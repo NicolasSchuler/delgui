@@ -25,16 +25,21 @@ renderer.
 deltapanes                    # two empty panels
 deltapanes a.rs b.rs          # prefilled, compares immediately
 deltapanes --paste file.rs    # clipboard into panel A, file into panel B
+deltapanes --watch a.rs b.rs  # re-diff whenever either file changes on disk
 ```
+
+Files can also be dragged onto either panel. A panel bound to a file gets a
+`watch` toggle; watching follows atomic-rename saves, which is how most editors
+write, so it keeps working after the first save.
 
 Nothing is written to disk: panel contents reach delta over pipes, the same way
 `delta <(pbpaste) file.rs` does.
 
 ## Status
 
-Milestone 1. Two panels, paste and file input, automatic language detection,
-live flag toggles, delta-faithful rendering. Not yet: file watching, N panels,
-packaging, OS hotkey.
+Milestone 2. Two panels, paste and file input, drag-and-drop, file watching,
+automatic language detection, live flag toggles, delta-faithful rendering.
+Not yet: N panels, packaging, OS hotkey.
 
 The `lang:` box is an override, not a requirement. A file panel uses its own
 extension; a pasted panel is sniffed. Prose is detected as prose and left

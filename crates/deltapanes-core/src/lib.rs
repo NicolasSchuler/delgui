@@ -6,6 +6,7 @@
 pub mod ansi;
 pub mod delta;
 pub mod language;
+pub mod watch;
 
 pub use ansi::{Color, Line, Span, Style};
 pub use delta::{Delta, DeltaError, Input, Options};

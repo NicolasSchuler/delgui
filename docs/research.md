@@ -127,7 +127,22 @@ nothing; `Delta::discover` enforces it and reports the version in the UI.
   the child process.
 - delta exits 1 when the inputs differ, like `diff`. Not an error.
 
-## 8. Prior art
+## 8. File watching watches directories, not files
+
+Editors and formatters overwhelmingly save by writing a temporary file and
+renaming it over the target. That swaps the inode, so a watch registered on the
+file itself sees the first save and silently misses every one after it. The
+watcher therefore registers each file's **parent directory** non-recursively and
+filters events back down by name. `survives_an_atomic_rename_save` performs two
+consecutive rename-saves and fails if the second goes unnoticed.
+
+Two consequences worth knowing. macOS FSEvents delivers with latency and will
+report writes from just *before* the watch was established, so the first poll
+after registering has to be discarded or the app re-diffs spuriously on startup.
+And a save is rarely a single event, while a file caught mid-write reads as
+truncated -- so events are coalesced for 180 ms before re-reading.
+
+## 9. Prior art
 
 No GUI frontend for delta exists. The library route is closed by design: delta's
 output is hardcoded to ANSI, per [issue #317](https://github.com/dandavison/delta/issues/317)

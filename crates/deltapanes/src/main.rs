@@ -8,6 +8,7 @@ use deltapanes_core::delta::Delta;
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let preload = args.iter().any(|a| a == "--paste").then(clipboard_text).flatten();
+    let watch = args.iter().any(|a| a == "--watch");
     // Positional paths mirror `delta A B`, so the app is a drop-in for the
     // shell invocation as well as a paste target.
     let files: Vec<std::path::PathBuf> = args
@@ -36,7 +37,7 @@ fn main() -> eframe::Result<()> {
         },
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-            Ok(Box::new(app::App::new(delta, preload, &files)))
+            Ok(Box::new(app::App::new(delta, preload, &files, watch)))
         }),
     )
 }

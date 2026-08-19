@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use deltapanes_core::ansi::{self, Line};
 use deltapanes_core::language;
+use deltapanes_core::watch::FileWatcher;
 use deltapanes_core::delta::{Delta, Input, Options};
 use egui::{FontId, Key};
 
@@ -17,6 +18,10 @@ const MAX_PANEL_BYTES: usize = 4 * 1024 * 1024;
 /// Delta re-runs on every width change, so resizing has to settle first.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// A save is rarely one filesystem event, and a file mid-write reads as
+/// truncated, so watch events are coalesced before re-reading.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(180);
+
 pub struct Panel {
     pub title: String,
     pub text: String,
@@ -24,11 +29,13 @@ pub struct Panel {
     /// Syntax sniffed from the panel's own content, recomputed only on edit.
     /// `None` means "this looks like prose", which is a perfectly good answer.
     pub detected: Option<&'static str>,
+    /// Re-read and re-diff when the bound file changes on disk.
+    pub watch: bool,
 }
 
 impl Panel {
     fn new(title: &str) -> Self {
-        Self { title: title.into(), text: String::new(), path: None, detected: None }
+        Self { title: title.into(), text: String::new(), path: None, detected: None, watch: false }
     }
 
     fn to_input(&self) -> Input {
@@ -55,6 +62,22 @@ impl Panel {
         match &self.path {
             Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             None => format!("paste · {} bytes", self.text.len()),
+        }
+    }
+
+    /// Bind the panel to a file, adopting its contents.
+    fn bind(&mut self, path: PathBuf) {
+        self.text = std::fs::read_to_string(&path).unwrap_or_default();
+        self.path = Some(path);
+        self.resniff();
+    }
+
+    fn reload(&mut self) {
+        if let Some(p) = &self.path {
+            if let Ok(text) = std::fs::read_to_string(p) {
+                self.text = text;
+                self.resniff();
+            }
         }
     }
 }
@@ -85,6 +108,11 @@ pub struct App {
     last_key: RenderKey,
     columns: usize,
     pending_resize: Option<Instant>,
+    watcher: Option<FileWatcher>,
+    pending_reload: Option<Instant>,
+    /// Rects of the two panels, recorded during layout so a dropped file can be
+    /// routed to whichever one it landed on.
+    panel_rects: [egui::Rect; 2],
     /// Compare once on the first frame when both panels arrived pre-filled.
     autorun: bool,
     tx: Sender<Job>,
@@ -92,7 +120,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(delta: Delta, preload: Option<String>, files: &[PathBuf]) -> Self {
+    pub fn new(delta: Delta, preload: Option<String>, files: &[PathBuf], watch: bool) -> Self {
         let (tx, rx) = channel();
         let mut panels = [Panel::new("A"), Panel::new("B")];
         if let Some(text) = preload {
@@ -107,6 +135,7 @@ impl App {
             }
             panels[slots].text = std::fs::read_to_string(f).unwrap_or_default();
             panels[slots].path = Some(f.clone());
+            panels[slots].watch = watch;
             slots += 1;
         }
         for p in panels.iter_mut() {
@@ -125,6 +154,9 @@ impl App {
             last_key: RenderKey::default(),
             columns: 120,
             pending_resize: None,
+            watcher: None,
+            pending_reload: None,
+            panel_rects: [egui::Rect::NOTHING; 2],
             autorun,
             tx,
             rx,
@@ -188,6 +220,98 @@ impl App {
         });
     }
 
+    /// Bring the watcher in line with the panels' `watch` flags.
+    fn sync_watches(&mut self, ctx: &egui::Context) {
+        let wanted: Vec<Option<PathBuf>> = self
+            .panels
+            .iter()
+            .map(|p| p.watch.then(|| p.path.clone()).flatten())
+            .collect();
+        if wanted.iter().all(|w| w.is_none()) && self.watcher.is_none() {
+            return;
+        }
+        if self.watcher.is_none() {
+            let ctx = ctx.clone();
+            match FileWatcher::new(move || ctx.request_repaint()) {
+                Ok(w) => self.watcher = Some(w),
+                Err(e) => {
+                    self.error = Some(format!("could not start file watching: {e}"));
+                    for p in self.panels.iter_mut() {
+                        p.watch = false;
+                    }
+                    return;
+                }
+            }
+        }
+        let watcher = self.watcher.as_mut().expect("just constructed");
+        for (panel, want) in self.panels.iter().zip(&wanted) {
+            match want {
+                Some(path) if !watcher.is_watching(path) => {
+                    if let Err(e) = watcher.watch(path) {
+                        self.error = Some(format!("cannot watch {}: {e}", path.display()));
+                    }
+                }
+                None => {
+                    if let Some(path) = &panel.path {
+                        if watcher.is_watching(path) {
+                            watcher.unwatch(path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn poll_watches(&mut self) {
+        let Some(watcher) = self.watcher.as_mut() else { return };
+        let changed = watcher.poll();
+        if changed.is_empty() {
+            return;
+        }
+        let relevant = self
+            .panels
+            .iter()
+            .any(|p| p.watch && p.path.as_ref().is_some_and(|q| changed.contains(q)));
+        if relevant {
+            self.pending_reload = Some(Instant::now());
+        }
+    }
+
+    /// Route dropped files to the panel they landed on, spilling into the
+    /// remaining panel when several arrive at once.
+    fn accept_drops(&mut self, ctx: &egui::Context) {
+        let (files, pos) = ctx.input(|i| {
+            (
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .map(|f| f.path().to_path_buf())
+                    .collect::<Vec<_>>(),
+                i.pointer.latest_pos(),
+            )
+        });
+        if files.is_empty() {
+            return;
+        }
+        let mut slot = self.drop_target(pos);
+        for file in files.into_iter().take(2) {
+            self.panels[slot].bind(file);
+            slot = 1 - slot;
+        }
+        self.compare(ctx);
+    }
+
+    /// Whichever panel is under the cursor; failing that, the first empty one.
+    fn drop_target(&self, pos: Option<egui::Pos2>) -> usize {
+        if let Some(pos) = pos {
+            if let Some(i) = self.panel_rects.iter().position(|r| r.contains(pos)) {
+                return i;
+            }
+        }
+        self.panels.iter().position(|p| p.text.is_empty()).unwrap_or(0)
+    }
+
     fn poll(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
             self.rendering = false;
@@ -203,6 +327,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.poll();
+        self.poll_watches();
         if self.autorun {
             self.autorun = false;
             self.compare(ctx);
@@ -261,19 +386,22 @@ impl eframe::App for App {
                             ui.strong(&self.panels[i].title);
                             ui.label(egui::RichText::new(self.panels[i].source_label()).weak().small());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if self.panels[i].path.is_some() && ui.small_button("unbind").clicked() {
-                                    self.panels[i].path = None;
+                                if self.panels[i].path.is_some() {
+                                    if ui.small_button("unbind").clicked() {
+                                        self.panels[i].path = None;
+                                        self.panels[i].watch = false;
+                                    }
+                                    ui.checkbox(&mut self.panels[i].watch, "watch")
+                                        .on_hover_text("re-read and re-diff when the file changes on disk");
                                 }
                                 if ui.small_button("open…").clicked() {
                                     if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                        self.panels[i].text =
-                                            std::fs::read_to_string(&p).unwrap_or_default();
-                                        self.panels[i].path = Some(p);
-                                        self.panels[i].resniff();
+                                        self.panels[i].bind(p);
                                     }
                                 }
                             });
                         });
+                        self.panel_rects[i] = ui.max_rect();
                         egui::ScrollArea::both().id_salt(i).show(ui, |ui| {
                             let edited = ui
                                 .add(
@@ -316,6 +444,32 @@ impl eframe::App for App {
 
         if ctx.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command) {
             self.compare(ctx);
+        }
+        self.accept_drops(ctx);
+        self.sync_watches(ctx);
+        if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            let target = self.drop_target(ctx.input(|i| i.pointer.latest_pos()));
+            ui.painter().rect_stroke(
+                self.panel_rects[target],
+                4.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(0x7d, 0xb0, 0xf0)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // Re-read only once the writes stop, so a half-written file is never
+        // what gets diffed.
+        if let Some(at) = self.pending_reload {
+            if at.elapsed() >= WATCH_DEBOUNCE {
+                self.pending_reload = None;
+                for p in self.panels.iter_mut() {
+                    if p.watch {
+                        p.reload();
+                    }
+                }
+                self.compare(ctx);
+            } else {
+                ctx.request_repaint_after(WATCH_DEBOUNCE);
+            }
         }
         // Re-run once the drag settles rather than on every resize frame.
         if let Some(at) = self.pending_resize {

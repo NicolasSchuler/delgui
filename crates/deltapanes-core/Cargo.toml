@@ -8,3 +8,4 @@ description = "Frontend-agnostic core for deltapanes: delta invocation and ANSI-
 [dependencies]
 anstyle-parse.workspace = true
 libc = "0.2"
+notify = "8"
