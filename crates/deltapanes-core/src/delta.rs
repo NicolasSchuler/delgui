@@ -80,6 +80,21 @@ impl Delta {
         })
     }
 
+    /// Syntax themes this delta build knows about, as `(name, is_dark)`.
+    pub fn syntax_themes(&self) -> Vec<(String, bool)> {
+        let Ok(out) = Command::new(&self.path).arg("--list-syntax-themes").output() else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (kind, name) = l.split_once('\t')?;
+                Some((name.trim().to_string(), kind.trim() == "dark"))
+            })
+            .filter(|(name, _)| !name.is_empty())
+            .collect()
+    }
+
     /// Render a comparison, returning delta's raw ANSI stdout.
     pub fn render(&self, left: &Input, right: &Input, opts: &Options) -> Result<Vec<u8>, DeltaError> {
         let mut cmd = Command::new(&self.path);
@@ -186,6 +201,8 @@ pub struct Options {
     /// *right-hand* path only, so a paste on the right silently loses
     /// highlighting without this.
     pub default_language: Option<String>,
+    /// Named feature presets to activate, passed as `--features`.
+    pub features: Vec<String>,
     /// Inherit `[delta]` from gitconfig and `DELTA_FEATURES`. When false we
     /// pass `--no-gitconfig`, which is the only way to get reproducible output
     /// for tests (`GIT_CONFIG_GLOBAL` is *not* honoured by delta).
@@ -205,6 +222,7 @@ impl Default for Options {
             wrap: true,
             syntax_theme: None,
             default_language: None,
+            features: Vec::new(),
             inherit_gitconfig: true,
             working_dir: None,
             extra_args: Vec::new(),
@@ -235,6 +253,9 @@ impl Options {
         }
         if let Some(l) = &self.default_language {
             a.push(format!("--default-language={l}"));
+        }
+        if !self.features.is_empty() {
+            a.push(format!("--features={}", self.features.join(" ")));
         }
         if !self.inherit_gitconfig {
             a.push("--no-gitconfig".into());

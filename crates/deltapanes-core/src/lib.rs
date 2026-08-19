@@ -4,6 +4,7 @@
 //! frontend and the ratatui fallback can share it.
 
 pub mod ansi;
+pub mod config;
 pub mod delta;
 pub mod language;
 pub mod watch;
