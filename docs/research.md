@@ -119,13 +119,14 @@ nothing; `Delta::discover` enforces it and reports the version in the UI.
 - delta expands tabs itself, so the renderer needs no tab-stop logic.
 - CJK is padded by display width. A GUI font must therefore render CJK at exactly
   two cells or side-by-side columns will drift. **egui's default font has no CJK
-  glyphs at all** — an open item.
+  glyphs at all**, and §14 measures what the installed ones do instead.
 - `\ No newline at end of file` is emitted normally and needs no special casing.
 - Wrapping is on by default; `--wrap-max-lines=0` truncates instead.
 - `delta A B` is byte-identical to `git diff --no-index A B | delta`, and shells
   out to git (falling back to `diff`) to get there. Both must be reachable from
   the child process.
-- delta exits 1 when the inputs differ, like `diff`. Not an error.
+- delta exits 1 when the inputs differ, like `diff`. Not an error — but see §12, because
+  exit 1 also covers a file that is not there.
 
 ## 8. File watching watches directories, not files
 
@@ -149,12 +150,170 @@ output is hardcoded to ANSI, per [issue #317](https://github.com/dandavison/delt
 and [discussion #2128](https://github.com/dandavison/delta/discussions/2128).
 A subprocess is not a compromise, it is the only interface.
 
+## 10. delta has no negative flags, and side-by-side turns line numbers on for itself
+
+Measured against 0.19.2:
+
+| attempt | result |
+| --- | --- |
+| `--side-by-side` with no `--line-numbers` | line numbers appear anyway |
+| `--line-numbers=false` | **exit 2**, `unexpected value 'false'` |
+| `--no-line-numbers`, `--no-side-by-side` | **exit 2**, no such flag |
+| `--line-numbers-left-format= --line-numbers-right-format=` | works — line numbers *and* the column separators disappear |
+
+The same shape applies to everything a `[delta]` gitconfig can set: omitting a flag means "whatever
+gitconfig says", not "off". `--features=` with an empty value **does** override `delta.features`
+(verified against a fake `HOME`), which is why `to_args` emits it even when the list is empty --
+otherwise unticking every feature box in the UI would silently leave them all on.
+
+`line_numbers_can_be_switched_off_in_side_by_side` pins the working lever.
+
+## 11. `--light`/`--dark` is a separate axis from `--syntax-theme`
+
+| | `--dark` | `--light` |
+| --- | --- | --- |
+| minus background | `#3f0001` | `#ffe0e0` |
+| plus background | `#002800` | `#d0ffd0` |
+| default syntax theme | Monokai Extended | GitHub |
+
+Two findings behind that table. **Choosing a light syntax theme flips the backgrounds on its own**
+-- `--syntax-theme=GitHub` alone yields `#ffe0e0`/`#d0ffd0` -- so a GUI that offers the theme list
+without a light mode can produce near-black text on near-black ground with one click. And
+`--dark --syntax-theme=GitHub` is honoured as stated: the mode decides the ground, the theme decides
+the code. A GUI has no terminal to be queried about, so it must say which one it is in.
+
+Separately, parsing every SGR delta emits across `--dark`, `--light`, side-by-side, `--hyperlinks`
+and `--navigate`: **delta's default output uses exactly one of the sixteen palette colours, index 4
+(`SGR 34`)**, 238 occurrences, for the hunk-header rules, the side-by-side divider and the `╎`
+markers. Everything else is truecolor or the 256-cube. The other fifteen are still reachable through
+a gitconfig that names colours (`--minus-style "normal red"` emits `SGR 41`), so the palette keeps
+all sixteen -- but index 4 is the one that has to agree with the app's accent.
+
+`appearance_picks_delta_s_colour_scheme` pins the backgrounds.
+
+## 12. Empty stdout means two different things
+
+| invocation | exit | stdout |
+| --- | --- | --- |
+| identical inputs | 0 | **empty** |
+| inputs differ | 1 | the diff |
+| a path that does not exist | 1 | **empty**, stderr explains |
+| an unreadable file | 128 | empty |
+| an unknown flag | 2 | empty |
+
+So "delta printed nothing" is *either* the answer or a failure, and the status alone does not
+separate them either -- exit 1 covers both the normal case and a missing file. The rule that works
+is **failing status *and* empty stdout**. Ignoring this rendered every delta failure as a blank pane
+with no message, indistinguishable from "these two are the same".
+
+## 13. `/dev/fd/N` is resolved by name, late
+
+The read end of each pipe has to stay open in *our* process for as long as the child runs, not just
+until `spawn` returns. delta shells out to `git diff --no-index`, and it is that grandchild that
+opens the path -- milliseconds later. Closing the descriptor at `spawn` frees the *number*, a
+concurrent render is handed it, and the first child fails with `could not access '/dev/fd/3'`. It
+only reproduces under parallelism: the test suite passed single-threaded and failed with
+`--test-threads` unset.
+
+Leaking them instead is worse. Two descriptors per render, one render per keystroke: with
+`RLIMIT_NOFILE` at 256 -- what `launchctl limit maxfiles` gives a Finder-launched GUI -- the app
+broke permanently after **123 renders**, roughly two minutes of typing, and every later render
+failed with "Too many open files". Both failure modes now have a test.
+
+## 14. egui 0.36 font facts
+
+egui 0.36 rasterises through `skrifa`/`harfrust`/`vello_cpu`, **not `ab_glyph`**: `.ttc`
+collections and variable fonts both load, which matters because nearly every macOS system font ships
+as a collection.
+
+- The bundled families are `Ubuntu-Light` (proportional) and `Hack-Regular` (monospace), plus two
+  emoji fonts. Between them they have **no `⏎`, `⌫`, `✕`, and no `→` in the proportional chain** --
+  all four were on screen as tofu boxes, including in the primary button. `Hack` is not in the
+  proportional fallback chain by default; adding it fixes the arrows and box-drawing.
+- **There is no bold face in the binary**, and `RichText::strong()` resolves to a *colour*, not a
+  weight. A weight hierarchy needs a font file. macOS's `/System/Library/Fonts/SFNS.ttf` is a
+  variable font with `wght` 1-1000, so one file registered twice at different `FontTweak::coords`
+  gives real weights.
+- `Fonts::has_glyph` is unusable as a coverage check: it compares against the replacement face and
+  so reports *every* glyph as missing whenever the chosen font also supplies `◻`. `glyph_width > 0`
+  is the reliable signal.
+- `glyph_width` is independent of `pixels_per_point`, so the column count derived from it moves only
+  with the font size -- which is why a font-size slider has to go through the resize debounce.
+- CJK, measured as `width('中') / width(' ')` at 13pt: Maple Mono NF CN **2.000**, Hiragino Sans GB
+  1.661, STHeiti Light 1.661, AppleSDGothicNeo 1.437, no fallback at all 0 (drawn as a one-column
+  box). delta pads CJK to two columns, so nothing but exactly 2.0 stays aligned.
+
+## 15. Building a result: the structure has to come from the diff, not the render
+
+Measured against delta 0.19.2 / git 2.55.0 on 2026-08-19, for the merge feature.
+
+**Reading `@@` back out of delta's rendered output does not work.** It looks like it should:
+`--hunk-header-style=raw` prints git's own header verbatim, and it is never wrapped or truncated
+(intact at `--width=22`, in both wrap and truncate modes). Three things kill it:
+
+| | |
+| --- | --- |
+| `--hunk-header-style` given twice | `error: … cannot be used multiple times`, exit 2, **empty stdout** — and `Options::to_args` already emits `=omit` whenever the *Hunk headers* checkbox is off, which is the default |
+| `[delta] line-numbers-left-format = ""` | the gutter disappears, so a line of file content is drawn at column 0 and is indistinguishable from a header. Diffing two `.patch` files is enough |
+| `[diff] context = 1` in gitconfig | changes what a hunk *is*, silently |
+| `--hunk-label` | does **not** apply to the `raw` style — only to `line-number` |
+
+**So merge mode runs the diff itself and pipes it to delta.** `delta A B` is byte-identical to
+`git diff --no-index A B | delta` (md5, side-by-side + line numbers + `--file-style=omit`), which
+§7 already recorded, so this changes what the app *knows*, not what it *draws*. In a unified diff
+every body line carries a ` `/`+`/`-`/`\` prefix, so only a real header starts with `@@` — the
+phantom-header problem cannot arise, and `--unified=0` is then ours to pass on the command line
+rather than something to smuggle past gitconfig.
+
+**Zero context is not a refinement, it is the feature.** Hunks per pair of examples:
+
+| pair | `-U3` (git's default) | `-U1` | `-U0` |
+| --- | --- | --- | --- |
+| `examples/config_before.rs` → `config_after.rs` (13 lines, 4 changes) | **1** | 1 | **4** |
+| a 233-line source file, 9 scattered changes | 7 | 9 | 9 |
+| rendered rows for the first pair | 82 | 48 | 30 |
+
+At the default, the app's own example pair is a single hunk: one button for the whole file. The
+take unit is still git's — deltapanes never decides what a hunk is.
+
+**What is still read out of the render** is only which rows each hunk occupies, and only as a
+count: `--hunk-label=␟` marks exactly one row per hunk, at column 0, in every mode tested
+(unified, side-by-side, with and without line numbers, `--width=24` wrapped and truncated, and
+with the user's hunk headers switched off). `merge::locate` refuses to return anything if the
+marks do not number exactly the hunks git reported, and `merge::verify` then checks that the
+regions *between* hunks are identical on both sides — if that holds, every individual take is
+correct by construction. `tests/merge.rs` pins all of it.
+
+**delta prints a blank row between hunks**, which `locate` trims off the end of each span, since
+merge mode draws its own separator. A *changed* empty line is not blank in that sense: it carries
+the `ESC[K` fill that paints its background.
+
+**`--no-gitconfig` does not sandbox the diff step by itself.** deltapanes therefore owns that step
+for every render, states the algorithm/context/colour behavior explicitly, passes
+`--no-ext-diff --no-textconv`, removes injected config and external-helper environment, and pipes
+the resulting patch into delta. When `inherit_gitconfig` is off it also points global/system config
+at `/dev/null`. A configured executable can no longer receive private panel snapshots.
+
+**Cost.** 18 ms for a small pair, 27 ms for 4 000 lines with 109 hunks, plus about 10 ms for the
+separate `git diff`. Two frames — which is why a take simply greys its controls until the next
+render lands, instead of predicting where the remaining hunks moved to.
+
+**egui, for the controls.** `Label` re-wraps a `LayoutJob` to `ui.available_width()` regardless of
+`job.wrap.max_width`, so a diff laid out to exactly `--width` columns spills its last glyph onto a
+line of its own the moment a scrollbar appears. `TextWrapMode::Extend` is required, and this was
+already true of the single-label diff. `TextEditState`'s undoer is fed only while the field has
+focus, at one-second granularity, so a burst of takes made with focus in the diff leaves its most
+recent snapshot describing the text from *before all of them* — `clear_undoer` after every
+programmatic write is what stops one ⌘Z throwing a merge away.
+
 ## Open items
 
-- **CJK/wide-glyph fidelity.** Needs a bundled monospace font with CJK coverage,
-  or side-by-side misaligns on non-Latin text.
-- **The 16 palette colours.** delta uses indices 0–15 for structural elements and
-  a terminal takes those from the user's colour scheme. `render::Palette` supplies
-  a default dark set; there is no way to read the user's real terminal theme.
+- **CJK/wide-glyph fidelity.** Measured in §14: no stock macOS CJK font is double-width, so no
+  automatic fallback fixes this. `fonts::probe` now reports the ratio and the settings panel warns;
+  the actual fix is a dual-width font such as Maple Mono NF CN or an Iosevka CJK build.
+- **Per-line takes.** A difference is git's unit, and at zero context that is one contiguous
+  change — which is fine until two edits land on the same line. The result panel is a text field,
+  so the answer for now is to take the difference and then type; a finer unit would mean deciding
+  what a hunk is, which is the line this app does not cross.
 - **cwd policy.** When a panel is bound to a file inside a repo with its own
   `[delta]` config, should delta run there? Currently `working_dir` is unset.

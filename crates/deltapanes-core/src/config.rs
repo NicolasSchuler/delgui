@@ -91,7 +91,9 @@ fn parse_git_output(text: &str) -> DeltaConfig {
             Some((k, v)) => (k, v.trim()),
             None => (entry, ""),
         };
-        let Some(rest) = key.strip_prefix("delta.") else { continue };
+        let Some(rest) = key.strip_prefix("delta.") else {
+            continue;
+        };
 
         // `delta.side-by-side` is a setting; `delta.mypreset.line-numbers` is an
         // entry inside the named feature `mypreset`.
@@ -126,10 +128,16 @@ mod tests {
              file:/Users/x/.gitconfig\tdelta.mypreset.syntax-theme GitHub\n\
              file:/repo/.git/config\tdelta.decorations.hunk-header-style file line-number\n",
         );
-        assert_eq!(cfg.settings.get("side-by-side").map(String::as_str), Some("true"));
+        assert_eq!(
+            cfg.settings.get("side-by-side").map(String::as_str),
+            Some("true")
+        );
         assert_eq!(cfg.active, vec!["mypreset", "decorations"]);
         assert_eq!(cfg.features["mypreset"]["syntax-theme"], "GitHub");
-        assert_eq!(cfg.features["decorations"]["hunk-header-style"], "file line-number");
+        assert_eq!(
+            cfg.features["decorations"]["hunk-header-style"],
+            "file line-number"
+        );
         assert_eq!(cfg.sources.len(), 2);
     }
 
@@ -142,6 +150,9 @@ mod tests {
     #[test]
     fn selectable_features_include_builtins_named_without_a_section() {
         let cfg = parse_git_output("file:/x\tdelta.features line-numbers decorations\n");
-        assert_eq!(cfg.selectable_features(), vec!["decorations", "line-numbers"]);
+        assert_eq!(
+            cfg.selectable_features(),
+            vec!["decorations", "line-numbers"]
+        );
     }
 }

@@ -4,48 +4,235 @@ use egui::{Key, Modifiers};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
+    OpenFile,
+    CloseWindow,
     Compare,
+    Find,
     AddPanel,
     RemovePanel,
-    ClearPanel,
     PasteIntoNewPanel,
     ShowDiff(usize),
     MakeReference,
     ToggleSideBySide,
     ToggleLineNumbers,
     ToggleWrap,
+    ToggleSettings,
     ToggleHelp,
+    SaveResult,
+    SaveResultAs,
+    UndoTake,
+    RedoTake,
 }
 
 pub struct Binding {
     pub label: &'static str,
     pub describe: &'static str,
+    pub group: &'static str,
     pub action: Action,
     key: Key,
     mods: Modifiers,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
-const CMD_SHIFT: Modifiers = Modifiers { shift: true, ..Modifiers::COMMAND };
+const CMD_SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ..Modifiers::COMMAND
+};
+const CMD_ALT: Modifiers = Modifiers {
+    alt: true,
+    ..Modifiers::COMMAND
+};
+
+/// Chords are written the way the platform writes them.
+///
+/// It is not only convention: `⏎` exists in macOS's system font and in none of
+/// the fonts egui bundles, so away from macOS it would be drawn as an empty box
+/// -- which is exactly what the primary button used to show.
+const fn chord(mac: &'static str, elsewhere: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        elsewhere
+    }
+}
+
+pub fn compare_label() -> &'static str {
+    chord("⌘⏎", "Ctrl+Enter")
+}
+
+pub fn help_label() -> &'static str {
+    chord("⌘/", "Ctrl+/")
+}
+
+pub fn help_hint() -> &'static str {
+    chord("Keyboard shortcuts  ⌘/", "Keyboard shortcuts  Ctrl+/")
+}
+
+/// ⌘S was the side-by-side toggle until the app could write a file. Once it can,
+/// a user finishing a merge presses ⌘S and must not get a layout flip.
+pub fn save_label() -> &'static str {
+    chord("⌘S", "Ctrl+S")
+}
+
+pub fn settings_hint() -> &'static str {
+    chord("Settings  ⌘,", "Settings  Ctrl+,")
+}
 
 pub fn bindings() -> Vec<Binding> {
     let mut v = vec![
-        Binding { label: "⌘ ⏎", describe: "compare", action: Action::Compare, key: Key::Enter, mods: CMD },
-        Binding { label: "⌘ N", describe: "add a panel", action: Action::AddPanel, key: Key::N, mods: CMD },
-        Binding { label: "⌘ ⇧ W", describe: "remove the shown panel", action: Action::RemovePanel, key: Key::W, mods: CMD_SHIFT },
-        Binding { label: "⌘ ⌫", describe: "clear the focused panel", action: Action::ClearPanel, key: Key::Backspace, mods: CMD },
-        Binding { label: "⌘ ⇧ V", describe: "paste into a fresh panel", action: Action::PasteIntoNewPanel, key: Key::V, mods: CMD_SHIFT },
-        Binding { label: "⌘ R", describe: "make the shown panel the reference", action: Action::MakeReference, key: Key::R, mods: CMD },
-        Binding { label: "⌘ S", describe: "side-by-side", action: Action::ToggleSideBySide, key: Key::S, mods: CMD },
-        Binding { label: "⌘ L", describe: "line numbers", action: Action::ToggleLineNumbers, key: Key::L, mods: CMD },
-        Binding { label: "⌘ \\", describe: "wrap long lines", action: Action::ToggleWrap, key: Key::Backslash, mods: CMD },
-        Binding { label: "⌘ /", describe: "this list", action: Action::ToggleHelp, key: Key::Slash, mods: CMD },
+        Binding {
+            label: chord("⌘O", "Ctrl+O"),
+            describe: "open a file in the shown panel",
+            group: "file",
+            action: Action::OpenFile,
+            key: Key::O,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘W", "Ctrl+W"),
+            describe: "close the window",
+            group: "file",
+            action: Action::CloseWindow,
+            key: Key::W,
+            mods: CMD,
+        },
+        Binding {
+            label: compare_label(),
+            describe: "re-render now",
+            group: "compare",
+            action: Action::Compare,
+            key: Key::Enter,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘F", "Ctrl+F"),
+            describe: "find in the diff",
+            group: "compare",
+            action: Action::Find,
+            key: Key::F,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘R", "Ctrl+R"),
+            describe: "make the shown panel the baseline",
+            group: "compare",
+            action: Action::MakeReference,
+            key: Key::R,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘N", "Ctrl+N"),
+            describe: "add a panel",
+            group: "panels",
+            action: Action::AddPanel,
+            key: Key::N,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘⇧W", "Ctrl+Shift+W"),
+            describe: "remove the shown panel",
+            group: "panels",
+            action: Action::RemovePanel,
+            key: Key::W,
+            mods: CMD_SHIFT,
+        },
+        Binding {
+            label: chord("⌘⇧V", "Ctrl+Shift+V"),
+            describe: "paste into a fresh panel",
+            group: "panels",
+            action: Action::PasteIntoNewPanel,
+            key: Key::V,
+            mods: CMD_SHIFT,
+        },
+        Binding {
+            label: chord("⌘⌥S", "Ctrl+Alt+S"),
+            describe: "side by side",
+            group: "view",
+            action: Action::ToggleSideBySide,
+            key: Key::S,
+            mods: CMD_ALT,
+        },
+        Binding {
+            label: chord("⌘L", "Ctrl+L"),
+            describe: "line numbers",
+            group: "view",
+            action: Action::ToggleLineNumbers,
+            key: Key::L,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘\\", "Ctrl+\\"),
+            describe: "wrap long lines",
+            group: "view",
+            action: Action::ToggleWrap,
+            key: Key::Backslash,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘,", "Ctrl+,"),
+            describe: "settings",
+            group: "view",
+            action: Action::ToggleSettings,
+            key: Key::Comma,
+            mods: CMD,
+        },
+        Binding {
+            label: help_label(),
+            describe: "this list",
+            group: "view",
+            action: Action::ToggleHelp,
+            key: Key::Slash,
+            mods: CMD,
+        },
+        Binding {
+            label: save_label(),
+            describe: "save the result to a file",
+            group: "result",
+            action: Action::SaveResult,
+            key: Key::S,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘⇧S", "Ctrl+Shift+S"),
+            describe: "save the result as a new file",
+            group: "result",
+            action: Action::SaveResultAs,
+            key: Key::S,
+            mods: CMD_SHIFT,
+        },
+        Binding {
+            label: chord("⌘Z", "Ctrl+Z"),
+            describe: "undo the last take",
+            group: "result",
+            action: Action::UndoTake,
+            key: Key::Z,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘⇧Z", "Ctrl+Shift+Z"),
+            describe: "redo the last take",
+            group: "result",
+            action: Action::RedoTake,
+            key: Key::Z,
+            mods: CMD_SHIFT,
+        },
     ];
     // Number keys select which panel's diff is on screen.
-    for (i, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6].into_iter().enumerate() {
+    for (i, key) in [
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         v.push(Binding {
-            label: "⌘ 1…6",
+            label: chord("⌘1…6", "Ctrl+1…6"),
             describe: "show that panel's diff",
+            group: "panels",
             action: Action::ShowDiff(i),
             key,
             mods: CMD,
@@ -59,25 +246,77 @@ pub fn bindings() -> Vec<Binding> {
 pub fn pressed(input: &egui::InputState) -> Vec<Action> {
     bindings()
         .into_iter()
-        .filter(|b| input.key_pressed(b.key) && input.modifiers.matches_logically(b.mods))
+        .filter(|b| input.key_pressed(b.key) && input.modifiers.matches_exact(b.mods))
         .map(|b| b.action)
         .collect()
 }
 
-/// One row per binding for the help overlay, with the numeric block collapsed.
-pub fn help_rows() -> Vec<(&'static str, &'static str)> {
-    let mut rows: Vec<(&str, &str)> = Vec::new();
-    for b in bindings() {
-        if !rows.iter().any(|(l, _)| *l == b.label) {
-            rows.push((b.label, b.describe));
+pub struct HelpRow {
+    pub label: &'static str,
+    pub describe: &'static str,
+    pub group: &'static str,
+}
+
+/// The help overlay's contents: every chord once, with the numeric block
+/// collapsed, plus the things you do with the mouse -- which are half of how
+/// the app is operated and were documented nowhere.
+pub fn help_rows() -> Vec<HelpRow> {
+    let mut rows: Vec<HelpRow> = Vec::new();
+    for group in ["file", "compare", "panels", "result", "view"] {
+        for b in bindings().into_iter().filter(|b| b.group == group) {
+            if !rows.iter().any(|r| r.label == b.label) {
+                rows.push(HelpRow {
+                    label: b.label,
+                    describe: b.describe,
+                    group: b.group,
+                });
+            }
         }
     }
+    rows.push(HelpRow {
+        label: "drop",
+        describe: "load files into the panels you drop them on",
+        group: "mouse",
+    });
+    rows.push(HelpRow {
+        label: "click A",
+        describe: "make that panel the baseline",
+        group: "mouse",
+    });
+    rows.push(HelpRow {
+        label: "⋯",
+        describe: "open, reload, follow on disk, clear, remove",
+        group: "mouse",
+    });
+    rows.push(HelpRow {
+        label: "Combine…",
+        describe: "build a result you can take differences into",
+        group: "result",
+    });
     rows
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dispatch(key: Key, modifiers: Modifiers) -> Vec<Action> {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::ModifiersChanged(modifiers));
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        ctx.begin_pass(input);
+        let actions = ctx.input(pressed);
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        actions
+    }
 
     /// Two bindings on the same chord means one of them silently never fires.
     #[test]
@@ -95,13 +334,83 @@ mod tests {
         }
     }
 
+    /// Every combination of the logical modifiers either selects the one exact
+    /// binding for a key or selects nothing. In particular, Shift/Alt variants
+    /// must never fall through to the plain Command action on the same key.
+    #[test]
+    fn modifier_combinations_match_exactly_without_overlap() {
+        let all = bindings();
+        let mut keys = Vec::new();
+        for key in all.iter().map(|binding| binding.key) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        for key in keys {
+            for command in [false, true] {
+                for shift in [false, true] {
+                    for alt in [false, true] {
+                        let pressed = Modifiers {
+                            command,
+                            shift,
+                            alt,
+                            ..Modifiers::NONE
+                        };
+                        let actual = dispatch(key, pressed);
+                        let expected: Vec<Action> = all
+                            .iter()
+                            .filter(|binding| binding.key == key && binding.mods == pressed)
+                            .map(|binding| binding.action)
+                            .collect();
+
+                        assert_eq!(
+                            actual, expected,
+                            "unexpected match for {key:?} with {pressed:?}"
+                        );
+                        assert!(
+                            actual.len() <= 1,
+                            "{key:?} with {pressed:?} dispatches {actual:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn standard_shortcut_variants_dispatch_only_the_intended_action() {
+        let cases = [
+            (Key::O, CMD, Action::OpenFile),
+            (Key::W, CMD, Action::CloseWindow),
+            (Key::F, CMD, Action::Find),
+            (Key::W, CMD_SHIFT, Action::RemovePanel),
+            (Key::S, CMD, Action::SaveResult),
+            (Key::S, CMD_SHIFT, Action::SaveResultAs),
+            (Key::S, CMD_ALT, Action::ToggleSideBySide),
+            (Key::Z, CMD, Action::UndoTake),
+            (Key::Z, CMD_SHIFT, Action::RedoTake),
+        ];
+        for (key, mods, expected) in cases {
+            let actual = dispatch(key, mods);
+            assert_eq!(actual, vec![expected], "wrong action for {key:?} {mods:?}");
+        }
+
+        let all = bindings();
+        let unsupported = CMD_ALT.plus(Modifiers::SHIFT);
+        assert!(
+            all.iter()
+                .all(|binding| binding.key != Key::S || !unsupported.matches_exact(binding.mods)),
+            "Command+Option+Shift+S must not fall through to another S binding"
+        );
+    }
+
     /// Every action must be reachable, and every chord must be documented.
     #[test]
     fn every_binding_is_listed_in_the_help() {
         let rows = help_rows();
         for b in bindings() {
             assert!(
-                rows.iter().any(|(label, _)| *label == b.label),
+                rows.iter().any(|r| r.label == b.label),
                 "{} has no help row",
                 b.describe
             );
@@ -123,6 +432,37 @@ mod tests {
     fn no_binding_is_a_bare_keypress() {
         for b in bindings() {
             assert!(b.mods.command, "{} would fire while typing", b.describe);
+        }
+    }
+
+    /// ⌘⌫ is "delete to the start of the line" in every macOS text field, and
+    /// the panels *are* text fields. It used to clear a panel outright, with no
+    /// undo and an ambiguous target; clearing now lives in the panel's own menu.
+    ///
+    /// ⌘Z is the one exception, and only because `App::handle_keys` drops it
+    /// while any text field has focus: inside a panel it is still that field's
+    /// own undo, and only over the diff -- where egui has nothing bound and users
+    /// press it anyway -- does it undo a take.
+    #[test]
+    fn no_binding_collides_with_a_standard_text_editing_chord() {
+        let reserved = [
+            (Key::Backspace, CMD),
+            (Key::A, CMD),
+            (Key::C, CMD),
+            (Key::V, CMD),
+            (Key::X, CMD),
+            (Key::Z, CMD),
+            (Key::Z, CMD_SHIFT),
+        ];
+        for b in bindings() {
+            if matches!(b.action, Action::UndoTake | Action::RedoTake) {
+                continue;
+            }
+            assert!(
+                !reserved.iter().any(|(k, m)| *k == b.key && *m == b.mods),
+                "{} steals a text-editing chord",
+                b.describe
+            );
         }
     }
 }

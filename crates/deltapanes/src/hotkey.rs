@@ -24,7 +24,11 @@ impl Hotkey {
         Ok(Self {
             _manager: manager,
             id: hotkey.id(),
-            label: if cfg!(target_os = "macos") { "⌘⇧D".into() } else { "Super+Shift+D".into() },
+            label: if cfg!(target_os = "macos") {
+                "⌘⇧D".into()
+            } else {
+                "Super+Shift+D".into()
+            },
         })
     }
 

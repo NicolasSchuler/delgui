@@ -7,7 +7,9 @@ pub mod ansi;
 pub mod config;
 pub mod delta;
 pub mod language;
+pub mod merge;
 pub mod watch;
 
 pub use ansi::{Color, Line, Span, Style};
-pub use delta::{Delta, DeltaError, Input, Options};
+pub use delta::{Appearance, Delta, DeltaError, Input, Options};
+pub use merge::Hunk;

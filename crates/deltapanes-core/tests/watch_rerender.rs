@@ -33,8 +33,12 @@ fn a_saved_file_changes_what_delta_renders() {
         ..Options::default()
     };
     let render = |d: &Delta| {
-        d.render(&Input::Path(left.clone()), &Input::Path(right.clone()), &opts)
-            .expect("render")
+        d.render(
+            &Input::Path(left.clone()),
+            &Input::Path(right.clone()),
+            &opts,
+        )
+        .expect("render")
     };
 
     let before = visible(&render(&d));
@@ -48,7 +52,11 @@ fn a_saved_file_changes_what_delta_renders() {
 
     // Save the way an editor does: write a sibling, rename it over the target.
     let tmp = dir.join("b.rs.tmp");
-    std::fs::write(&tmp, "fn main() {\n    let x = 99;\n    println!(\"{x}\");\n}\n").unwrap();
+    std::fs::write(
+        &tmp,
+        "fn main() {\n    let x = 99;\n    println!(\"{x}\");\n}\n",
+    )
+    .unwrap();
     std::fs::rename(&tmp, &right).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -64,7 +72,16 @@ fn a_saved_file_changes_what_delta_renders() {
     let after = visible(&render(&d));
     std::fs::remove_dir_all(&dir).ok();
 
-    assert_ne!(before, after, "re-render produced identical output after a save");
-    assert!(after.contains("let x = 99;"), "re-render missed the new contents:\n{after}");
-    assert!(!after.contains("let x = 2;"), "re-render still showed the old contents");
+    assert_ne!(
+        before, after,
+        "re-render produced identical output after a save"
+    );
+    assert!(
+        after.contains("let x = 99;"),
+        "re-render missed the new contents:\n{after}"
+    );
+    assert!(
+        !after.contains("let x = 2;"),
+        "re-render still showed the old contents"
+    );
 }

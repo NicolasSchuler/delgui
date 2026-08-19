@@ -9,13 +9,22 @@
 //! is worse than no guess, so every rule below demands positive evidence and
 //! ties are resolved as "don't know".
 
+use std::cmp::Reverse;
+
 /// Minimum score before we claim to recognise anything.
 const THRESHOLD: u32 = 3;
+
+/// Sniffing happens while the user edits, so one pasted minified line must not
+/// make each keystroke clone megabytes before delta's own size guard is reached.
+/// This is bytes rather than characters because allocation is the cost being
+/// bounded; [`sample`] backs up to a UTF-8 boundary when the limit cuts a line.
+const MAX_SAMPLE_BYTES: usize = 64 * 1024;
+const MAX_SAMPLE_LINES: usize = 400;
 
 /// Returns an extension token suitable for `--default-language`, or `None` when
 /// the text does not look like code.
 pub fn detect(text: &str) -> Option<&'static str> {
-    let sample: String = text.lines().take(400).collect::<Vec<_>>().join("\n");
+    let sample = sample(text);
     let trimmed = sample.trim_start();
     if trimmed.is_empty() {
         return None;
@@ -25,8 +34,13 @@ pub fn detect(text: &str) -> Option<&'static str> {
     if let Some(rest) = trimmed.strip_prefix("#!") {
         let line = rest.lines().next().unwrap_or_default();
         for (needle, lang) in [
-            ("python", "py"), ("node", "js"), ("ruby", "rb"), ("perl", "pl"),
-            ("bash", "sh"), ("zsh", "sh"), ("sh", "sh"),
+            ("python", "py"),
+            ("node", "js"),
+            ("ruby", "rb"),
+            ("perl", "pl"),
+            ("bash", "sh"),
+            ("zsh", "sh"),
+            ("sh", "sh"),
         ] {
             if line.contains(needle) {
                 return Some(lang);
@@ -35,12 +49,19 @@ pub fn detect(text: &str) -> Option<&'static str> {
         return Some("sh");
     }
     if trimmed.starts_with("<?xml") || trimmed.starts_with("<!DOCTYPE html") {
-        return Some(if trimmed.starts_with("<?xml") { "xml" } else { "html" });
+        return Some(if trimmed.starts_with("<?xml") {
+            "xml"
+        } else {
+            "html"
+        });
     }
     if looks_like_json(trimmed) {
         return Some("json");
     }
-    if sample.lines().any(|l| l.starts_with("@@ ") || l.starts_with("diff --git ")) {
+    if sample
+        .lines()
+        .any(|l| l.starts_with("@@ ") || l.starts_with("diff --git "))
+    {
         return Some("diff");
     }
 
@@ -54,7 +75,7 @@ pub fn detect(text: &str) -> Option<&'static str> {
             (*lang, hits)
         })
         .collect();
-    scores.sort_by(|a, b| b.1.cmp(&a.1));
+    scores.sort_by_key(|(_, score)| Reverse(*score));
 
     match scores.as_slice() {
         // A clear winner, or a tie we refuse to break.
@@ -67,6 +88,33 @@ pub fn detect(text: &str) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+/// Copy a representative prefix without splitting a UTF-8 code point.
+///
+/// `str::lines` also preserves the old CRLF behaviour: the carriage return is
+/// stripped before lines are joined with a single newline.
+fn sample(text: &str) -> String {
+    let mut sample = String::with_capacity(text.len().min(MAX_SAMPLE_BYTES));
+    for (index, line) in text.lines().take(MAX_SAMPLE_LINES).enumerate() {
+        if index > 0 {
+            if sample.len() == MAX_SAMPLE_BYTES {
+                break;
+            }
+            sample.push('\n');
+        }
+
+        let remaining = MAX_SAMPLE_BYTES - sample.len();
+        let mut end = line.len().min(remaining);
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        sample.push_str(&line[..end]);
+        if end < line.len() {
+            break;
+        }
+    }
+    sample
 }
 
 /// Match a needle only when it stands alone, so that "in" inside "point" or
@@ -117,7 +165,7 @@ const RULES: &[(&str, &[&str])] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::detect;
+    use super::{MAX_SAMPLE_BYTES, detect, sample};
 
     /// The case that matters most: prose must not be mistaken for code.
     #[test]
@@ -142,10 +190,22 @@ mod tests {
 
     #[test]
     fn recognises_common_languages() {
-        assert_eq!(detect("fn main() {\n    let mut x: Vec<u8> = vec![];\n    x.push(1);\n}"), Some("rs"));
-        assert_eq!(detect("def f(self):\n    import os\n    if x is None:\n        return True"), Some("py"));
-        assert_eq!(detect("package main\n\nimport \"fmt\"\n\nfunc main() { x := 1; _ = x }"), Some("go"));
-        assert_eq!(detect("SELECT a FROM t JOIN u ON x WHERE y GROUP BY z"), Some("sql"));
+        assert_eq!(
+            detect("fn main() {\n    let mut x: Vec<u8> = vec![];\n    x.push(1);\n}"),
+            Some("rs")
+        );
+        assert_eq!(
+            detect("def f(self):\n    import os\n    if x is None:\n        return True"),
+            Some("py")
+        );
+        assert_eq!(
+            detect("package main\n\nimport \"fmt\"\n\nfunc main() { x := 1; _ = x }"),
+            Some("go")
+        );
+        assert_eq!(
+            detect("SELECT a FROM t JOIN u ON x WHERE y GROUP BY z"),
+            Some("sql")
+        );
     }
 
     #[test]
@@ -154,13 +214,45 @@ mod tests {
         assert_eq!(detect("#!/bin/bash\nls\n"), Some("sh"));
         assert_eq!(detect("{\n  \"name\": \"x\",\n  \"v\": 2\n}"), Some("json"));
         assert_eq!(detect("<?xml version=\"1.0\"?><a/>"), Some("xml"));
-        assert_eq!(detect("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n"), Some("diff"));
+        assert_eq!(
+            detect("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n"),
+            Some("diff")
+        );
     }
 
     /// Markdown is mostly prose, and delta highlights it very lightly. Guessing
     /// wrong here costs more than leaving it alone.
     #[test]
     fn markdown_prose_stays_unhighlighted() {
-        assert_eq!(detect("# Title\n\nSome ordinary paragraph text goes here.\n"), None);
+        assert_eq!(
+            detect("# Title\n\nSome ordinary paragraph text goes here.\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn sniffing_is_byte_bounded_and_utf8_safe() {
+        let text = "é".repeat(MAX_SAMPLE_BYTES);
+        let sampled = sample(&text);
+
+        assert!(sampled.len() <= MAX_SAMPLE_BYTES);
+        assert!(sampled.is_char_boundary(sampled.len()));
+        assert_eq!(sampled.len() % 'é'.len_utf8(), 0);
+    }
+
+    #[test]
+    fn content_after_the_byte_budget_cannot_change_the_guess() {
+        let mut text = "ordinary prose ".repeat(MAX_SAMPLE_BYTES / 4);
+        text.push_str("\nfn main() { let mut value: Vec<u8> = Vec::new(); }");
+
+        assert_eq!(detect(&text), None);
+    }
+
+    #[test]
+    fn early_evidence_survives_a_large_suffix() {
+        let mut text = String::from("fn main() { let mut value: Vec<u8> = Vec::new(); }\n");
+        text.push_str(&"x".repeat(MAX_SAMPLE_BYTES * 2));
+
+        assert_eq!(detect(&text), Some("rs"));
     }
 }

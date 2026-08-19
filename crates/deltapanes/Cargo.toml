@@ -7,9 +7,16 @@ description = "A paste-first GUI frontend for delta"
 
 [dependencies]
 deltapanes-core.workspace = true
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11", "persistence"] }
 egui = "0.36"
 arboard = "3.6"
 rfd = "0.17"
 unicode-width = "0.2"
+# Enumerating installed fonts. Pure Rust on every platform -- font-kit would drag
+# freetype and fontconfig C libraries in on Linux for the same answer.
+fontdb = { version = "0.24", default-features = false, features = ["fs", "memmap", "std"] }
+# Already in the tree via epaint. Used to reject a file before handing it to
+# egui, which panics on unparseable font data from inside the event loop.
+read-fonts = "0.41"
+serde = { version = "1", features = ["derive"] }
 global-hotkey = "0.8"

@@ -5,10 +5,13 @@
 //! delta upgrades changing something underneath us.
 
 use deltapanes_core::ansi::{self, Color};
-use deltapanes_core::delta::{Delta, Input, Options};
+use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options};
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 const LEFT: &str = "fn main() {\n\tlet s = \"héllo wörld\";\n\tprintln!(\"{}\", s);\n}\n";
-const RIGHT: &str = "fn main() {\n\tlet s = \"héllo, wörld!\";\n\tlet n = 42;\n\tprintln!(\"{} {}\", s, n);\n}\n";
+const RIGHT: &str =
+    "fn main() {\n\tlet s = \"héllo, wörld!\";\n\tlet n = 42;\n\tprintln!(\"{} {}\", s, n);\n}\n";
 
 fn delta() -> Delta {
     Delta::discover().expect("these tests require `delta` on PATH (brew install git-delta)")
@@ -31,16 +34,87 @@ fn all_modes() -> Vec<(&'static str, Options)> {
     };
     vec![
         ("unified", base()),
-        ("side-by-side", Options { side_by_side: true, ..base() }),
-        ("no-line-numbers", Options { line_numbers: false, ..base() }),
-        ("narrow-wrap", Options { width: 40, side_by_side: true, ..base() }),
-        ("narrow-truncate", Options { width: 40, side_by_side: true, wrap: false, ..base() }),
-        ("hyperlinks", Options { extra_args: vec!["--hyperlinks".into()], ..base() }),
-        ("navigate", Options { extra_args: vec!["--navigate".into()], ..base() }),
-        ("color-only", Options { extra_args: vec!["--color-only".into()], ..base() }),
-        ("light", Options { extra_args: vec!["--light".into()], ..base() }),
-        ("theme-none", Options { syntax_theme: Some("none".into()), ..base() }),
-        ("raw", Options { extra_args: vec!["--raw".into()], ..base() }),
+        (
+            "side-by-side",
+            Options {
+                side_by_side: true,
+                ..base()
+            },
+        ),
+        (
+            "side-by-side-no-line-numbers",
+            Options {
+                side_by_side: true,
+                line_numbers: false,
+                ..base()
+            },
+        ),
+        (
+            "no-line-numbers",
+            Options {
+                line_numbers: false,
+                ..base()
+            },
+        ),
+        (
+            "narrow-wrap",
+            Options {
+                width: 40,
+                side_by_side: true,
+                ..base()
+            },
+        ),
+        (
+            "narrow-truncate",
+            Options {
+                width: 40,
+                side_by_side: true,
+                wrap: false,
+                ..base()
+            },
+        ),
+        (
+            "hyperlinks",
+            Options {
+                extra_args: vec!["--hyperlinks".into()],
+                ..base()
+            },
+        ),
+        (
+            "navigate",
+            Options {
+                extra_args: vec!["--navigate".into()],
+                ..base()
+            },
+        ),
+        (
+            "color-only",
+            Options {
+                extra_args: vec!["--color-only".into()],
+                ..base()
+            },
+        ),
+        (
+            "light",
+            Options {
+                extra_args: vec!["--light".into()],
+                ..base()
+            },
+        ),
+        (
+            "theme-none",
+            Options {
+                syntax_theme: Some("none".into()),
+                ..base()
+            },
+        ),
+        (
+            "raw",
+            Options {
+                extra_args: vec!["--raw".into()],
+                ..base()
+            },
+        ),
     ]
 }
 
@@ -87,13 +161,26 @@ fn twenty_four_bit_colour_survives_an_empty_environment() {
     let d = delta();
     let (l, r) = buffers();
     let out = d
-        .render(&l, &r, &Options { inherit_gitconfig: false, default_language: Some("rs".into()), ..Options::default() })
+        .render(
+            &l,
+            &r,
+            &Options {
+                inherit_gitconfig: false,
+                default_language: Some("rs".into()),
+                ..Options::default()
+            },
+        )
         .expect("render");
     let has_rgb = ansi::parse(&out)
         .iter()
         .flat_map(|line| line.spans.iter())
-        .any(|s| matches!(s.style.fg, Some(Color::Rgb(..))) || matches!(s.style.bg, Some(Color::Rgb(..))));
-    assert!(has_rgb, "expected 24-bit colour; delta fell back to the 256-colour palette");
+        .any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(..))) || matches!(s.style.bg, Some(Color::Rgb(..)))
+        });
+    assert!(
+        has_rgb,
+        "expected 24-bit colour; delta fell back to the 256-colour palette"
+    );
 }
 
 /// delta infers syntax from the right-hand path only, so a pasted panel needs
@@ -134,10 +221,19 @@ fn default_language_restores_highlighting_for_pasted_panels() {
 fn end_of_line_background_fill_is_captured() {
     let d = delta();
     let (l, r) = buffers();
-    let opts = Options { inherit_gitconfig: false, ..Options::default() };
+    let opts = Options {
+        inherit_gitconfig: false,
+        ..Options::default()
+    };
     let out = d.render(&l, &r, &opts).expect("render");
-    let filled = ansi::parse(&out).iter().filter(|l| l.fill_to_eol.is_some()).count();
-    assert!(filled > 0, "expected some lines to carry an EL background fill");
+    let filled = ansi::parse(&out)
+        .iter()
+        .filter(|l| l.fill_to_eol.is_some())
+        .count();
+    assert!(
+        filled > 0,
+        "expected some lines to carry an EL background fill"
+    );
 }
 
 /// A pasted buffer and the same bytes on disk must render identically, since
@@ -151,7 +247,11 @@ fn buffer_and_path_inputs_agree() {
     std::fs::write(&pl, LEFT).unwrap();
     std::fs::write(&pr, RIGHT).unwrap();
 
-    let opts = Options { inherit_gitconfig: false, default_language: Some("rs".into()), ..Options::default() };
+    let opts = Options {
+        inherit_gitconfig: false,
+        default_language: Some("rs".into()),
+        ..Options::default()
+    };
     let from_paths = d
         .render(&Input::Path(pl), &Input::Path(pr), &opts)
         .expect("render");
@@ -164,6 +264,331 @@ fn buffer_and_path_inputs_agree() {
         String::from_utf8_lossy(&from_buffers),
         "pasted text rendered differently from the identical file on disk"
     );
+}
+
+/// The app's default mode is side-by-side, where delta turns line numbers on for
+/// itself and offers no flag to say no -- so the toolbar checkbox was dead there
+/// until `to_args` learned to empty both column formats instead.
+#[test]
+fn line_numbers_can_be_switched_off_in_side_by_side() {
+    let d = delta();
+    let (l, r) = buffers();
+    let base = Options {
+        inherit_gitconfig: false,
+        side_by_side: true,
+        default_language: Some("rs".into()),
+        ..Options::default()
+    };
+    // Counted as "a digit sits in the gutter before the code", which ignores the
+    // hunk header -- that is a line number too, and it stays either way.
+    let numbered = |on: bool| {
+        let out = d
+            .render(
+                &l,
+                &r,
+                &Options {
+                    line_numbers: on,
+                    ..base.clone()
+                },
+            )
+            .expect("render");
+        strip_ansi(&String::from_utf8_lossy(&out))
+            .lines()
+            .filter_map(|line| line.find("fn main").map(|at| line[..at].to_string()))
+            .filter(|gutter| gutter.contains(|c: char| c.is_ascii_digit()))
+            .count()
+    };
+    assert!(
+        numbered(true) > 0,
+        "side-by-side with line numbers should show some"
+    );
+    assert_eq!(
+        numbered(false),
+        0,
+        "unticking line numbers left them on screen"
+    );
+}
+
+/// delta decides its plus and minus backgrounds from a terminal query that a GUI
+/// cannot answer, so the app states the mode outright. If this stopped working
+/// the diff would silently keep dark backgrounds under a light window.
+#[test]
+fn appearance_picks_delta_s_colour_scheme() {
+    let d = delta();
+    let (l, r) = buffers();
+    let base = Options {
+        inherit_gitconfig: false,
+        default_language: Some("rs".into()),
+        ..Options::default()
+    };
+    let backgrounds = |mode| {
+        let out = d
+            .render(
+                &l,
+                &r,
+                &Options {
+                    appearance: Some(mode),
+                    ..base.clone()
+                },
+            )
+            .expect("render");
+        ansi::parse(&out)
+            .iter()
+            .filter_map(|line| line.fill_to_eol)
+            .collect::<Vec<_>>()
+    };
+    let dark = backgrounds(Appearance::Dark);
+    let light = backgrounds(Appearance::Light);
+    assert!(
+        !dark.is_empty() && !light.is_empty(),
+        "expected filled lines in both modes"
+    );
+    assert_ne!(
+        dark, light,
+        "--dark and --light produced the same diff backgrounds"
+    );
+    // The documented defaults, so a delta change here is visible rather than
+    // merely different.
+    assert!(
+        dark.contains(&Color::Rgb(0x00, 0x28, 0x00)),
+        "dark plus background: {dark:?}"
+    );
+    assert!(
+        light.contains(&Color::Rgb(0xd0, 0xff, 0xd0)),
+        "light plus background: {light:?}"
+    );
+}
+
+/// A rejected flag exits 2 with empty stdout, which is byte-for-byte what two
+/// identical inputs produce. Reading the status is the only way the GUI can tell
+/// "nothing changed" from "delta refused".
+#[test]
+fn a_rejected_invocation_is_an_error_not_an_empty_diff() {
+    let d = delta();
+    let (l, r) = buffers();
+    let opts = Options {
+        inherit_gitconfig: false,
+        extra_args: vec!["--not-a-delta-flag".into()],
+        ..Options::default()
+    };
+    match d.render(&l, &r, &opts) {
+        Err(DeltaError::Refused { code, message }) => {
+            assert_eq!(code, Some(2));
+            assert!(!message.is_empty(), "delta's complaint was dropped");
+            assert!(
+                !message.contains('\u{1b}'),
+                "escape codes reached the message: {message:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A child may write a plausible prefix before discovering a fatal error. The
+/// status remains authoritative: partial ANSI must never be presented as a
+/// successful diff.
+#[test]
+fn partial_stdout_does_not_hide_a_delta_failure() {
+    let dir = unique_test_dir("partial-output");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake_delta = dir.join("delta");
+    write_executable(
+        &fake_delta,
+        "#!/bin/sh\nprintf 'partial rendered output\\n'\nprintf 'synthetic failure\\n' >&2\nexit 2\n",
+    );
+    let d = Delta {
+        path: fake_delta,
+        version: (0, 19, 2),
+        version_string: "delta 0.19.2".into(),
+    };
+    let opts = Options {
+        inherit_gitconfig: false,
+        ..Options::default()
+    };
+
+    match d.render_patch(b"synthetic patch", &opts) {
+        Err(DeltaError::Refused { code, message }) => {
+            assert_eq!(code, Some(2));
+            assert_eq!(message, "synthetic failure");
+        }
+        other => panic!("expected a refusal despite partial stdout, got {other:?}"),
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The GUI owns the Git invocation. Neither the legacy external-diff variable
+/// nor Git's environment-only config layer may replace it with a helper, even
+/// when normal gitconfig inheritance is enabled.
+#[test]
+fn hostile_external_diff_environment_is_ignored() {
+    const CHILD: &str = "DELTAPANES_EXTERNAL_DIFF_CHILD";
+    const SENTINEL: &str = "DELTAPANES_EXTERNAL_DIFF_SENTINEL";
+    if std::env::var_os(CHILD).is_some() {
+        let sentinel = std::path::PathBuf::from(std::env::var_os(SENTINEL).unwrap());
+        let d = delta();
+        for inherit_gitconfig in [false, true] {
+            let (left, right) = buffers();
+            d.render(
+                &left,
+                &right,
+                &Options {
+                    inherit_gitconfig,
+                    default_language: Some("rs".into()),
+                    ..Options::default()
+                },
+            )
+            .expect("owned diff should ignore external helpers");
+            assert!(
+                !sentinel.exists(),
+                "an external diff helper ran with inherit_gitconfig={inherit_gitconfig}"
+            );
+        }
+        return;
+    }
+
+    let dir = unique_test_dir("external-diff");
+    std::fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("hostile-diff");
+    let sentinel = dir.join("helper-ran");
+    write_executable(
+        &helper,
+        "#!/bin/sh\nprintf invoked > \"$DELTAPANES_EXTERNAL_DIFF_SENTINEL\"\nprintf 'not a unified diff\\n'\n",
+    );
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "hostile_external_diff_environment_is_ignored"])
+        .env(CHILD, "1")
+        .env(SENTINEL, &sentinel)
+        .env("GIT_EXTERNAL_DIFF", &helper)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "diff.external")
+        .env("GIT_CONFIG_VALUE_0", &helper)
+        .status()
+        .expect("spawn isolated test process");
+    assert!(status.success(), "isolated helper-injection check failed");
+    assert!(!sentinel.exists(), "external helper left its sentinel");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Identical inputs are delta's way of saying "no difference": empty stdout and
+/// exit 0. The GUI has to tell that apart from a failure, so it is pinned here.
+#[test]
+fn identical_inputs_render_nothing_and_succeed() {
+    let d = delta();
+    let same = || Input::Buffer(LEFT.as_bytes().to_vec());
+    let opts = Options {
+        inherit_gitconfig: false,
+        ..Options::default()
+    };
+    assert!(
+        d.render(&same(), &same(), &opts)
+            .expect("render")
+            .is_empty()
+    );
+}
+
+/// Buffers reach delta as `/dev/fd/N`, and the read ends used to be leaked so
+/// they would survive into the child. They do not need to: the child has its own
+/// copy of the descriptor table once `spawn` returns. The leak cost two
+/// descriptors per render and the GUI renders per keystroke, so a session ran
+/// out of descriptors -- measurably, after about 123 of them -- and then stayed
+/// broken. This is the guard.
+#[test]
+fn rendering_repeatedly_does_not_leak_descriptors() {
+    let d = delta();
+    let opts = Options {
+        inherit_gitconfig: false,
+        ..Options::default()
+    };
+    let render_once = || {
+        let (l, r) = buffers();
+        d.render(&l, &r, &opts).expect("render");
+    };
+    // Warm up first: the first calls settle whatever the runtime opens lazily.
+    for _ in 0..5 {
+        render_once();
+    }
+    let before = open_descriptors();
+    for _ in 0..60 {
+        render_once();
+    }
+    let after = open_descriptors();
+    assert!(
+        after <= before + 4,
+        "60 renders went from {before} open descriptors to {after}; the pipes are leaking again"
+    );
+}
+
+/// `/dev/fd/N` is resolved *by name*, late, by delta and by the `git diff` it
+/// shells out to. Closing the descriptor as soon as `spawn` returns therefore
+/// frees the number while a child is still going to look it up -- and a second
+/// render on another thread gets handed that number, so the first one fails with
+/// "could not access /dev/fd/3". Measured, not theorised: the suite failed only
+/// when run in parallel.
+#[test]
+fn concurrent_renders_do_not_race_over_dev_fd_numbers() {
+    let d = delta();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let d = &d;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let (l, r) = buffers();
+                        let opts = Options {
+                            inherit_gitconfig: false,
+                            ..Options::default()
+                        };
+                        d.render(&l, &r, &opts).expect("concurrent render");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker");
+        }
+    });
+}
+
+/// How many descriptors this process holds. `/dev/fd` lists exactly that on
+/// macOS and Linux both, and reading it is cheaper than parsing `lsof`.
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+}
+
+/// A file that disappears from under a panel makes Git exit 1 with nothing on
+/// stdout -- which is byte-identical to "these inputs are the same". Without
+/// reading the status the GUI shows a blank pane and no reason for it.
+#[test]
+fn a_vanished_file_is_an_error_not_an_empty_diff() {
+    let d = delta();
+    let opts = Options {
+        inherit_gitconfig: false,
+        ..Options::default()
+    };
+    let present = Input::Buffer(LEFT.as_bytes().to_vec());
+    let missing = Input::Path("/nonexistent/deltapanes/gone.rs".into());
+    match d.render(&present, &missing, &opts) {
+        Err(DeltaError::GitRefused { message, .. }) => {
+            assert!(!message.is_empty(), "delta's complaint was dropped")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("deltapanes-{label}-{}-{nonce}", std::process::id()))
+}
+
+fn write_executable(path: &std::path::Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 #[test]

@@ -53,6 +53,30 @@ impl Line {
     }
 }
 
+/// The rows delta actually drew, without the blank line it prints between
+/// files.
+///
+/// There is only ever one "file" in a two-buffer comparison and the app draws
+/// its own headers, so a leading empty row is just the diff starting one line
+/// too low. It lives here rather than in a frontend because it is a fact about
+/// delta's output, and because it has to be the *only* place that decides where
+/// the body starts: `merge::locate` reports row indices into this slice, and a
+/// second trim applied afterwards would silently shift every one of them.
+pub fn body_range(lines: &[Line]) -> std::ops::Range<usize> {
+    let blank = |l: &Line| l.spans.is_empty() && l.fill_to_eol.is_none();
+    let start = lines.iter().position(|l| !blank(l)).unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|l| !blank(l))
+        .map_or(start, |i| i + 1);
+    start..end
+}
+
+/// The lines `body_range` selects.
+pub fn body(lines: &[Line]) -> &[Line] {
+    &lines[body_range(lines)]
+}
+
 /// Parse delta's stdout into styled lines.
 pub fn parse(bytes: &[u8]) -> Vec<Line> {
     let mut parser = Parser::<DefaultCharAccumulator>::new();
