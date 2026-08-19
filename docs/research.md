@@ -54,6 +54,12 @@ extension. That is the right semantics for a per-panel language selector, but it
 also means a panel bound to a real file cannot have its language overridden this
 way.
 
+Because a pasted panel has no filename to infer from, `language::detect` sniffs
+the content instead. It is biased towards returning `None`: pasting prose is a
+normal thing to do, delta renders unhighlighted text fine, and prose mistaken
+for code gets sprayed with meaningless colour. Requiring the user to type a
+language for every paste is the failure mode this avoids.
+
 `--file-style=omit` suppresses delta's own `dev/fd/63 ⟶ b.rs` header, since the
 app draws its own panel headers.
 

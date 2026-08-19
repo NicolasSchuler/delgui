@@ -3,6 +3,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use deltapanes_core::ansi::{self, Line};
+use deltapanes_core::language;
 use deltapanes_core::delta::{Delta, Input, Options};
 use egui::{FontId, Key};
 
@@ -20,14 +21,14 @@ pub struct Panel {
     pub title: String,
     pub text: String,
     pub path: Option<PathBuf>,
-    /// Syntax hint passed as `--default-language`. delta infers from the
-    /// right-hand path only, so a pasted panel has nothing to infer from.
-    pub language: String,
+    /// Syntax sniffed from the panel's own content, recomputed only on edit.
+    /// `None` means "this looks like prose", which is a perfectly good answer.
+    pub detected: Option<&'static str>,
 }
 
 impl Panel {
     fn new(title: &str) -> Self {
-        Self { title: title.into(), text: String::new(), path: None, language: String::new() }
+        Self { title: title.into(), text: String::new(), path: None, detected: None }
     }
 
     fn to_input(&self) -> Input {
@@ -35,6 +36,19 @@ impl Panel {
             Some(p) => Input::Path(p.clone()),
             None => Input::Buffer(self.text.as_bytes().to_vec()),
         }
+    }
+
+    fn resniff(&mut self) {
+        self.detected = language::detect(&self.text);
+    }
+
+    /// What this panel would tell delta about its own syntax: a real path
+    /// speaks for itself, otherwise fall back to what the content looks like.
+    fn language_hint(&self) -> Option<String> {
+        if let Some(ext) = self.path.as_ref().and_then(|p| p.extension()) {
+            return Some(ext.to_string_lossy().into_owned());
+        }
+        self.detected.map(String::from)
     }
 
     fn source_label(&self) -> String {
@@ -61,6 +75,8 @@ pub struct App {
     delta: Delta,
     panels: [Panel; 2],
     opts: Options,
+    /// Empty means "use whatever the panels imply". Typed text wins over that.
+    language_override: String,
     palette: Palette,
 
     diff: Vec<Line>,
@@ -90,17 +106,18 @@ impl App {
                 break;
             }
             panels[slots].text = std::fs::read_to_string(f).unwrap_or_default();
-            if let Some(ext) = f.extension() {
-                panels[slots].language = ext.to_string_lossy().into_owned();
-            }
             panels[slots].path = Some(f.clone());
             slots += 1;
+        }
+        for p in panels.iter_mut() {
+            p.resniff();
         }
         let autorun = panels.iter().all(|p| !p.text.is_empty());
         Self {
             delta,
             panels,
             opts: Options { side_by_side: true, ..Options::default() },
+            language_override: String::new(),
             palette: Palette::dark(),
             diff: Vec::new(),
             error: None,
@@ -122,11 +139,22 @@ impl App {
         }
     }
 
+    /// Resolve the syntax to hand delta, in order of how much we trust it.
+    ///
+    /// delta infers from the right-hand path only, so panel B is consulted
+    /// first: whatever it says is what delta would have concluded on its own.
+    fn resolve_language(&self) -> Option<String> {
+        let explicit = self.language_override.trim();
+        if !explicit.is_empty() {
+            return Some(explicit.to_string());
+        }
+        self.panels[1].language_hint().or_else(|| self.panels[0].language_hint())
+    }
+
     fn effective_options(&self) -> Options {
-        let lang = self.panels.iter().map(|p| p.language.trim()).find(|l| !l.is_empty());
         Options {
             width: self.columns as u16,
-            default_language: lang.map(String::from),
+            default_language: self.resolve_language(),
             ..self.opts.clone()
         }
     }
@@ -197,11 +225,19 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.opts.inherit_gitconfig, "inherit gitconfig");
                 ui.separator();
                 ui.label("lang:");
+                let auto = self
+                    .panels[1]
+                    .language_hint()
+                    .or_else(|| self.panels[0].language_hint());
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.panels[0].language)
-                        .desired_width(60.0)
-                        .hint_text("rs"),
-                );
+                    egui::TextEdit::singleline(&mut self.language_override)
+                        .desired_width(64.0)
+                        .hint_text(auto.clone().unwrap_or_else(|| "prose".into())),
+                )
+                .on_hover_text(match &auto {
+                    Some(l) => format!("detected {l} — type to override"),
+                    None => "looks like prose; left unhighlighted — type to override".into(),
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("{}  ·  {} cols", self.delta.version_string, self.columns))
@@ -230,26 +266,29 @@ impl eframe::App for App {
                                 }
                                 if ui.small_button("open…").clicked() {
                                     if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                        if self.panels[i].language.is_empty() {
-                                            if let Some(ext) = p.extension() {
-                                                self.panels[i].language = ext.to_string_lossy().into_owned();
-                                            }
-                                        }
                                         self.panels[i].text =
                                             std::fs::read_to_string(&p).unwrap_or_default();
                                         self.panels[i].path = Some(p);
+                                        self.panels[i].resniff();
                                     }
                                 }
                             });
                         });
                         egui::ScrollArea::both().id_salt(i).show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.panels[i].text)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(10)
-                                    .hint_text("paste here"),
-                            );
+                            let edited = ui
+                                .add(
+                                    egui::TextEdit::multiline(&mut self.panels[i].text)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(10)
+                                        .hint_text("paste here"),
+                                )
+                                .changed();
+                            // Sniffing is bounded but not free, so it happens on
+                            // edit rather than every frame.
+                            if edited {
+                                self.panels[i].resniff();
+                            }
                         });
                     }
                 });

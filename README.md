@@ -32,8 +32,15 @@ Nothing is written to disk: panel contents reach delta over pipes, the same way
 
 ## Status
 
-Milestone 1. Two panels, paste and file input, live flag toggles, delta-faithful
-rendering. Not yet: file watching, N panels, packaging, OS hotkey.
+Milestone 1. Two panels, paste and file input, automatic language detection,
+live flag toggles, delta-faithful rendering. Not yet: file watching, N panels,
+packaging, OS hotkey.
+
+The `lang:` box is an override, not a requirement. A file panel uses its own
+extension; a pasted panel is sniffed. Prose is detected as prose and left
+unhighlighted, which is what you want when you are diffing paragraphs rather
+than code — the detector is deliberately biased towards answering "don't know",
+because prose sprayed with syntax colour is worse than prose left plain.
 
 See [`docs/research.md`](docs/research.md) for the measurements the design rests
 on — including a gotcha that affects the plain shell workflow too: **delta infers
