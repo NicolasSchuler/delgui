@@ -1,0 +1,8 @@
+Delta produces excellent diff output, but its interface assumes the two things
+being compared already exist as paths in a filesystem or a git tree. That
+assumption breaks down in a common case: the two texts exist in a clipboard,
+a browser, or a log viewer.
+
+The result is that diffs which should take five seconds are skipped entirely,
+or done by eye. There is no local, paste-oriented interface that delegates the
+rendering to an existing tool.
