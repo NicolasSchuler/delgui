@@ -1,0 +1,297 @@
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
+
+use deltapanes_core::ansi::{self, Line};
+use deltapanes_core::delta::{Delta, Input, Options};
+use egui::{FontId, Key};
+
+use crate::render::{Palette, to_layout_job};
+
+/// Beyond this, delta itself becomes the bottleneck: ~0.8 s at 2 MB and ~6.6 s
+/// at 19 MB, producing roughly seven times the input in ANSI. We refuse rather
+/// than hang, since a diff you wait ten seconds for is a diff you did by eye.
+const MAX_PANEL_BYTES: usize = 4 * 1024 * 1024;
+
+/// Delta re-runs on every width change, so resizing has to settle first.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+
+pub struct Panel {
+    pub title: String,
+    pub text: String,
+    pub path: Option<PathBuf>,
+    /// Syntax hint passed as `--default-language`. delta infers from the
+    /// right-hand path only, so a pasted panel has nothing to infer from.
+    pub language: String,
+}
+
+impl Panel {
+    fn new(title: &str) -> Self {
+        Self { title: title.into(), text: String::new(), path: None, language: String::new() }
+    }
+
+    fn to_input(&self) -> Input {
+        match &self.path {
+            Some(p) => Input::Path(p.clone()),
+            None => Input::Buffer(self.text.as_bytes().to_vec()),
+        }
+    }
+
+    fn source_label(&self) -> String {
+        match &self.path {
+            Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            None => format!("paste · {} bytes", self.text.len()),
+        }
+    }
+}
+
+#[derive(Default, PartialEq, Clone)]
+struct RenderKey {
+    left: String,
+    right: String,
+    args: Vec<String>,
+}
+
+enum Job {
+    Done(Vec<Line>),
+    Failed(String),
+}
+
+pub struct App {
+    delta: Delta,
+    panels: [Panel; 2],
+    opts: Options,
+    palette: Palette,
+
+    diff: Vec<Line>,
+    error: Option<String>,
+    rendering: bool,
+    last_key: RenderKey,
+    columns: usize,
+    pending_resize: Option<Instant>,
+    /// Compare once on the first frame when both panels arrived pre-filled.
+    autorun: bool,
+    tx: Sender<Job>,
+    rx: Receiver<Job>,
+}
+
+impl App {
+    pub fn new(delta: Delta, preload: Option<String>, files: &[PathBuf]) -> Self {
+        let (tx, rx) = channel();
+        let mut panels = [Panel::new("A"), Panel::new("B")];
+        if let Some(text) = preload {
+            panels[0].text = text;
+        }
+        // A preloaded clipboard occupies panel A, so files fill from whichever
+        // panels are still empty.
+        let mut slots = panels.iter().position(|p| p.text.is_empty()).unwrap_or(0);
+        for f in files {
+            if slots > 1 {
+                break;
+            }
+            panels[slots].text = std::fs::read_to_string(f).unwrap_or_default();
+            if let Some(ext) = f.extension() {
+                panels[slots].language = ext.to_string_lossy().into_owned();
+            }
+            panels[slots].path = Some(f.clone());
+            slots += 1;
+        }
+        let autorun = panels.iter().all(|p| !p.text.is_empty());
+        Self {
+            delta,
+            panels,
+            opts: Options { side_by_side: true, ..Options::default() },
+            palette: Palette::dark(),
+            diff: Vec::new(),
+            error: None,
+            rendering: false,
+            last_key: RenderKey::default(),
+            columns: 120,
+            pending_resize: None,
+            autorun,
+            tx,
+            rx,
+        }
+    }
+
+    fn current_key(&self) -> RenderKey {
+        RenderKey {
+            left: self.panels[0].path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| self.panels[0].text.clone()),
+            right: self.panels[1].path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| self.panels[1].text.clone()),
+            args: self.effective_options().to_args(),
+        }
+    }
+
+    fn effective_options(&self) -> Options {
+        let lang = self.panels.iter().map(|p| p.language.trim()).find(|l| !l.is_empty());
+        Options {
+            width: self.columns as u16,
+            default_language: lang.map(String::from),
+            ..self.opts.clone()
+        }
+    }
+
+    fn compare(&mut self, ctx: &egui::Context) {
+        if let Some(p) = self.panels.iter().find(|p| p.text.len() > MAX_PANEL_BYTES) {
+            self.error = Some(format!(
+                "Panel {} holds {:.1} MB, over the {} MB limit.\n\
+                 delta takes several seconds at this size and produces ~7x its input in styled output.",
+                p.title,
+                p.text.len() as f64 / 1e6,
+                MAX_PANEL_BYTES / 1024 / 1024
+            ));
+            return;
+        }
+        let key = self.current_key();
+        self.last_key = key;
+        self.rendering = true;
+        self.error = None;
+
+        let (delta, opts) = (self.delta.clone(), self.effective_options());
+        let (left, right) = (self.panels[0].to_input(), self.panels[1].to_input());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let job = match delta.render(&left, &right, &opts) {
+                Ok(bytes) => Job::Done(ansi::parse(&bytes)),
+                Err(e) => Job::Failed(e.to_string()),
+            };
+            let _ = tx.send(job);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll(&mut self) {
+        while let Ok(job) = self.rx.try_recv() {
+            self.rendering = false;
+            match job {
+                Job::Done(lines) => self.diff = lines,
+                Job::Failed(e) => self.error = Some(e),
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
+        self.poll();
+        if self.autorun {
+            self.autorun = false;
+            self.compare(ctx);
+        }
+
+        let font = FontId::monospace(13.0);
+        // delta lays out against a column count, so the GUI's pixel width has to
+        // be translated back into columns and the diff re-rendered on resize.
+        let glyph = ctx.fonts_mut(|f| f.glyph_width(&font, ' ')).max(1.0);
+
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Compare  ⌘⏎").clicked() {
+                    self.compare(ctx);
+                }
+                ui.separator();
+                ui.checkbox(&mut self.opts.side_by_side, "side-by-side");
+                ui.checkbox(&mut self.opts.line_numbers, "line numbers");
+                ui.checkbox(&mut self.opts.wrap, "wrap");
+                ui.checkbox(&mut self.opts.inherit_gitconfig, "inherit gitconfig");
+                ui.separator();
+                ui.label("lang:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.panels[0].language)
+                        .desired_width(60.0)
+                        .hint_text("rs"),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}  ·  {} cols", self.delta.version_string, self.columns))
+                            .weak()
+                            .small(),
+                    );
+                    if self.rendering {
+                        ui.spinner();
+                    }
+                });
+            });
+        });
+
+        egui::Panel::top("panels")
+            .resizable(true)
+            .default_size(260.0)
+            .show(ui, |ui| {
+                ui.columns(2, |cols| {
+                    for (i, ui) in cols.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.strong(&self.panels[i].title);
+                            ui.label(egui::RichText::new(self.panels[i].source_label()).weak().small());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if self.panels[i].path.is_some() && ui.small_button("unbind").clicked() {
+                                    self.panels[i].path = None;
+                                }
+                                if ui.small_button("open…").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                        if self.panels[i].language.is_empty() {
+                                            if let Some(ext) = p.extension() {
+                                                self.panels[i].language = ext.to_string_lossy().into_owned();
+                                            }
+                                        }
+                                        self.panels[i].text =
+                                            std::fs::read_to_string(&p).unwrap_or_default();
+                                        self.panels[i].path = Some(p);
+                                    }
+                                }
+                            });
+                        });
+                        egui::ScrollArea::both().id_salt(i).show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.panels[i].text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(10)
+                                    .hint_text("paste here"),
+                            );
+                        });
+                    }
+                });
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            let cols = ((ui.available_width() / glyph).floor() as usize).clamp(20, 400);
+            if cols != self.columns {
+                self.columns = cols;
+                self.pending_resize = Some(Instant::now());
+            }
+            if let Some(e) = &self.error {
+                ui.colored_label(egui::Color32::from_rgb(0xef, 0x7b, 0x74), e);
+                return;
+            }
+            if self.diff.is_empty() {
+                ui.weak("Paste into both panels, then press ⌘⏎.");
+                return;
+            }
+            egui::ScrollArea::both().show(ui, |ui| {
+                let job = to_layout_job(&self.diff, self.columns, font.clone(), &self.palette);
+                ui.add(egui::Label::new(job).selectable(true));
+            });
+        });
+
+        if ctx.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command) {
+            self.compare(ctx);
+        }
+        // Re-run once the drag settles rather than on every resize frame.
+        if let Some(at) = self.pending_resize {
+            if at.elapsed() >= RESIZE_DEBOUNCE {
+                self.pending_resize = None;
+                if !self.diff.is_empty() {
+                    self.compare(ctx);
+                }
+            } else {
+                ctx.request_repaint_after(RESIZE_DEBOUNCE);
+            }
+        }
+        // A toggle in the toolbar should take effect without a second click.
+        if !self.rendering && !self.diff.is_empty() && self.current_key() != self.last_key {
+            self.compare(ctx);
+        }
+    }
+}

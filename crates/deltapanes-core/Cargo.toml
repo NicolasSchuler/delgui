@@ -1,0 +1,10 @@
+[package]
+name = "deltapanes-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Frontend-agnostic core for deltapanes: delta invocation and ANSI-to-span parsing"
+
+[dependencies]
+anstyle-parse.workspace = true
+libc = "0.2"

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/deltapanes-core", "crates/deltapanes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/nicolas/deltapanes"
+
+[workspace.dependencies]
+deltapanes-core = { path = "crates/deltapanes-core" }
+anstyle-parse = "1.0"
