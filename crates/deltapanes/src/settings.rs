@@ -5,9 +5,56 @@
 //! `~/Library/Application Support` on a 30-second autosave timer would quietly
 //! undo the whole point. Only preferences are stored.
 
+use deltapanes_core::delta::Whitespace;
 use serde::{Deserialize, Serialize};
 
 use crate::fonts::Face;
+
+/// serde cannot derive impls for a type from another crate, and `deltapanes-core`
+/// has no business depending on serde: how the GUI persists a preference is not
+/// a fact about invoking delta. This is serde's own answer -- a local definition
+/// it generates the impls from -- and it keeps one enum in the API.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Whitespace")]
+enum WhitespaceDef {
+    Exact,
+    Amount,
+    All,
+}
+
+/// How much unchanged text each difference is shown with.
+///
+/// `Whole` is what "show me the file, with the changes marked" means; it reaches
+/// git as a context width large enough to cover any file the app will open, and
+/// `MAX_PANEL_BYTES` is four megabytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Context {
+    /// Just the changed lines. What merge mode uses, for the same reason.
+    Tight,
+    #[default]
+    Normal,
+    Whole,
+}
+
+impl Context {
+    pub const ALL: [Self; 3] = [Self::Tight, Self::Normal, Self::Whole];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tight => "Changes only",
+            Self::Normal => "Some context",
+            Self::Whole => "Whole file",
+        }
+    }
+
+    pub fn lines(self) -> u32 {
+        match self {
+            Self::Tight => 0,
+            Self::Normal => 3,
+            Self::Whole => 1_000_000,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum ThemeChoice {
@@ -97,6 +144,15 @@ pub struct Settings {
     pub line_numbers: bool,
     pub wrap: bool,
     pub hunk_headers: bool,
+    pub context: Context,
+    #[serde(with = "WhitespaceDef")]
+    pub whitespace: Whitespace,
+    pub ignore_blank_lines: bool,
+    pub ignore_cr_at_eol: bool,
+    /// Empty rather than absent when unset: a text field the user cleared and a
+    /// field they never touched are the same state, and `Option<String>` invites
+    /// storing `Some("")`, which git reads as "every line matches".
+    pub ignore_matching: String,
     pub syntax_theme: Option<String>,
     pub inherit_gitconfig: bool,
     /// Explicit feature selection. `None` is a pre-feature-settings migration
@@ -127,6 +183,11 @@ impl Default for Settings {
             // decoration for a fact already on screen. Available in Settings for
             // long multi-hunk diffs, where it earns its place.
             hunk_headers: false,
+            context: Context::default(),
+            whitespace: Whitespace::Exact,
+            ignore_blank_lines: false,
+            ignore_cr_at_eol: false,
+            ignore_matching: String::new(),
             syntax_theme: None,
             inherit_gitconfig: true,
             features: None,

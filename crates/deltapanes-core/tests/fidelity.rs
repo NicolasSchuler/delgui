@@ -5,7 +5,7 @@
 //! delta upgrades changing something underneath us.
 
 use deltapanes_core::ansi::{self, Color};
-use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options};
+use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -116,6 +116,143 @@ fn all_modes() -> Vec<(&'static str, Options)> {
             },
         ),
     ]
+}
+
+/// The frontend runs the `git diff --no-index` step itself for every render,
+/// not only while merging, because everything decided before delta sees a patch
+/// -- the context width, where each hunk begins and ends -- never reaches
+/// delta's argv and cannot be read back out of the rendering.
+///
+/// That is only safe because delta's own two-file mode does the same thing:
+/// `delta a b` is documented as `diff -u a b | delta`, and this is the
+/// measurement behind it. It also fires if a delta upgrade changes how the
+/// internal diff is invoked, which would be a silent divergence otherwise.
+#[test]
+fn patch_path_matches_two_file_mode() {
+    let d = delta();
+    for (name, opts) in all_modes() {
+        let (l, r) = buffers();
+        let direct = d.render(&l, &r, &opts).expect("render");
+        let patch = d.diff(&l, &r, &opts).expect("diff");
+        let piped = d.render_patch(&patch, &opts).expect("render patch");
+        assert_eq!(
+            anonymous_descriptors(&direct),
+            anonymous_descriptors(&piped),
+            "mode {name:?}: owning the diff step changed the rendering",
+        );
+    }
+}
+
+/// The number in `/dev/fd/7` is whatever the kernel handed that spawn, and two
+/// spawns are two numbers. It reaches the output only in `--color-only`, which
+/// passes Git's `diff --git a/… b/…` header through untouched -- so comparing
+/// two renderings means comparing everything except it.
+fn anonymous_descriptors(rendered: &[u8]) -> String {
+    let text = String::from_utf8_lossy(rendered);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find("/dev/fd/") {
+        out.push_str(&rest[..at]);
+        out.push_str("/dev/fd/N");
+        rest = rest[at + "/dev/fd/".len()..].trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The same, for the inputs that reach delta as real paths -- where delta infers
+/// the syntax from the filename rather than from `--default-language`, and does
+/// it from a `+++ b/…` header on the piped path instead of from argv.
+#[test]
+fn patch_path_matches_two_file_mode_for_files_too() {
+    let d = delta();
+    let dir = unique_test_dir("patch-path");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (pl, pr) = (dir.join("l.rs"), dir.join("r.rs"));
+    std::fs::write(&pl, LEFT).unwrap();
+    std::fs::write(&pr, RIGHT).unwrap();
+    let opts = Options {
+        inherit_gitconfig: false,
+        ..Options::default()
+    };
+    let direct = d
+        .render(&Input::Path(pl.clone()), &Input::Path(pr.clone()), &opts)
+        .expect("render");
+    let patch = d
+        .diff(&Input::Path(pl), &Input::Path(pr), &opts)
+        .expect("diff");
+    let piped = d.render_patch(&patch, &opts).expect("render patch");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        direct.windows(5).any(|w| w == b"38;2;"),
+        "the fixture stopped being syntax-highlighted, so this proves nothing",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&direct),
+        String::from_utf8_lossy(&piped),
+        "owning the diff step changed the rendering of file-backed panels",
+    );
+}
+
+/// The one thing every comparable tool offers that delta's two-file mode cannot:
+/// `delta -w a b` is not an ignore, it is delta reading `-w` as `--width` and
+/// then refusing the filename as a column count. It is reachable only because
+/// the app runs the diff step itself.
+#[test]
+fn whitespace_can_be_ignored_because_the_diff_step_is_ours() {
+    let d = delta();
+    let left = Input::Buffer("fn main() {\n    let s = 1;\n}\n".into());
+    let right = Input::Buffer("fn main() {\n\tlet   s   =   1;\n}\n".into());
+    let exact = Options {
+        inherit_gitconfig: false,
+        default_language: Some("rs".into()),
+        ..Options::default()
+    };
+    assert!(
+        !d.diff(&left, &right, &exact).expect("diff").is_empty(),
+        "the fixture has to differ for this to prove anything",
+    );
+
+    for mode in [Whitespace::Amount, Whitespace::All] {
+        let opts = Options {
+            whitespace: mode,
+            ..exact.clone()
+        };
+        let patch = d.diff(&left, &right, &opts).expect("diff");
+        assert!(patch.is_empty(), "{mode:?} did not reach git diff");
+        // An empty patch is an empty diff and not a refusal: delta is handed
+        // nothing and says nothing, which is what "no differences" is drawn from.
+        assert!(
+            d.render_patch(&patch, &opts).expect("render").is_empty(),
+            "{mode:?}: an ignored-away difference became an error",
+        );
+    }
+}
+
+/// `-I` is the rule-based half of the same idea, and the one tools like Beyond
+/// Compare build a whole grammar language on. Here it is one pattern.
+#[test]
+fn lines_matching_a_pattern_are_not_differences() {
+    let d = delta();
+    let left = Input::Buffer("build 4919\nreal change\n".into());
+    let right = Input::Buffer("build 5820\nreal change\n".into());
+    let opts = Options {
+        inherit_gitconfig: false,
+        ignore_matching: Some("^build ".into()),
+        ..Options::default()
+    };
+    assert!(
+        d.diff(&left, &right, &opts).expect("diff").is_empty(),
+        "the only changed line matched the pattern",
+    );
+
+    let left = Input::Buffer("build 4919\nreal change\n".into());
+    let right = Input::Buffer("build 5820\nreal change, edited\n".into());
+    assert!(
+        !d.diff(&left, &right, &opts).expect("diff").is_empty(),
+        "a change that is not all pattern is still a difference",
+    );
 }
 
 #[test]

@@ -20,6 +20,11 @@ fn options() -> Options {
     Options {
         inherit_gitconfig: false,
         marked_hunks: true,
+        // Merge mode asks for both: marks to find the hunks by, and no header,
+        // because it draws its own control row there and delta's header
+        // decoration would be drawn inside the hunk instead of above it.
+        hunk_headers: false,
+        pin_hunk_structure: true,
         context: 0,
         default_language: Some("rs".into()),
         ..Options::default()
@@ -125,6 +130,93 @@ fn taking_the_first_hunk_repeatedly_converges_on_the_candidate() {
     }
 }
 
+/// Every render is marked now, not only the ones a result is being built from,
+/// because that is where Previous/Next change gets its list of differences. This
+/// is what makes that free: with the marked rows taken back out, what is left is
+/// exactly what `--hunk-header-style=omit` would have drawn.
+///
+/// If this fails after a delta upgrade, plain comparisons have started rendering
+/// differently from the way they always have -- which is worth failing over.
+#[test]
+fn dropping_the_marked_rows_restores_the_unmarked_rendering() {
+    for side_by_side in [false, true] {
+        for context in [0u32, 3] {
+            let marked = Options {
+                hunk_headers: false,
+                side_by_side,
+                context,
+                ..options()
+            };
+            let unmarked = Options {
+                marked_hunks: false,
+                ..marked.clone()
+            };
+            for (name, base, cand) in CASES {
+                let (hunks, lines) = pipeline(base, cand, &marked);
+                let (drawn, spans) = merge::prepare_rows(rows(&lines), hunks.len(), false);
+                assert!(
+                    spans.is_some() || hunks.is_empty(),
+                    "{name}: could not locate {} hunks at context {context}",
+                    hunks.len(),
+                );
+                let (_, plain) = pipeline(base, cand, &unmarked);
+                assert_eq!(
+                    drawn,
+                    ansi::body(&plain),
+                    "{name}: side_by_side={side_by_side} context={context} -- \
+                     asking delta to mark the hunks changed what is drawn",
+                );
+            }
+        }
+    }
+}
+
+/// The other half: with hunk headers on, the marked row stays and becomes the
+/// header. The difference from an unmarked render is then confined to that row
+/// and to the decoration rules delta draws around it, which it sizes to the
+/// header text -- so they come out as wide as the label made it. That is the
+/// whole price of being able to navigate a diff whose headers are switched on.
+#[test]
+fn a_kept_marked_row_is_the_header_without_its_mark() {
+    let marked = Options {
+        hunk_headers: true,
+        ..options()
+    };
+    let unmarked = Options {
+        marked_hunks: false,
+        ..marked.clone()
+    };
+    let (name, base, cand) = CASES[16];
+    let (hunks, lines) = pipeline(base, cand, &marked);
+    let (drawn, spans) = merge::prepare_rows(rows(&lines), hunks.len(), true);
+    let spans = spans.unwrap_or_else(|| panic!("{name}: marks do not match the hunks"));
+    let (_, plain) = pipeline(base, cand, &unmarked);
+
+    assert_eq!(
+        drawn.len(),
+        ansi::body(&plain).len(),
+        "{name}: keeping the marked rows changed how many rows are drawn",
+    );
+    for span in &spans {
+        assert!(
+            !drawn[span.start].spans.iter().any(|s| s.text.contains('␟')),
+            "{name}: the mark is still visible in the header it was written on",
+        );
+    }
+    // Every row is untouched but the headers and the rules delta drew for them.
+    let rule = |line: &Line| {
+        let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+        !text.is_empty() && text.chars().all(|c| "─│┌┐└┘├┤┄┈".contains(c))
+    };
+    let headers: Vec<usize> = spans.iter().map(|s| s.start).collect();
+    for (i, (ours, theirs)) in drawn.iter().zip(ansi::body(&plain)).enumerate() {
+        if headers.contains(&i) || (rule(ours) && rule(theirs)) {
+            continue;
+        }
+        assert_eq!(ours, theirs, "{name}: row {i} changed and is not a header");
+    }
+}
+
 /// Each hunk has to be findable on screen, or the control row lands beside lines
 /// it does not act on. This is the one thing still read out of the rendering, so
 /// it is where a delta upgrade should draw blood.
@@ -225,10 +317,11 @@ fn side_by_side_and_unified_agree_on_the_hunks() {
     assert_eq!(unified, side);
 }
 
-/// Merge mode renders through a different pipeline than the rest of the app --
-/// our `git diff` piped into delta, rather than delta's own two-file mode. If
-/// those ever stop agreeing, the diff would change appearance the moment a
-/// result panel appears. (research.md §7)
+/// Every render pipes our own `git diff` into delta now, so this no longer
+/// guards a seam between two modes -- `patch_path_matches_two_file_mode` covers
+/// that. What it still pins is the case merge mode is hardest on: a marked,
+/// zero-context, side-by-side render of the fixture with the most hunks.
+/// (research.md §7)
 #[test]
 fn piping_our_own_diff_renders_exactly_as_deltas_two_file_mode_does() {
     let delta = delta();

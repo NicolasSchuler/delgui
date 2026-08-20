@@ -14,6 +14,7 @@ app prints why and exits. Never add a substitute renderer.
 ```sh
 cargo build --release
 cargo run -- examples/config_before.rs examples/config_after.rs   # try it by hand
+cargo run -- --help                                               # incl. the git difftool recipe
 cargo test                                                        # whole workspace
 cargo test -p deltapanes-core --test fidelity                     # delta-output regressions
 cargo test -p deltapanes-core --test merge                        # the take arithmetic
@@ -53,10 +54,10 @@ crates/deltapanes        egui/eframe frontend
 docs/research.md         measured findings; every non-obvious decision below traces here
 ```
 
-The render path is: `Panel` → `Input::Buffer`/`Input::Path` → `Delta::render` (subprocess) →
-`ansi::parse` → `Vec<Line>` → `render::to_layout_job` → egui. Rendering happens on a spawned
-thread; results come back over an `mpsc` channel as a `Job` and land in `App::cache`, keyed by
-panel index.
+The render path is: `Panel` → `Input::Buffer`/`Input::Path` → `Delta::diff` (a `git diff
+--no-index` subprocess) → `Delta::render_patch` (a delta subprocess) → `ansi::parse` → `Vec<Line>`
+→ `render::to_layout_job` → egui. Rendering happens on a spawned thread; results come back over an
+`mpsc` channel as a `Job` and land in `App::cache`, keyed by panel index.
 
 ### Constraints that look arbitrary but are not
 
@@ -118,24 +119,87 @@ Each of these is load-bearing and pinned by a test or documented in `docs/resear
   user picks goes through `read_fonts` first — epaint *panics* on unparseable data, one pass later,
   from inside eframe's event loop — and then through `fonts::probe`, which measures glyph widths
   because `Fonts::has_glyph` false-negatives on any font that also supplies `◻`.
-- **Merge mode reads its structure from the diff, not from the rendering.** delta's two-file mode
-  shells out to `git diff --no-index`; while a result is being built, `Delta::diff` runs that step
-  itself and `Delta::render_patch` pipes the same bytes back in to be drawn. The two are
-  byte-identical (`research.md` §7, §15), so this changes what the app knows and not what it
-  draws. Do not "simplify" it back to parsing `@@` out of delta's output: `--hunk-header-style`
+- **The app owns the diff step, for every render.** delta's two-file mode shells out to
+  `git diff --no-index` itself, so `Delta::diff` runs that step and `Delta::render_patch` pipes the
+  same bytes back in to be drawn. The two are byte-identical — `research.md` §7 and §15 measured
+  it, `patch_path_matches_two_file_mode` pins it, and `anonymous_descriptors` in that test exists
+  because `--color-only` passes Git's `a/dev/fd/7` header through and two spawns get two numbers.
+  What it buys is that the app knows the diff it is showing: the context width and the hunk ranges
+  are decided before delta sees a patch, never reach delta's argv, and cannot be read back out of
+  the rendering. Do not "simplify" it back to `Delta::render` for the non-merge case, and do not
+  parse `@@` out of delta's output: `--hunk-header-style`
   cannot be passed twice and `to_args` already emits it, a `[delta]` section that empties the
   line-number columns makes a line of file content indistinguishable from a header, and
   `[diff] context` silently redefines what a hunk is. In a unified diff every body line is
   prefixed, so only a real header starts with `@@`.
+- **Only merge mode pins the diff's shape.** `Options::pin_hunk_structure` adds
+  `--diff-algorithm=myers --no-indent-heuristic`, and `effective_options` sets it exactly while
+  merging, because a take is a pair of line ranges into buffers and it owns the structure it
+  splices from. A plain render must leave those alone: `diff.indentHeuristic` is on by default and
+  decides whether an added function arrives whole or split mid-comment, and delta's own two-file
+  mode honours it — forcing it off everywhere would make every ordinary diff worse than the one
+  delta would have drawn. `--no-ext-diff`, `--no-textconv` and `--no-color` are not in that
+  bargain; they are unconditional.
+- **`Options::fingerprint` is `to_args` plus `git_diff_args`, whole.** The cache key is built from
+  it, and a setting that shapes the diff without reaching delta's argv — the context width, an
+  ignore flag — would otherwise leave the cache serving the previous render forever. Spelling the
+  diff-only settings out again there is how that bug gets reintroduced.
 - **Merge mode diffs at zero context, and that is the feature.** At git's default of three,
   `examples/config_before.rs` vs `config_after.rs` — thirteen lines, four independent changes —
   is a *single* hunk, i.e. one button for the whole file. `merge::locate` also trims the blank row
   delta prints between hunks, because merge mode draws its own separator.
-- **The only thing read out of the merge rendering is where each hunk was drawn**, and only as a
+- **The only thing read out of the rendering is where each hunk was drawn**, and only as a
   count: `--hunk-label` marks one row per hunk. `locate` returns nothing at all if the marks do
-  not number exactly the hunks git reported, and `verify` then checks that the regions between
-  hunks are identical on both sides — if that holds, every individual take is correct by
-  construction. A failure hides the controls and says so; it never splices anyway.
+  not number exactly the hunks git reported. Merge mode then runs `verify`, which checks that the
+  regions between hunks are identical on both sides — if that holds, every individual take is
+  correct by construction. A failure hides the controls and says so; it never splices anyway.
+- **Every render is marked, and the marks are taken back out before drawing.** Previous/Next change
+  and the "n of m" counter need to know where the differences are, so `effective_options` sets
+  `marked_hunks` always — not only while merging. `--hunk-label` applies to whatever header style
+  is in force, so `hunk_headers` still decides whether a header is drawn, and
+  `merge::prepare_rows` then either drops the marked row (merge mode, which draws its own control
+  row, and a plain render with headers off) or keeps it as the header with the mark taken off the
+  front. Dropping is free — `dropping_the_marked_rows_restores_the_unmarked_rendering` pins the
+  result as byte-identical to `--hunk-header-style=omit`. Keeping costs exactly one thing, pinned
+  by `a_kept_marked_row_is_the_header_without_its_mark`: delta sizes the decoration rule to the
+  header text, so it comes out as wide as the label made it. `prepare_rows` re-trims the body
+  afterwards, because dropping a marker can expose a blank context line the marker was hiding.
+- **A plain diff is drawn as one block; only merge mode cuts it up.** `prepare_shown_diff` builds
+  the per-hunk layouts only while merging, since laying every hunk out a second time would double
+  the layout cost of the longest diffs. Where a hunk was drawn is arithmetic there instead: one
+  rendered line is one laid-out row — delta does the wrapping and `TextWrapMode::Extend` stops egui
+  redoing it — which is the same assumption find already makes.
+- **Difference navigation works in every comparison, and from the keyboard.** ⌘⌥↓/⌘⌥↑ walk the
+  differences and ⌘G/⌘⇧G walk the search matches; both are pending moves (`pending_hunk_move`,
+  `pending_find_move`) claimed by `diff_area` on the next frame, because the frame that draws the
+  diff is the one that knows how many there are and where. F7, which is what the IDEs bind, is not
+  available: `no_binding_is_a_bare_keypress` forbids it, and the panels are text fields.
+- **Ignoring differences is reading, and merge mode is not reading.** `Options` carries the diff
+  step's own ignores — `whitespace` (`-b`/`-w`), `ignore_blank_lines`, `ignore_cr_at_eol`,
+  `ignore_matching` — and `effective_options` forces every one of them off while merging, alongside
+  `context`. `merge::verify` requires the regions between hunks to be identical on both sides, and
+  an ignore is precisely what makes that false: left on, building a result would hide its own take
+  controls. Forced there and never on `self.opts`, which `save` persists verbatim. None of these
+  reach delta's argv, so `fingerprint` is what keeps the cache honest — and none of them are
+  reachable at all through `delta a b`, which reads `-w` as `--width`.
+- **An ignore is never invisible.** `Options::ignoring` puts what is being left out beside the
+  difference count, and into the "no differences" screen — which is the one that would otherwise
+  read as "these files are the same" when it means "the same apart from whitespace".
+- **`Context` is the user's choice; `Options::context` is the argument.** The enum lives in
+  `settings.rs` because the persisted format is a GUI concern, and `Whitespace` lives in core with
+  a `#[serde(remote)]` mirror beside it, so core keeps no serde dependency. "Whole file" is a
+  context width of a million lines, which covers any file `MAX_PANEL_BYTES` admits.
+- **Git may launch the app to resolve a conflict.** `--mergetool BASE LOCAL REMOTE MERGED` binds
+  the three inputs *by position* — an empty ancestor is an ordinary both-sides-added conflict and
+  must not be filled by "first empty panel" — seeds the result from the ancestor, and makes ⌘S
+  write `MERGED`. Seeding from the ancestor is what turns each side into differences to take;
+  seeding from git's own half-merged file would mean diffing against its conflict markers. The exit
+  status is the answer git acts on with `trustExitCode`: `publish_resolution` recomputes every
+  frame whether `MERGED` currently holds the merge, because a save followed by more typing does
+  not, and a successful save publishes immediately because Save and quit can close in that same
+  frame. Measured against real git: the four placeholders expand as documented, the temp files
+  keep the original extension (so delta still infers the syntax), exit 0 stages the file and exit
+  1 leaves it conflicted.
 - **A result panel is a panel with `result` set, and merge mode is the baseline being one.** There
   is no second flag to get out of step. It is excluded from `Panel::is_empty` and from
   `drop_targets`, or a paste, a dropped file or the global hotkey would overwrite it — the last
@@ -212,7 +276,14 @@ reasoning and what a test now pins down.
 ## Open items
 
 Listed at the bottom of `docs/research.md`: CJK glyph coverage (measured — no stock macOS CJK font
-is double-width, so `fonts::probe` warns rather than fixes), search inside the diff (⌘F, still
-unbuilt, and half of why the architecture parses ANSI instead of embedding a terminal), whether
-delta should run in a file panel's repo directory, and per-line takes (a difference is git's unit,
-which at zero context is one contiguous change).
+is double-width, so `fonts::probe` warns rather than fixes), whether delta should run in a file
+panel's repo directory, and per-line takes (a difference is git's unit, which at zero context is
+one contiguous change).
+
+One thing that list used to hold and no longer should:
+
+- **Search in the diff is built.** ⌘F opens a find bar over the *rendered* text — a literal,
+  case-sensitive substring scan (`find_line_offsets`) that counts matches, walks them with
+  Previous/Next, and scrolls to the matching line by multiplying its index by the line height. It
+  does not highlight the match, and it has no regex or case toggle. Being able to do this at all is
+  half of why the architecture parses ANSI rather than embedding a terminal.

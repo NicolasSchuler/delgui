@@ -8,6 +8,10 @@ pub enum Action {
     CloseWindow,
     Compare,
     Find,
+    NextMatch,
+    PreviousMatch,
+    NextChange,
+    PreviousChange,
     AddPanel,
     RemovePanel,
     PasteIntoNewPanel,
@@ -111,6 +115,41 @@ pub fn bindings() -> Vec<Binding> {
             action: Action::Find,
             key: Key::F,
             mods: CMD,
+        },
+        // ⌘G/⌘⇧G are what every macOS app binds find-next to, and F7/⇧F7 -- what
+        // the IDEs use for the next difference -- cannot be borrowed: a bare
+        // keypress would fire while typing into a panel.
+        Binding {
+            label: chord("⌘G", "Ctrl+G"),
+            describe: "next match",
+            group: "compare",
+            action: Action::NextMatch,
+            key: Key::G,
+            mods: CMD,
+        },
+        Binding {
+            label: chord("⌘⇧G", "Ctrl+Shift+G"),
+            describe: "previous match",
+            group: "compare",
+            action: Action::PreviousMatch,
+            key: Key::G,
+            mods: CMD_SHIFT,
+        },
+        Binding {
+            label: chord("⌘⌥↓", "Ctrl+Alt+Down"),
+            describe: "jump to the next difference",
+            group: "compare",
+            action: Action::NextChange,
+            key: Key::ArrowDown,
+            mods: CMD_ALT,
+        },
+        Binding {
+            label: chord("⌘⌥↑", "Ctrl+Alt+Up"),
+            describe: "jump to the previous difference",
+            group: "compare",
+            action: Action::PreviousChange,
+            key: Key::ArrowUp,
+            mods: CMD_ALT,
         },
         Binding {
             label: chord("⌘R", "Ctrl+R"),

@@ -3,13 +3,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use deltapanes_core::ansi::{self, Line};
 use deltapanes_core::config::{self, DeltaConfig};
-use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options};
+use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
 use deltapanes_core::language;
 use deltapanes_core::merge::{self, Hunk};
 use deltapanes_core::watch::FileWatcher;
@@ -19,7 +20,7 @@ use crate::fonts::{self, Face, Family, Probe};
 use crate::hotkey::Hotkey;
 use crate::keys::{self, Action};
 use crate::render::{self, Palette};
-use crate::settings::{MONO_PT, ResultPlacement, Settings, ThemeChoice, UI_PT};
+use crate::settings::{Context, MONO_PT, ResultPlacement, Settings, ThemeChoice, UI_PT};
 use crate::theme::{Tokens, radius};
 use crate::ui;
 
@@ -57,6 +58,31 @@ const FLASH: Duration = Duration::from_secs(4);
 
 const UNDO_DEPTH: usize = 100;
 const UNDO_BYTES: usize = 64_000_000;
+
+/// Where `git mergetool` expects the merge to be written, and whether it was.
+///
+/// Git decides from the exit status whether to stage the file it handed over
+/// (`mergetool.<tool>.trustExitCode`), so the answer has to outlive the window
+/// -- hence the shared flag rather than a return value.
+pub struct MergeTool {
+    pub merged: PathBuf,
+    pub resolved: Arc<AtomicBool>,
+}
+
+/// What the command line asked for, as distinct from what is remembered.
+///
+/// One value rather than six parameters because it keeps growing: every launch
+/// path the app gains -- a paste, a hotkey, git handing over a conflict -- adds
+/// to it, and they are all the same question.
+#[derive(Default)]
+pub struct Launch {
+    pub preload: Option<String>,
+    pub files: Vec<PathBuf>,
+    pub watch: bool,
+    pub combine: bool,
+    pub mergetool: Option<MergeTool>,
+    pub hotkey: Option<Hotkey>,
+}
 
 pub struct Panel {
     pub text: String,
@@ -458,21 +484,35 @@ fn render_job(
     columns: usize,
     merging: bool,
 ) -> Result<Cached, DeltaError> {
+    // One path for every render. delta's two-file mode shells out to
+    // `git diff --no-index` itself, so running that step here costs a process
+    // spawn rather than a second diff, and `patch_path_matches_two_file_mode`
+    // pins the two as byte-identical. What it buys is that the app knows the
+    // diff it is showing: the context width, the hunk ranges, and anything else
+    // decided before delta sees a patch never reaches delta's argv, so it cannot
+    // be recovered from the rendering afterwards.
+    let patch = delta.diff(left, right, opts)?;
+    let rendered = ansi::parse(&delta.render_patch(&patch, opts)?);
+    let hunks = merge::parse(&patch);
+    // Every render is marked, so every render knows where its differences are --
+    // which is all Previous/Next change needs. The marker rows come back out
+    // here; `keep` decides whether the one delta drew stays as the header.
+    let keep = !merging && opts.hunk_headers;
+    let (lines, located) = merge::prepare_rows(ansi::body(&rendered), hunks.len(), keep);
     if !merging {
-        let bytes = delta.render(left, right, opts)?;
         return Ok(Cached {
             key,
-            lines: ansi::parse(&bytes),
+            lines,
             columns,
-            hunks: Vec::new(),
+            // Without spans there is nothing to navigate, which is a quieter
+            // failure than merge mode's: no controls appear and the diff is
+            // unaffected, so it is not worth a banner.
+            hunks: located
+                .map(|spans| hunks.into_iter().zip(spans).collect())
+                .unwrap_or_default(),
             problem: None,
         });
     }
-    let patch = delta.diff(left, right, opts)?;
-    let lines = ansi::parse(&delta.render_patch(&patch, opts)?);
-    let hunks = merge::parse(&patch);
-    let rows = ansi::body_range(&lines);
-    let located = merge::locate(&lines[rows], hunks.len());
     // Both sides are buffers in merge mode, so these are exactly the strings a
     // take will splice -- not a file that may have moved on since git read it.
     let texts = left
@@ -577,8 +617,15 @@ pub struct App {
     undo_bytes: usize,
     /// Where each hunk was drawn, as (top, height) relative to the start of the
     /// diff's content, so a take can put the viewport back where it was.
+    /// Set when git launched the app to resolve a conflict, which changes two
+    /// things: where a save goes, and what the process exit means.
+    mergetool: Option<MergeTool>,
     hunk_boxes: Vec<(f32, f32)>,
     hunk_cursor: usize,
+    /// A jump asked for by the keyboard, waiting for the frame that knows how
+    /// many differences there are and where they were drawn.
+    pending_hunk_move: isize,
+    pending_find_move: isize,
     show_find: bool,
     find_query: String,
     find_cursor: usize,
@@ -604,15 +651,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        delta: Delta,
-        mut settings: Settings,
-        preload: Option<String>,
-        files: &[PathBuf],
-        watch: bool,
-        combine: bool,
-        hotkey: Option<Hotkey>,
-    ) -> Self {
+    pub fn new(delta: Delta, mut settings: Settings, launch: Launch) -> Self {
+        let Launch {
+            preload,
+            files,
+            watch,
+            combine,
+            mergetool,
+            hotkey,
+        } = launch;
         let (tx, rx) = channel();
         let mut panels = vec![Panel::empty(), Panel::empty()];
         let mut error = None;
@@ -621,14 +668,26 @@ impl App {
         }
         // A preloaded clipboard occupies panel A, so files fill from whichever
         // panels are still empty, adding panels when more than two arrive.
-        for f in files {
-            let slot = match panels.iter().position(Panel::is_empty) {
-                Some(i) => i,
-                None if panels.len() < MAX_PANELS => {
+        //
+        // Git's three files go in by position instead. An ancestor that is an
+        // empty file is an ordinary conflict -- both sides added the file -- and
+        // it would otherwise read as an empty panel for the next file to claim,
+        // putting "ours" where the ancestor belongs.
+        for (n, f) in files.iter().enumerate() {
+            let slot = if mergetool.is_some() {
+                while panels.len() <= n {
                     panels.push(Panel::empty());
-                    panels.len() - 1
                 }
-                None => break,
+                n
+            } else {
+                match panels.iter().position(Panel::is_empty) {
+                    Some(i) => i,
+                    None if panels.len() < MAX_PANELS => {
+                        panels.push(Panel::empty());
+                        panels.len() - 1
+                    }
+                    None => break,
+                }
             };
             if let Err(e) = panels[slot].bind(f.clone()) {
                 error.get_or_insert(e);
@@ -703,6 +762,9 @@ impl App {
                 line_numbers: settings.line_numbers,
                 wrap: settings.wrap,
                 hunk_headers: settings.hunk_headers,
+                whitespace: settings.whitespace,
+                ignore_blank_lines: settings.ignore_blank_lines,
+                ignore_cr_at_eol: settings.ignore_cr_at_eol,
                 syntax_theme: settings.syntax_theme.clone(),
                 inherit_gitconfig: settings.inherit_gitconfig,
                 ..Options::default()
@@ -740,6 +802,8 @@ impl App {
             undo_bytes: 0,
             hunk_boxes: Vec::new(),
             hunk_cursor: 0,
+            pending_hunk_move: 0,
+            pending_find_move: 0,
             show_find: false,
             find_query: String::new(),
             find_cursor: 0,
@@ -753,13 +817,26 @@ impl App {
             destructive: None,
             focus_panel: None,
             flash: None,
+            mergetool,
             tx,
             rx,
         };
-        if combine {
+        if combine || app.mergetool.is_some() {
             // Seeded from the first panel, which is the one `--combine a.rs b.rs`
-            // names first and the likeliest starting point.
+            // names first and the likeliest starting point -- and, under
+            // `--mergetool`, git's common ancestor. Starting from the ancestor
+            // is what makes each side's changes a difference to take; starting
+            // from git's own half-merged file would mean diffing against its
+            // conflict markers.
             app.start_result(Some(0));
+        }
+        if let Some(tool) = &app.mergetool {
+            app.notice = Some(format!(
+                "Resolving {} for git. {} writes the merge back and closes the question; \
+                 quitting without it tells git the conflict is unresolved.",
+                tool.merged.display(),
+                keys::save_label(),
+            ));
         }
         app
     }
@@ -820,11 +897,41 @@ impl App {
             // Forced here rather than on `self.opts`, which `save` persists
             // verbatim: building a result once would otherwise rewrite the
             // user's own toolbar defaults for good.
-            marked_hunks: merging,
-            // Zero, because at git's default of three a thirteen-line file with
-            // four independent changes is one hunk -- a single take for the whole
-            // file, which is no way to pick anything.
-            context: if merging { 0 } else { 3 },
+            // Always: the app locates every difference it draws, merging or
+            // not, and `--hunk-label` is what makes that possible.
+            marked_hunks: true,
+            // Merge mode draws its own control row where the header was, and
+            // delta's header decoration would land inside the hunk.
+            hunk_headers: !merging && self.opts.hunk_headers,
+            // Only merge mode: a take is a pair of line ranges, so it owns the
+            // structure it splices from. A plain render leaves git's own
+            // heuristics alone, because delta's two-file mode would have.
+            pin_hunk_structure: merging,
+            // Zero while merging, because at git's default of three a
+            // thirteen-line file with four independent changes is one hunk -- a
+            // single take for the whole file, which is no way to pick anything.
+            context: if merging {
+                0
+            } else {
+                self.settings.context.lines()
+            },
+            // Ignoring differences is a way of reading a diff, and merge mode is
+            // not reading: a take splices a hunk's lines wholesale, and
+            // `merge::verify` requires everything between the hunks to be
+            // identical on both sides -- which is exactly what an ignore makes
+            // false. Forced here rather than on `self.opts`, so that building a
+            // result does not rewrite the setting.
+            whitespace: if merging {
+                Whitespace::Exact
+            } else {
+                self.opts.whitespace
+            },
+            ignore_blank_lines: !merging && self.opts.ignore_blank_lines,
+            ignore_cr_at_eol: !merging && self.opts.ignore_cr_at_eol,
+            ignore_matching: (!merging)
+                .then(|| self.settings.ignore_matching.trim())
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_owned),
             ..self.opts.clone()
         }
     }
@@ -1386,6 +1493,14 @@ impl App {
         self.flash = Some(("Copied".into(), Instant::now()));
     }
 
+    /// The destination a plain Save should use without opening a dialog.
+    fn result_save_target(&self, i: usize) -> Option<PathBuf> {
+        self.panels[i]
+            .saved_to
+            .clone()
+            .or_else(|| self.mergetool.as_ref().map(|tool| tool.merged.clone()))
+    }
+
     /// Write the result to a file. The only thing in deltapanes that writes one.
     fn save_result(&mut self, ask: bool) -> bool {
         let Some(i) = self.result_panel() else {
@@ -1396,7 +1511,11 @@ impl App {
             );
             return false;
         };
-        let path = match self.panels[i].saved_to.clone() {
+        // Git named the destination when it launched us, so the first ⌘S has
+        // somewhere to go without asking. Save as… still asks, which is the way
+        // out if the answer belongs somewhere else after all.
+        let known = self.result_save_target(i);
+        let path = match known {
             Some(p) if !ask => p,
             _ => match rfd::FileDialog::new()
                 .set_file_name(self.suggested_file_name())
@@ -1426,6 +1545,9 @@ impl App {
                 self.flash = Some((format!("Saved to {}", path.display()), Instant::now()));
                 self.panels[i].saved_to = Some(path);
                 self.panels[i].dirty = false;
+                // Saving and closing can happen in one frame. Publish here so
+                // Git sees the write even when there is no next frame.
+                self.publish_resolution();
                 true
             }
             // Reported for the same reason a failed read is: a save that
@@ -1672,18 +1794,20 @@ impl App {
                 }
                 Action::ToggleSettings => self.show_settings = !self.show_settings,
                 Action::ToggleHelp => self.show_help = !self.show_help,
-                Action::Find => {
-                    if self
-                        .cache
-                        .get(&self.shown)
-                        .is_some_and(|cached| !render::is_empty(&cached.lines))
-                    {
-                        self.show_find = true;
-                        self.focus_find = true;
+                Action::Find => self.open_find(),
+                // Walking the matches only makes sense once there is something
+                // to walk; before that ⌘G is the same request as ⌘F.
+                Action::NextMatch | Action::PreviousMatch => {
+                    if self.find_query.is_empty() {
+                        self.open_find();
                     } else {
-                        self.notice = Some("There is no rendered diff to search yet.".into());
+                        self.show_find = true;
+                        self.pending_find_move =
+                            if action == Action::NextMatch { 1 } else { -1 };
                     }
                 }
+                Action::NextChange => self.pending_hunk_move = 1,
+                Action::PreviousChange => self.pending_hunk_move = -1,
                 Action::SaveResult => {
                     let _ = self.save_result(false);
                 }
@@ -1705,6 +1829,40 @@ impl App {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.show_help = false;
             self.show_find = false;
+        }
+    }
+
+    /// Keep git's answer current every frame and immediately after a save.
+    ///
+    /// Not "did a save succeed once": the question git asks on exit is whether
+    /// the file it handed over now holds the merge, and a save followed by more
+    /// typing does not. Cheap enough to redo rather than track from six places
+    /// -- the same reasoning `RenderKey` is rebuilt on.
+    fn publish_resolution(&self) {
+        let Some(tool) = &self.mergetool else {
+            return;
+        };
+        let resolved = self.result_panel().is_some_and(|i| {
+            !self.panels[i].dirty
+                && self.panels[i]
+                    .saved_to
+                    .as_deref()
+                    .is_some_and(|at| paths_refer_to_same_file(at, &tool.merged))
+        });
+        tool.resolved.store(resolved, Ordering::Relaxed);
+    }
+
+    /// The find bar, and the reason it is not there if it cannot be.
+    fn open_find(&mut self) {
+        if self
+            .cache
+            .get(&self.shown)
+            .is_some_and(|cached| !render::is_empty(&cached.lines))
+        {
+            self.show_find = true;
+            self.focus_find = true;
+        } else {
+            self.notice = Some("There is no rendered diff to search yet.".into());
         }
     }
 
@@ -2283,6 +2441,10 @@ impl App {
         palette: &Palette,
         line_height: f32,
     ) {
+        // Only merge mode draws the diff hunk by hunk. A plain render is one
+        // block, and laying every hunk out a second time to reach it would
+        // double the layout cost of the longest diffs.
+        let merging = self.merging();
         let Some(cached) = self.cache.get(&self.shown) else {
             return;
         };
@@ -2310,20 +2472,24 @@ impl App {
             palette,
             line_height,
         );
-        let hunks = cached
-            .hunks
-            .iter()
-            .map(|(_, span)| {
-                render::prepare_layout(
-                    ctx,
-                    &rows[span.clone()],
-                    cached.columns,
-                    font.clone(),
-                    palette,
-                    line_height,
-                )
-            })
-            .collect();
+        let hunks = if merging {
+            cached
+                .hunks
+                .iter()
+                .map(|(_, span)| {
+                    render::prepare_layout(
+                        ctx,
+                        &rows[span.clone()],
+                        cached.columns,
+                        font.clone(),
+                        palette,
+                        line_height,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.prepared.insert(
             self.shown,
             PreparedDiff {
@@ -2365,6 +2531,11 @@ impl App {
         let line_height = self.settings.mono_pt * 1.36;
         self.prepare_shown_diff(ctx, &font, &palette, line_height);
         let restore = self.restore_offset.take();
+        let merging = self.merging();
+        // Claimed before anything borrows `self`, and defaulted to the keyboard's
+        // pending move so a chord and a button click go through one path.
+        let mut move_hunk = std::mem::take(&mut self.pending_hunk_move);
+        let mut move_find = std::mem::take(&mut self.pending_find_move);
         let mut take = None;
         let mut boxes = Vec::new();
         let mut offset = self.diff_offset;
@@ -2373,10 +2544,10 @@ impl App {
             && !prepared.whole.text().is_empty()
         {
             let copy_text = prepared.whole.text().to_owned();
-            let hunk_count = prepared.hunks.len();
+            // From the cache, not from `prepared`: the per-hunk layouts exist
+            // only while merging, and the count is what every render knows.
+            let hunk_count = self.cache.get(&self.shown).map_or(0, |c| c.hunks.len());
             let find_lines = find_line_offsets(&copy_text, &self.find_query);
-            let mut move_hunk = 0isize;
-            let mut move_find = 0isize;
             let mut close_find = false;
             ui.horizontal_wrapped(|ui| {
                 if hunk_count > 0 {
@@ -2394,6 +2565,11 @@ impl App {
                     if ui::ghost(ui, "Next change").clicked() {
                         move_hunk = 1;
                     }
+                }
+                if let Some(what) = self.effective_options().ignoring() {
+                    ui.label(ui::small(what).color(t.text_muted)).on_hover_text(
+                        "Some differences are being left out of this diff, from Settings.",
+                    );
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui::ghost(ui, "Copy diff").clicked() {
@@ -2511,8 +2687,19 @@ impl App {
                             } else {
                                 Color32::from_rgb(0xcd, 0xdd, 0xf5)
                             };
-                            if c.hunks.is_empty() {
+                            if !merging || c.hunks.is_empty() {
                                 ui.add(prepared.whole.label(glyph));
+                                // One rendered line is one laid-out row --
+                                // delta does the wrapping, and `Extend` stops
+                                // egui redoing it -- so where a hunk was drawn
+                                // is arithmetic, and the block does not have to
+                                // be cut up to find out.
+                                boxes.extend(c.hunks.iter().map(|(_, span)| {
+                                    (
+                                        span.start as f32 * line_height,
+                                        span.len() as f32 * line_height,
+                                    )
+                                }));
                                 return;
                             }
                             // Zero spacing so the hunks still read as one block
@@ -2633,7 +2820,7 @@ impl App {
     /// The ways out of the feature: the clipboard, a file, or somewhere else.
     fn result_controls(&mut self, ui: &mut egui::Ui, t: &Tokens, i: usize, act: &mut BandActions) {
         let has_text = !self.panels[i].text.is_empty();
-        let first_save = self.panels[i].saved_to.is_none();
+        let first_save = self.result_save_target(i).is_none();
         if ui::primary(
             ui,
             t,
@@ -2661,7 +2848,7 @@ impl App {
             .corner_radius(radius::CHIP)
             .min_size(Vec2::splat(26.0));
         let (response, _) = egui::containers::menu::MenuButton::from_button(menu).ui(ui, |ui| {
-            if self.panels[i].saved_to.is_some() && ui.button("Save as…").clicked() {
+            if !first_save && ui.button("Save as…").clicked() {
                 act.save = Some(true);
                 ui.close();
             }
@@ -2845,11 +3032,18 @@ impl App {
             );
             return;
         }
+        // An ignore that turns a difference into "no differences" has to say so
+        // here above all: this is the screen someone reads as "these are the
+        // same file".
+        let qualifier = match self.effective_options().ignoring() {
+            Some(what) => format!(" — {what}"),
+            None => String::new(),
+        };
         ui::identical(
             ui,
             t,
             &format!(
-                "{} and {} are identical — {lines} line{}.",
+                "{} and {} are identical — {lines} line{}{qualifier}.",
                 self.panel_label(a),
                 self.panel_label(b),
                 if lines == 1 { "" } else { "s" }
@@ -2957,9 +3151,9 @@ impl App {
                 }
 
                 ui.add_space(16.0);
-                ui::section(ui, &t, "delta");
                 let mut dirty = false;
-                ui::field(ui, &t, "Syntax", |ui| {
+                ui::section(ui, &t, "syntax");
+                ui::field(ui, &t, "Theme", |ui| {
                     let automatic = if self.opts.inherit_gitconfig {
                         "from your gitconfig"
                     } else {
@@ -3031,7 +3225,61 @@ impl App {
                     }
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(16.0);
+                ui::section(ui, &t, "differences");
+                let merging = self.merging();
+                ui::field(ui, &t, "Show", |ui| {
+                    let options: Vec<(Context, &str)> =
+                        Context::ALL.iter().map(|c| (*c, c.label())).collect();
+                    dirty |= ui::choice(ui, &t, &mut self.settings.context, &options);
+                });
+                ui::field(ui, &t, "Whitespace", |ui| {
+                    dirty |= ui::choice(
+                        ui,
+                        &t,
+                        &mut self.opts.whitespace,
+                        &[
+                            (Whitespace::Exact, "Exact"),
+                            (Whitespace::Amount, "Ignore amount"),
+                            (Whitespace::All, "Ignore all"),
+                        ],
+                    );
+                });
+                dirty |= ui
+                    .checkbox(&mut self.opts.ignore_blank_lines, "Ignore blank lines")
+                    .changed();
+                dirty |= ui
+                    .checkbox(
+                        &mut self.opts.ignore_cr_at_eol,
+                        "Ignore Windows line endings",
+                    )
+                    .on_hover_text(
+                        "A file saved with CRLF differs from the same file saved with LF on                          every single line.",
+                    )
+                    .changed();
+                ui::field(ui, &t, "Ignore lines matching", |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ignore_matching)
+                            .desired_width(180.0)
+                            .hint_text("regular expression"),
+                    );
+                    // On losing focus, not on every keystroke: a half-typed
+                    // pattern is usually not a valid one, and git refuses the
+                    // whole diff over it.
+                    dirty |= response.lost_focus();
+                });
+                if merging {
+                    ui.add_space(6.0);
+                    ui.label(
+                        ui::small(
+                            "While a result is being built these are off: a take copies a                              difference's lines exactly, so nothing may be left out of one.",
+                        )
+                        .color(t.text_muted),
+                    );
+                }
+
+                ui.add_space(16.0);
+                ui::section(ui, &t, "delta");
                 dirty |= ui
                     .checkbox(&mut self.opts.hunk_headers, "Hunk headers")
                     .on_hover_text(
@@ -3617,6 +3865,9 @@ impl eframe::App for App {
             line_numbers: self.opts.line_numbers,
             wrap: self.opts.wrap,
             hunk_headers: self.opts.hunk_headers,
+            whitespace: self.opts.whitespace,
+            ignore_blank_lines: self.opts.ignore_blank_lines,
+            ignore_cr_at_eol: self.opts.ignore_cr_at_eol,
             syntax_theme: self.opts.syntax_theme.clone(),
             inherit_gitconfig: self.opts.inherit_gitconfig,
             features: Some(self.features.iter().cloned().collect()),
@@ -3633,6 +3884,7 @@ impl eframe::App for App {
         self.poll_catalog();
         self.poll_watches();
         self.poll_hotkey(ctx);
+        self.publish_resolution();
 
         // delta lays out against a column count, so the GUI's pixel width has to
         // be translated back into columns and the diff re-rendered on resize.
@@ -3827,16 +4079,140 @@ mod tests {
                 version_string: "delta test".into(),
             },
             settings,
-            None,
-            &[],
-            false,
-            false,
-            None,
+            Launch::default(),
         )
     }
 
     fn test_app() -> App {
         test_app_with_settings(Settings::default())
+    }
+
+    fn test_mergetool_app(files: &[PathBuf], merged: PathBuf) -> (App, Arc<AtomicBool>) {
+        let resolved = Arc::new(AtomicBool::new(false));
+        let app = App::new(
+            Delta {
+                path: PathBuf::from("deltapanes-test-delta-does-not-exist"),
+                version: (0, 19, 0),
+                version_string: "delta test".into(),
+            },
+            Settings::default(),
+            Launch {
+                files: files.to_vec(),
+                mergetool: Some(MergeTool {
+                    merged,
+                    resolved: Arc::clone(&resolved),
+                }),
+                ..Launch::default()
+            },
+        );
+        (app, resolved)
+    }
+
+    /// Git's three inputs go in by position, and an *empty* ancestor is an
+    /// ordinary conflict -- both sides added the file. Filled by "first empty
+    /// panel", as every other launch path does, "ours" would land in the
+    /// ancestor's panel and every difference would be measured from the wrong
+    /// side.
+    #[test]
+    fn git_s_files_keep_their_positions_even_when_the_ancestor_is_empty() {
+        let dir = temp_path("mergetool-layout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local, remote) = (dir.join("b"), dir.join("l"), dir.join("r"));
+        std::fs::write(&base, "").unwrap();
+        std::fs::write(&local, "ours\n").unwrap();
+        std::fs::write(&remote, "theirs\n").unwrap();
+        let merged = dir.join("merged.txt");
+
+        let (app, resolved) = test_mergetool_app(
+            &[base.clone(), local.clone(), remote.clone()],
+            merged.clone(),
+        );
+
+        assert_eq!(app.panels[0].path.as_ref(), Some(&base));
+        assert_eq!(app.panels[1].path.as_ref(), Some(&local));
+        assert_eq!(app.panels[2].path.as_ref(), Some(&remote));
+        // The ancestor seeds the result, which is then the baseline: each side's
+        // changes are differences to take, rather than a diff against git's own
+        // half-merged file and its conflict markers.
+        let result = app.result_panel().expect("a result to merge into");
+        assert_eq!(app.reference, result);
+        assert!(app.merging());
+        assert!(app.panels[result].text.is_empty(), "seeded from an empty base");
+        // Nothing has been written, so git is told nothing was resolved.
+        assert!(!resolved.load(Ordering::Relaxed));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Git's destination is already the primary Save target on the first frame,
+    /// and a successful save must reach the shared exit flag before another
+    /// frame gets a chance to publish it.
+    #[test]
+    fn mergetool_first_save_uses_git_s_target_and_resolves_immediately() {
+        let dir = temp_path("mergetool-first-save");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local, remote) = (dir.join("b"), dir.join("l"), dir.join("r"));
+        std::fs::write(&base, "before\n").unwrap();
+        std::fs::write(&local, "ours\n").unwrap();
+        std::fs::write(&remote, "theirs\n").unwrap();
+        let merged = dir.join("conflicted.txt");
+
+        let (mut app, resolved) =
+            test_mergetool_app(&[base, local, remote], merged.clone());
+        let result = app.result_panel().expect("a result to merge into");
+        app.panels[result].text = "resolved\n".into();
+        app.panels[result].dirty = true;
+
+        assert_eq!(
+            app.result_save_target(result).as_deref(),
+            Some(merged.as_path()),
+            "the primary Save control must not ask for another path",
+        );
+        assert!(app.save_result(false));
+        assert_eq!(std::fs::read_to_string(&merged).unwrap(), "resolved\n");
+        assert!(
+            resolved.load(Ordering::Relaxed),
+            "save-and-quit can close before the next frame",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The question git asks on exit is whether the file it handed over holds
+    /// the merge *now* -- not whether a save ever happened. Saving and then
+    /// typing more leaves it unresolved again.
+    #[test]
+    fn git_is_told_the_conflict_is_resolved_only_while_it_actually_is() {
+        let dir = temp_path("mergetool-exit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local) = (dir.join("b"), dir.join("l"));
+        std::fs::write(&base, "one\n").unwrap();
+        std::fs::write(&local, "two\n").unwrap();
+        let merged = dir.join("conflicted.txt");
+
+        let (mut app, resolved) =
+            test_mergetool_app(&[base, local.clone(), local], merged.clone());
+        let result = app.result_panel().expect("a result to merge into");
+
+        app.publish_resolution();
+        assert!(!resolved.load(Ordering::Relaxed), "nothing written yet");
+
+        app.panels[result].saved_to = Some(merged.clone());
+        app.panels[result].dirty = false;
+        app.publish_resolution();
+        assert!(resolved.load(Ordering::Relaxed), "written where git asked");
+
+        app.panels[result].dirty = true;
+        app.publish_resolution();
+        assert!(!resolved.load(Ordering::Relaxed), "edited since");
+
+        // Saved, but somewhere else: git's file is still the conflicted one.
+        app.panels[result].dirty = false;
+        app.panels[result].saved_to = Some(dir.join("elsewhere.txt"));
+        app.publish_resolution();
+        assert!(!resolved.load(Ordering::Relaxed), "not git's file");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[derive(Default)]
@@ -4071,6 +4447,111 @@ mod tests {
 
         assert!(error.contains("not a regular file"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Previous/Next change and the "n of m" counter are driven by
+    /// `Cached::hunks`, which used to be filled only while merging -- so in a
+    /// plain comparison, which is what the app mostly is, the controls never
+    /// appeared and nothing said how many differences there were.
+    #[test]
+    fn a_plain_render_knows_where_its_differences_are() {
+        let delta = Delta::discover().expect("these tests require `delta` on PATH");
+        let mut lines: Vec<String> = (0..20).map(|i| format!("line {i}\n")).collect();
+        let before: String = lines.concat();
+        // Far enough apart that three lines of context cannot join them.
+        lines[2] = "line two, changed\n".into();
+        lines[17] = "line seventeen, changed\n".into();
+        let after: String = lines.concat();
+
+        for hunk_headers in [false, true] {
+            let mut app = test_app();
+            app.opts.hunk_headers = hunk_headers;
+            app.panels[0].text = before.clone();
+            app.panels[1].text = after.clone();
+            assert!(!app.merging());
+
+            let cached = render_job(
+                &delta,
+                &Input::Buffer(before.clone().into_bytes()),
+                &Input::Buffer(after.clone().into_bytes()),
+                &app.effective_options(),
+                app.current_key(),
+                app.columns,
+                false,
+            )
+            .expect("render");
+
+            assert_eq!(
+                cached.hunks.len(),
+                2,
+                "two changes three lines apart are two differences (headers={hunk_headers})",
+            );
+            for (_, span) in &cached.hunks {
+                assert!(
+                    span.start < span.end && span.end <= cached.lines.len(),
+                    "a difference points outside the rows that get drawn",
+                );
+            }
+            assert!(
+                !cached.lines.iter().any(|line| line
+                    .spans
+                    .iter()
+                    .any(|span| span.text.contains(merge::HUNK_LABEL))),
+                "the mark delta was asked for is still on screen (headers={hunk_headers})",
+            );
+        }
+    }
+
+    /// Ignoring differences is a way of *reading* a diff, and building a result
+    /// is not reading: a take copies a difference's lines exactly, and
+    /// `merge::verify` requires everything between the differences to be
+    /// identical on both sides -- which is precisely what an ignore makes false.
+    /// Left on, building a result would silently hide its own controls.
+    #[test]
+    fn building_a_result_ignores_nothing_and_keeps_the_settings() {
+        let mut app = test_app();
+        app.opts.whitespace = Whitespace::All;
+        app.opts.ignore_blank_lines = true;
+        app.opts.ignore_cr_at_eol = true;
+        app.settings.ignore_matching = "  ^build   ".into();
+        app.settings.context = Context::Whole;
+
+        let reading = app.effective_options();
+        assert_eq!(reading.whitespace, Whitespace::All);
+        assert_eq!(reading.context, Context::Whole.lines());
+        // Trimmed, because a pattern typed with a stray space is not a pattern
+        // for a line that begins with one.
+        assert_eq!(reading.ignore_matching.as_deref(), Some("^build"));
+        assert!(reading.ignoring().is_some());
+
+        app.panels[0].result = true;
+        app.reference = 0;
+        app.building_result = true;
+        assert!(app.merging());
+        let building = app.effective_options();
+        assert_eq!(building.whitespace, Whitespace::Exact);
+        assert!(!building.ignore_blank_lines);
+        assert!(!building.ignore_cr_at_eol);
+        assert_eq!(building.ignore_matching, None);
+        assert_eq!(building.context, 0, "each change has to be takeable alone");
+        assert_eq!(building.ignoring(), None);
+
+        // Forced in `effective_options`, never on `opts`: `save` persists `opts`
+        // verbatim, so building a result once would otherwise rewrite the
+        // user's own settings for good.
+        assert_eq!(app.opts.whitespace, Whitespace::All);
+        assert!(app.opts.ignore_blank_lines);
+        assert_eq!(app.settings.context, Context::Whole);
+    }
+
+    /// An empty pattern is not "match everything"; it is a field nobody filled
+    /// in. Git would take it literally.
+    #[test]
+    fn an_empty_ignore_pattern_is_not_passed_to_git() {
+        let mut app = test_app();
+        app.settings.ignore_matching = "   ".into();
+        assert_eq!(app.effective_options().ignore_matching, None);
+        assert_eq!(app.effective_options().ignoring(), None);
     }
 
     /// An empty delta render means equality only for the exact revision that
@@ -4456,7 +4937,7 @@ mod tests {
     fn a_take_over_a_real_render_lands_on_the_candidates_lines() {
         let delta = Delta::discover().expect("this test requires `delta` on PATH");
         let ctx = egui::Context::default();
-        let mut app = App::new(delta, Settings::default(), None, &[], false, false, None);
+        let mut app = App::new(delta, Settings::default(), Launch::default());
         app.opts.inherit_gitconfig = false;
         app.panels[0].text = "fn one() {}\nfn two() {}\nfn three() {}\n".into();
         app.panels[1].text = "fn one() {}\nfn TWO() {}\nfn three() {}\n".into();

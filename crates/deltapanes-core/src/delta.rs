@@ -248,6 +248,26 @@ impl Delta {
     }
 }
 
+/// Confirm Git is present, before a render needs it.
+///
+/// Every render owns its `git diff --no-index` step, so a missing Git is as
+/// fatal as a missing delta. Asking once at startup is the difference between a
+/// message that names the problem and a diff area that fails identically on
+/// every keystroke.
+pub fn require_git() -> Result<(), DeltaError> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--version");
+    let out = run_simple_command(cmd, "git", PROCESS_LIMITS)
+        .map_err(|e| map_run_error(e, DeltaError::GitNotFound))?;
+    if !out.status.success() {
+        return Err(DeltaError::GitRefused {
+            code: out.status.code(),
+            message: first_complaint(&out.stderr),
+        });
+    }
+    Ok(())
+}
+
 /// Run a command over two inputs given as arguments, keeping the pipe discipline
 /// the `/dev/fd` trick depends on.
 fn over_two_inputs(
@@ -620,6 +640,33 @@ impl Appearance {
     }
 }
 
+/// How much of a whitespace change counts as a difference.
+///
+/// Every comparable tool offers some form of this, and it is the difference
+/// between re-indenting a file being one difference or forty. Git spells it
+/// three ways and they are not interchangeable: `-b` still reports a line that
+/// gained indentation, where `-w` does not.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Whitespace {
+    /// Every space is a difference. Git's own default.
+    #[default]
+    Exact,
+    /// `-b`: changes in the *amount* of whitespace, including at end of line.
+    Amount,
+    /// `-w`: whitespace anywhere, including indentation.
+    All,
+}
+
+impl Whitespace {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Exact => None,
+            Self::Amount => Some("--ignore-space-change"),
+            Self::All => Some("--ignore-all-space"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Terminal columns. delta's whole layout keys off this, so the GUI must
@@ -632,18 +679,53 @@ pub struct Options {
     /// on a long diff and pure noise on a two-buffer comparison of ten lines,
     /// where the app's own panel headers already say what is being compared.
     pub hunk_headers: bool,
-    /// Draw one findable row per hunk instead of a header, so the caller can say
-    /// which rows belong to which hunk. Takes precedence over `hunk_headers`:
-    /// delta rejects `--hunk-header-style` given twice, and merge mode replaces
-    /// the header with a control row of its own anyway.
+    /// Label every hunk header, so the caller can say which rows belong to which
+    /// hunk. `--hunk-label` is the only way to ask.
+    ///
+    /// It applies to whatever header style is in force, so this does not decide
+    /// whether a header is drawn -- `hunk_headers` still does. With headers off,
+    /// the cheapest markable header is drawn instead of none, and the caller
+    /// drops the row once it has been found (`merge::prepare_rows`); the result
+    /// is byte-identical to `--hunk-header-style=omit`, which
+    /// `dropping_the_marked_rows_restores_the_unmarked_rendering` pins.
+    ///
+    /// Merge mode therefore asks for headers off as well as marks on: it draws
+    /// its own control row, and delta's decoration rules would land inside the
+    /// hunk rather than above it.
     pub marked_hunks: bool,
+    /// Pin the diff's shape, so a hunk is the same hunk whatever git is
+    /// configured to do.
+    ///
+    /// Merge mode describes every take as a pair of line ranges, so it owns the
+    /// structure it operates on. A plain render must not: `diff.indentHeuristic`
+    /// is on by default and moves hunk boundaries in indented code -- an added
+    /// function comes out whole with it and split mid-comment without it -- and
+    /// delta's own two-file mode reads it. Forcing it off everywhere would make
+    /// every ordinary diff worse than the one delta would have drawn.
+    pub pin_hunk_structure: bool,
+    /// What to stop calling a difference.
+    ///
+    /// These reach `git diff` and nothing else, which is why they sit apart from
+    /// the delta options: `delta -w a b` is not an ignore, it is delta parsing
+    /// `-w` as `--width` and then refusing the filename. Owning the diff step is
+    /// what makes them reachable at all.
+    pub whitespace: Whitespace,
+    pub ignore_blank_lines: bool,
+    /// `--ignore-cr-at-eol`. The cheap half of the CRLF problem: a file saved on
+    /// Windows against one saved anywhere else differs on every single line.
+    pub ignore_cr_at_eol: bool,
+    /// `--ignore-matching-lines`: changes where every changed line matches are
+    /// not differences. A timestamp or a build number is the case for it.
+    pub ignore_matching: Option<String>,
     /// Lines of unchanged context each hunk carries, for the diff step.
     ///
     /// Three is git's default and what delta uses when it runs the diff itself.
     /// Merge mode drops it to zero: at three, `examples/config_before.rs` and
     /// `config_after.rs` -- thirteen lines with four independent changes --
     /// arrive as a *single* hunk, which is one take for the whole file.
-    pub context: u8,
+    /// Wide enough to mean "the whole file": `u8` would cap the offer at 255
+    /// lines of context, which is not the same offer.
+    pub context: u32,
     pub syntax_theme: Option<String>,
     /// Colour scheme to pin delta to. `None` leaves the choice to delta and to
     /// gitconfig, which is what the tests want; the GUI always states it so the
@@ -675,6 +757,11 @@ impl Default for Options {
             wrap: true,
             hunk_headers: true,
             marked_hunks: false,
+            pin_hunk_structure: false,
+            whitespace: Whitespace::Exact,
+            ignore_blank_lines: false,
+            ignore_cr_at_eol: false,
+            ignore_matching: None,
             context: 3,
             syntax_theme: None,
             appearance: None,
@@ -693,7 +780,7 @@ impl Options {
     /// This is public so a frontend can show the pipeline it actually runs
     /// without duplicating safety-critical flags in presentation code.
     pub fn git_diff_args(&self) -> Vec<String> {
-        vec![
+        let mut a = vec![
             "--no-pager".into(),
             "diff".into(),
             "--no-index".into(),
@@ -704,11 +791,54 @@ impl Options {
             // Never execute configured helpers against private panel content.
             "--no-ext-diff".into(),
             "--no-textconv".into(),
-            // Own the hunk structure merge mode operates on.
-            "--diff-algorithm=myers".into(),
-            "--no-indent-heuristic".into(),
-            format!("--unified={}", self.context),
-        ]
+        ];
+        // Only where a hunk is a pair of line ranges something will be spliced
+        // at; see the field. A plain render leaves git's own heuristics alone.
+        if self.pin_hunk_structure {
+            a.push("--diff-algorithm=myers".into());
+            a.push("--no-indent-heuristic".into());
+        }
+        if let Some(flag) = self.whitespace.flag() {
+            a.push(flag.into());
+        }
+        if self.ignore_blank_lines {
+            a.push("--ignore-blank-lines".into());
+        }
+        if self.ignore_cr_at_eol {
+            a.push("--ignore-cr-at-eol".into());
+        }
+        // One argument rather than `-I` and its value, so that a pattern
+        // beginning with a dash stays a pattern and does not become an option.
+        if let Some(pattern) = &self.ignore_matching {
+            a.push(format!("--ignore-matching-lines={pattern}"));
+        }
+        // Stated rather than inherited from `diff.context`, because the width is
+        // a control the app offers and merge mode depends on it being zero.
+        a.push(format!("--unified={}", self.context));
+        a
+    }
+
+    /// What is being ignored, for saying so on screen.
+    ///
+    /// An ignore that suppresses a difference silently is the one way this does
+    /// harm, so the app never leaves it invisible.
+    pub fn ignoring(&self) -> Option<String> {
+        let mut what: Vec<&str> = Vec::new();
+        match self.whitespace {
+            Whitespace::Exact => {}
+            Whitespace::Amount => what.push("whitespace changes"),
+            Whitespace::All => what.push("whitespace"),
+        }
+        if self.ignore_blank_lines {
+            what.push("blank lines");
+        }
+        if self.ignore_cr_at_eol {
+            what.push("line endings");
+        }
+        if self.ignore_matching.is_some() {
+            what.push("matching lines");
+        }
+        (!what.is_empty()).then(|| format!("ignoring {}", what.join(", ")))
     }
 
     pub fn to_args(&self) -> Vec<String> {
@@ -740,18 +870,22 @@ impl Options {
         // One `--hunk-header-style` or none: delta exits 2 on a repeated flag,
         // and the app emits `=omit` by default, so an out-of-band `=raw` on top
         // of it would kill the whole diff rather than just the take controls.
+        if self.marked_hunks && !self.hunk_headers {
+            // A row to find, and as little of one as possible, because it is
+            // about to be dropped. Stated even though `line-number` is delta's
+            // default, because a `[delta]` section can set it to `omit` -- and
+            // then there is no row to find at all.
+            a.push("--hunk-header-style=line-number".into());
+            a.push("--hunk-header-decoration-style=none".into());
+        } else if !self.marked_hunks && !self.hunk_headers {
+            a.push("--hunk-header-style=omit".into());
+        }
         if self.marked_hunks {
-            // Stated even though it is delta's default, because a `[delta]`
-            // section can set it to `omit` -- and then there is no row to find.
             // `raw` (git's own `@@ …` line) would carry the ranges too, but
             // `--hunk-label` does not apply to it, and a line of file content
             // can look exactly like a header. The ranges come from the diff
             // itself instead; this row only has to be findable.
-            a.push("--hunk-header-style=line-number".into());
-            a.push("--hunk-header-decoration-style=none".into());
             a.push(format!("--hunk-label={}", crate::merge::HUNK_LABEL));
-        } else if !self.hunk_headers {
-            a.push("--hunk-header-style=omit".into());
         }
         if let Some(t) = &self.syntax_theme {
             a.push(format!("--syntax-theme={t}"));
@@ -781,13 +915,15 @@ impl Options {
     /// step rather than delta's argv.
     ///
     /// The frontend keys its render cache off this and not off [`to_args`],
-    /// which does not mention `context`: a setting that moves only the diff
-    /// would otherwise leave the cache serving the previous render forever.
+    /// which mentions nothing that shapes the diff: a setting that moves only
+    /// that step would otherwise leave the cache serving the previous render
+    /// forever. Both argument lists whole, rather than the diff-only settings
+    /// spelled out again here, so that adding one cannot forget this.
     ///
     /// [`to_args`]: Options::to_args
     pub fn fingerprint(&self) -> Vec<String> {
         let mut a = self.to_args();
-        a.push(format!("--unified={}", self.context));
+        a.extend(self.git_diff_args());
         a
     }
 
@@ -847,6 +983,7 @@ mod tests {
     fn git_diff_args_state_every_safety_and_hunk_option() {
         let options = Options {
             context: 7,
+            pin_hunk_structure: true,
             ..Options::default()
         };
         assert_eq!(
@@ -863,6 +1000,131 @@ mod tests {
                 "--unified=7",
             ]
         );
+    }
+
+    /// These reach `git diff` and nothing else. Spelled out because they are
+    /// the difference between re-indenting a file being one difference or forty,
+    /// and because `-I` takes its pattern joined to it: split into two argv
+    /// entries, a pattern starting with a dash becomes the next option.
+    #[test]
+    fn ignore_settings_reach_the_diff_step() {
+        let options = Options {
+            whitespace: Whitespace::All,
+            ignore_blank_lines: true,
+            ignore_cr_at_eol: true,
+            ignore_matching: Some("--version".into()),
+            ..Options::default()
+        };
+        let args = options.git_diff_args();
+        assert!(args.contains(&"--ignore-all-space".to_string()));
+        assert!(args.contains(&"--ignore-blank-lines".to_string()));
+        assert!(args.contains(&"--ignore-cr-at-eol".to_string()));
+        assert!(args.contains(&"--ignore-matching-lines=--version".to_string()));
+        assert!(!args.iter().any(|a| a == "--version"), "split into two");
+
+        // `-b` and `-w` are not the same offer, and neither is the default.
+        let amount = Options {
+            whitespace: Whitespace::Amount,
+            ..Options::default()
+        };
+        assert!(
+            amount
+                .git_diff_args()
+                .contains(&"--ignore-space-change".to_string())
+        );
+        assert!(
+            !Options::default()
+                .git_diff_args()
+                .iter()
+                .any(|a| a.starts_with("--ignore"))
+        );
+    }
+
+    /// None of these reach delta's argv, so the cache key has to carry them or
+    /// switching one on would leave the previous diff on screen forever.
+    #[test]
+    fn the_fingerprint_covers_every_ignore() {
+        let base = Options::default();
+        for changed in [
+            Options {
+                whitespace: Whitespace::All,
+                ..Options::default()
+            },
+            Options {
+                ignore_blank_lines: true,
+                ..Options::default()
+            },
+            Options {
+                ignore_cr_at_eol: true,
+                ..Options::default()
+            },
+            Options {
+                ignore_matching: Some("x".into()),
+                ..Options::default()
+            },
+        ] {
+            assert_eq!(base.to_args(), changed.to_args(), "not a delta flag");
+            assert_ne!(base.fingerprint(), changed.fingerprint());
+        }
+    }
+
+    /// An ignore that quietly removes a difference is the one way this feature
+    /// does harm, so the app can always say what is being left out.
+    #[test]
+    fn what_is_being_ignored_can_be_said_out_loud() {
+        assert_eq!(Options::default().ignoring(), None);
+        let options = Options {
+            whitespace: Whitespace::All,
+            ignore_blank_lines: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            options.ignoring().as_deref(),
+            Some("ignoring whitespace, blank lines")
+        );
+    }
+
+    /// Git is now asked for at startup, so the check has to be right about the
+    /// binary it is checking: a wrong program name would turn every launch on a
+    /// perfectly good machine into "`git` was not found on PATH".
+    #[test]
+    fn git_is_found_where_every_render_will_need_it() {
+        super::require_git().expect("these tests already require git on PATH");
+    }
+
+    /// The safety flags are not negotiable; the two that shape the diff are.
+    /// `diff.indentHeuristic` is on by default and decides whether an added
+    /// function arrives whole or split mid-comment, and delta's own two-file
+    /// mode honours it -- so a plain render has to as well.
+    #[test]
+    fn a_plain_render_leaves_git_s_own_heuristics_alone() {
+        let args = Options::default().git_diff_args();
+        assert!(args.contains(&"--no-ext-diff".to_string()));
+        assert!(args.contains(&"--no-textconv".to_string()));
+        assert!(args.contains(&"--no-color".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--diff-algorithm")));
+        assert!(!args.iter().any(|a| a == "--no-indent-heuristic"));
+    }
+
+    /// The cache key is built from `fingerprint`, and a setting that never
+    /// reaches delta's argv would otherwise leave it serving the previous
+    /// render forever.
+    #[test]
+    fn the_fingerprint_covers_settings_that_only_reach_the_diff() {
+        let base = Options::default();
+        let wider_context = Options {
+            context: 0,
+            ..Options::default()
+        };
+        assert_eq!(base.to_args(), wider_context.to_args(), "not a delta flag");
+        assert_ne!(base.fingerprint(), wider_context.fingerprint());
+
+        let pinned = Options {
+            pin_hunk_structure: true,
+            ..Options::default()
+        };
+        assert_eq!(base.to_args(), pinned.to_args(), "not a delta flag either");
+        assert_ne!(base.fingerprint(), pinned.fingerprint());
     }
 
     #[test]

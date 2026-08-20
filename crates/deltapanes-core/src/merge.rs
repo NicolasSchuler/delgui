@@ -129,6 +129,89 @@ pub fn locate(rows: &[Line], hunks: usize) -> Option<Vec<Range<usize>>> {
     )
 }
 
+/// The rows to draw, and where each hunk sits among them.
+///
+/// `--hunk-label` is the only way to be told which row a hunk starts on, and the
+/// label is *visible*, so the marked rows are taken back out here. Either they
+/// go entirely -- merge mode draws its own control row in their place, and a
+/// plain render with hunk headers switched off wants nothing there at all -- or,
+/// when the user did ask for headers, the row stays and only the mark comes off
+/// the front of it.
+///
+/// The rows are cleaned whether or not the spans work out, because a `␟` on
+/// screen is never right. The spans are `None` exactly when [`locate`] refuses.
+///
+/// `rows` must already be the body: [`ansi::body`] trims the blank row delta
+/// prints between files, and the trim is applied again afterwards because
+/// dropping a marker can expose a blank line the marker was hiding.
+///
+/// [`ansi::body`]: crate::ansi::body
+pub fn prepare_rows(
+    rows: &[Line],
+    hunks: usize,
+    keep_marked_rows: bool,
+) -> (Vec<Line>, Option<Vec<Range<usize>>>) {
+    let located = locate(rows, hunks);
+    let mut kept: Vec<Line> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match unmark(row) {
+            Some(header) if keep_marked_rows => kept.push(header),
+            Some(_) => {}
+            None => kept.push(row.clone()),
+        }
+    }
+    // A kept marker row *is* the hunk's header, so the hunk now starts one row
+    // earlier; a dropped one shifts everything after it, and each hunk has
+    // exactly one before its own -- its own plus the ones before it.
+    let spans = located.map(|spans| {
+        spans
+            .into_iter()
+            .enumerate()
+            .map(|(k, span)| {
+                if keep_marked_rows {
+                    span.start - 1..span.end
+                } else {
+                    span.start - (k + 1)..span.end - (k + 1)
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let body = crate::ansi::body_range(&kept);
+    let kept: Vec<Line> = kept[body.clone()].to_vec();
+    let spans = spans.map(|spans| {
+        spans
+            .into_iter()
+            .map(|span| {
+                let start = span.start.saturating_sub(body.start).min(kept.len());
+                let end = span.end.saturating_sub(body.start).clamp(start, kept.len());
+                start..end
+            })
+            .collect()
+    });
+    (kept, spans)
+}
+
+/// A marked row with the mark taken off the front, or `None` if it carries none.
+///
+/// delta writes the label as a span of its own followed by a space, so removing
+/// both leaves the header exactly as it would have been drawn unlabelled -- bar
+/// the decoration rule above it, which delta sized to the longer text.
+fn unmark(row: &Line) -> Option<Line> {
+    let first = row.spans.first()?;
+    let rest = first.text.strip_prefix(HUNK_LABEL)?;
+    let mut row = row.clone();
+    if rest.trim().is_empty() {
+        row.spans.remove(0);
+        if row.spans.first().is_some_and(|s| s.text.trim().is_empty()) {
+            row.spans.remove(0);
+        }
+    } else {
+        row.spans[0].text = rest.to_string();
+    }
+    Some(row)
+}
+
 /// Lines the way git counts them, keeping their terminators.
 ///
 /// `split_inclusive` is exactly git's model: a trailing incomplete line is still

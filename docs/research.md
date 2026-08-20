@@ -306,6 +306,82 @@ focus, at one-second granularity, so a burst of takes made with focus in the dif
 recent snapshot describing the text from *before all of them* — `clear_undoer` after every
 programmatic write is what stops one ⌘Z throwing a merge away.
 
+## 16. One render path, and what it buys
+
+`delta a b` is documented as `diff -u a b | delta`, and it is: piping our own `git diff --no-index`
+into `delta` produces **byte-identical** output for every mode the app offers, for buffers and for
+real paths alike (`patch_path_matches_two_file_mode`). The one thing that differs is not the
+rendering — under `--color-only` delta passes Git's `diff --git a/dev/fd/7 …` header straight
+through, and two spawns get two descriptor numbers.
+
+So the app runs the diff step itself for *every* render, not only while merging. What that buys is
+everything decided before delta sees a patch, none of which reaches delta's argv or can be read back
+out of the rendering:
+
+- **Ignores.** `delta -w a b` is not an ignore. delta parses `-w` as `--width` and fails with
+  *Invalid value for width: "a" is not an integer*. `git diff --no-index -w … | delta` suppresses a
+  whitespace-only change exactly as expected. Same for `--ignore-blank-lines`,
+  `--ignore-cr-at-eol` and `--ignore-matching-lines`.
+- **Context width**, hence "changes only / some context / whole file".
+- **Hunk ranges**, hence Previous/Next change outside merge mode.
+
+What it costs is one process spawn, not a second diff — delta was already shelling out to Git.
+
+**Two flags are not free to force everywhere.** `--diff-algorithm=myers --no-indent-heuristic` are
+merge mode's, because a take is a pair of line ranges into a buffer. `diff.indentHeuristic` is on by
+Git's default and delta's two-file mode honours it; forced off, an added function comes out split
+mid-comment instead of whole:
+
+```
+  with the heuristic          without it
+  }                           }
+ +/*                           /*
+ + * Brand new function       + * Brand new function
+ + */                         + */
+ +static void brand_new()     +static void brand_new()
+```
+
+`--no-ext-diff`, `--no-textconv` and `--no-color` are unconditional: they are safety and
+parseability, not shape.
+
+## 17. Marking every hunk is free, or nearly
+
+`--hunk-label` is the only way to be told which row starts a hunk, and it applies to **whatever**
+header style is in force — not only to `line-number`. Two cases, both measured:
+
+- **Header off.** Ask for `--hunk-header-style=line-number --hunk-header-decoration-style=none`
+  plus the label, then drop the marked rows: the result is byte-identical to
+  `--hunk-header-style=omit`, in unified and side-by-side, at `-U0` and `-U3`
+  (`dropping_the_marked_rows_restores_the_unmarked_rendering`).
+- **Header on.** Keep delta's configured style, add the label, and take the mark off the front of
+  the row. Everything is identical except the decoration rule, which delta sizes to the header
+  text and so draws two characters wider: `─────┐` where it was `───┐`
+  (`a_kept_marked_row_is_the_header_without_its_mark`).
+
+Dropping a marker can expose a blank *context* line the marker was hiding, which `ansi::body_range`
+would then trim — silently shifting every span by one. `merge::prepare_rows` re-trims and
+recomputes, rather than assuming the body it was handed is still the body.
+
+## 18. What `git mergetool` actually passes
+
+Measured against real Git, with a stub in place of the app:
+
+```
+mergetool.<tool>.cmd = tool "$BASE" "$LOCAL" "$REMOTE" "$MERGED"
+
+  BASE=f_BASE_98116.txt  LOCAL=f_LOCAL_98116.txt  REMOTE=f_REMOTE_98116.txt  MERGED=f.txt
+    base line 2:   two
+    local line 2:  MINE      (ours)
+    remote line 2: SIDE      (theirs)
+```
+
+Three findings. The temp files **keep the original extension**, so delta still infers the syntax
+from the filename and a merge does not arrive unhighlighted. `MERGED` is the working-tree file
+itself, not a temp — so it collides with no panel's path and the app's "saving over an input"
+refusal never fires on it. And with `trustExitCode = true`, exit 0 **stages** the file (`M  f.txt`)
+while exit 1 leaves it conflicted (`UU f.txt`) — which is why the exit status is computed from
+whether `MERGED` holds the merge *now*, not from whether a save ever happened.
+
 ## Open items
 
 - **CJK/wide-glyph fidelity.** Measured in §14: no stock macOS CJK font is double-width, so no
@@ -316,4 +392,11 @@ programmatic write is what stops one ⌘Z throwing a merge away.
   so the answer for now is to take the difference and then type; a finer unit would mean deciding
   what a hunk is, which is the line this app does not cross.
 - **cwd policy.** When a panel is bound to a file inside a repo with its own
-  `[delta]` config, should delta run there? Currently `working_dir` is unset.
+  `[delta]` config, should delta run there? Currently `working_dir` is unset. `--mergetool` makes
+  this sharper rather than answering it: Git launches the tool at the repo root, so the process
+  inherits the right directory by accident, and the panels are Git's temp files rather than the
+  repo's.
+- **Ignores are a reading aid only.** They are forced off while a result is being built (§16), so
+  the one workflow where "ignore whitespace" would be most useful — merging two reformatted
+  versions — is the one that cannot have it. Lifting that means teaching `merge::verify` what an
+  ignored difference is, which is a different proposition from passing a flag.
