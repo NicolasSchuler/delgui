@@ -5,12 +5,12 @@
 //! `~/Library/Application Support` on a 30-second autosave timer would quietly
 //! undo the whole point. Only preferences are stored.
 
-use deltapanes_core::delta::Whitespace;
+use delgui_core::delta::Whitespace;
 use serde::{Deserialize, Serialize};
 
 use crate::fonts::Face;
 
-/// serde cannot derive impls for a type from another crate, and `deltapanes-core`
+/// serde cannot derive impls for a type from another crate, and `delgui-core`
 /// has no business depending on serde: how the GUI persists a preference is not
 /// a fact about invoking delta. This is serde's own answer -- a local definition
 /// it generates the impls from -- and it keeps one enum in the API.

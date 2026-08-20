@@ -7,9 +7,9 @@
 //! inspection, and all of them produce output that looks plausible in a buffer
 //! the user is about to write to disk.
 
-use deltapanes_core::ansi::{self, Line};
-use deltapanes_core::delta::{Delta, Input, Options};
-use deltapanes_core::merge::{self, Hunk};
+use delgui_core::ansi::{self, Line};
+use delgui_core::delta::{Delta, Input, Options};
+use delgui_core::merge::{self, Hunk};
 
 fn delta() -> Delta {
     Delta::discover().expect("these tests require `delta` on PATH (brew install git-delta)")

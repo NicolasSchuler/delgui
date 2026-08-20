@@ -3,7 +3,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use deltapanes_core::ansi::{self, Color, Line, Style};
+use delgui_core::ansi::{self, Color, Line, Style};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Color32, Context, CursorIcon, FontId, Galley, Key, Modifiers, OpenUrl, Response, Sense, Stroke,
@@ -440,7 +440,7 @@ fn format_for(style: &Style, font: FontId, palette: &Palette, line_height: f32) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deltapanes_core::ansi::Span;
+    use delgui_core::ansi::Span;
 
     fn palette() -> Palette {
         Palette {

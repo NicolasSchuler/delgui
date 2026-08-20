@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`deltapanes` — a GUI frontend for [`delta`](https://github.com/dandavison/delta). Two or more
+`delgui` — a GUI frontend for [`delta`](https://github.com/dandavison/delta). Two or more
 editable panels are handed to the **real delta binary** over pipes and its ANSI output is parsed
 back into styled spans for egui. delta is a hard dependency, not a fallback: if it is missing the
 app prints why and exits. Never add a substitute renderer.
@@ -16,12 +16,12 @@ cargo build --release
 cargo run -- examples/config_before.rs examples/config_after.rs   # try it by hand
 cargo run -- --help                                               # incl. the git difftool recipe
 cargo test                                                        # whole workspace
-cargo test -p deltapanes-core --test fidelity                     # delta-output regressions
-cargo test -p deltapanes-core --test merge                        # the take arithmetic
-cargo test -p deltapanes-core --test fidelity parser_understands   # one test by name substring
-cargo test -p deltapanes-core watch::tests                         # unit tests inside a module
+cargo test -p delgui-core --test fidelity                     # delta-output regressions
+cargo test -p delgui-core --test merge                        # the take arithmetic
+cargo test -p delgui-core --test fidelity parser_understands   # one test by name substring
+cargo test -p delgui-core watch::tests                         # unit tests inside a module
 cargo clippy --workspace --all-targets
-DELTAPANES_BLESS=1 cargo test -p deltapanes docs::                # regenerate docs/reference.md
+DELGUI_BLESS=1 cargo test -p delgui docs::                # regenerate docs/reference.md
 ```
 
 The code is hand-formatted in a deliberately compact style with no `rustfmt.toml`, so
@@ -36,20 +36,20 @@ on real filesystem events (~0.4–5 s each), so the suite is not instant.
 ## Architecture
 
 ```
-crates/deltapanes-core   no GUI dependencies — kept frontend-agnostic so a ratatui
+crates/delgui-core   no GUI dependencies — kept frontend-agnostic so a ratatui
   delta.rs               frontend stays possible
   ansi.rs
   merge.rs               hunks out of a unified diff, and splicing one into a buffer
   config.rs
   language.rs
   watch.rs
-crates/deltapanes        egui/eframe frontend
+crates/delgui        egui/eframe frontend
   app.rs                 all state + the eframe::App::ui loop
   render.rs              parsed lines -> egui LayoutJobs (one, or one per hunk)
   theme.rs               colour/spacing/type tokens -> egui Visuals and Style
   fonts.rs               font discovery, installation, and monospace probing
   ui.rs                  the styled controls app.rs is assembled from
-  settings.rs            what survives a restart (~/Library/Application Support/deltapanes)
+  settings.rs            what survives a restart (~/Library/Application Support/delgui)
   keys.rs                the single keymap table
   hotkey.rs
 docs/reference.md        generated: every option, chord, flag and limit
@@ -270,7 +270,7 @@ typing, and only file-backed panels offer it — there is nothing for a paste to
 
 ## Style
 
-`docs/reference.md` is **generated** — edit `crates/deltapanes/src/docs.rs` and re-bless it,
+`docs/reference.md` is **generated** — edit `crates/delgui/src/docs.rs` and re-bless it,
 never the Markdown. The generator is compiled only under `cfg(test)`, and its guards are the
 point of it: each `describe_*` is an exhaustive `match` with no wildcard arm and the `Settings`
 and `Options` defaults are destructured field by field, so adding an `Action`, an enum variant

@@ -1,12 +1,19 @@
 [package]
-name = "deltapanes"
+name = "delgui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
 description = "A paste-first GUI frontend for delta"
+keywords = ["diff", "delta", "gui", "git", "merge"]
+categories = ["development-tools", "gui", "command-line-utilities"]
 
 [dependencies]
-deltapanes-core.workspace = true
+delgui-core.workspace = true
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11", "persistence"] }
 egui = "0.36"
 arboard = "3.6"

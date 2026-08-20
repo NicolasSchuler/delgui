@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use deltapanes_core::ansi::{self, Line};
-use deltapanes_core::config::{self, DeltaConfig};
-use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
-use deltapanes_core::language;
-use deltapanes_core::merge::{self, Hunk};
-use deltapanes_core::watch::FileWatcher;
+use delgui_core::ansi::{self, Line};
+use delgui_core::config::{self, DeltaConfig};
+use delgui_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
+use delgui_core::language;
+use delgui_core::merge::{self, Hunk};
+use delgui_core::watch::FileWatcher;
 use egui::{Align, Color32, Frame, Key, Layout, Margin, RichText, Stroke, TextStyle, Vec2};
 
 use crate::fonts::{self, Face, Family, Probe};
@@ -284,7 +284,7 @@ fn read_panel_text(path: &Path) -> Result<String, String> {
     }
     String::from_utf8(bytes).map_err(|e| {
         format!(
-            "Could not read {} as text: {e}. deltapanes compares text.",
+            "Could not read {} as text: {e}. delgui compares text.",
             path.display()
         )
     })
@@ -292,14 +292,14 @@ fn read_panel_text(path: &Path) -> Result<String, String> {
 
 fn panel_read_error(path: &Path, error: &std::io::Error) -> String {
     format!(
-        "Could not read {} as text: {error}. deltapanes compares text.",
+        "Could not read {} as text: {error}. delgui compares text.",
         path.display()
     )
 }
 
 fn panel_too_large(path: &Path, bytes: usize) -> String {
     format!(
-        "Could not read {}: it is {:.1} MB. deltapanes stops at {} MB so the GUI stays responsive.",
+        "Could not read {}: it is {:.1} MB. delgui stops at {} MB so the GUI stays responsive.",
         path.display(),
         bytes as f64 / 1e6,
         MAX_PANEL_BYTES / 1_000_000
@@ -341,7 +341,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut last_collision = None;
     for _ in 0..32 {
         let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
-        let temp = parent.join(format!(".{name}.deltapanes-{}-{nonce}", std::process::id()));
+        let temp = parent.join(format!(".{name}.delgui-{}-{nonce}", std::process::id()));
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -526,7 +526,7 @@ fn render_job(
         (None, _) => (
             Vec::new(),
             Some(
-                "deltapanes cannot tell which rows each difference covers here, so it is not \
+                "delgui cannot tell which rows each difference covers here, so it is not \
                  offering to take them. The diff itself is unaffected."
                     .to_string(),
             ),
@@ -535,7 +535,7 @@ fn render_job(
             Vec::new(),
             Some(
                 "The diff does not account for everything these panels differ by, so \
-                 deltapanes is not offering to take from it. The diff itself is unaffected."
+                 delgui is not offering to take from it. The diff itself is unaffected."
                     .to_string(),
             ),
         ),
@@ -730,9 +730,9 @@ impl App {
         let mut startup_notices = Vec::new();
         if syntax_theme_reset {
             startup_notices.push(if settings.inherit_gitconfig {
-                "The saved delta syntax theme is no longer available, so deltapanes returned to your gitconfig."
+                "The saved delta syntax theme is no longer available, so delgui returned to your gitconfig."
             } else {
-                "The saved delta syntax theme is no longer available, so deltapanes returned to delta's default."
+                "The saved delta syntax theme is no longer available, so delgui returned to delta's default."
             });
         }
         if features_reset {
@@ -994,7 +994,7 @@ impl App {
         for i in [reference, shown] {
             if self.panels[i].text.len() > MAX_PANEL_BYTES {
                 self.error = Some(format!(
-                    "Panel {} holds {:.1} MB. deltapanes stops at {} MB because delta takes \
+                    "Panel {} holds {:.1} MB. delgui stops at {} MB because delta takes \
                      about a second per megabyte and produces seven times its input in \
                      styled output.",
                     title(i),
@@ -1254,7 +1254,7 @@ impl App {
     fn paste_into_new_panel(&mut self) {
         let Some(text) = crate::clipboard_text() else {
             self.notice = Some(
-                "The clipboard holds no text. deltapanes compares text; images and files \
+                "The clipboard holds no text. delgui compares text; images and files \
                  have to be dropped onto a panel instead."
                     .into(),
             );
@@ -1501,7 +1501,7 @@ impl App {
             .or_else(|| self.mergetool.as_ref().map(|tool| tool.merged.clone()))
     }
 
-    /// Write the result to a file. The only thing in deltapanes that writes one.
+    /// Write the result to a file. The only thing in delgui that writes one.
     fn save_result(&mut self, ask: bool) -> bool {
         let Some(i) = self.result_panel() else {
             self.notice = Some(
@@ -3066,7 +3066,7 @@ impl App {
             ui,
             t,
             "Nothing to compare yet",
-            "Put text in two panels and deltapanes will diff them with the real delta binary.",
+            "Put text in two panels and delgui will diff them with the real delta binary.",
             &[
                 ("paste", "into a panel, or drop a file onto it"),
                 (keys::compare_label(), "compare"),
@@ -3324,7 +3324,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(
-                            "No [delta] section in your gitconfig, so deltapanes is using \
+                            "No [delta] section in your gitconfig, so delgui is using \
                          delta's own defaults.",
                         )
                         .color(t.text_muted),
@@ -3502,7 +3502,7 @@ impl App {
                 } else {
                     "Replace panels"
                 },
-                "Opening the selected file will replace text that exists only in deltapanes.",
+                "Opening the selected file will replace text that exists only in delgui.",
             ),
             DestructiveAction::Reload(_) => (
                 "Discard edits and reload?",
@@ -3617,7 +3617,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
-                        "{} panel{} contain{} text or edits that exist only in deltapanes.",
+                        "{} panel{} contain{} text or edits that exist only in delgui.",
                         unsaved.len(),
                         if unsaved.len() == 1 { "" } else { "s" },
                         if unsaved.len() == 1 { "s" } else { "" },
@@ -3703,7 +3703,7 @@ impl App {
                     ui.add_space(12.0);
                     ui.label(
                         ui::small(format!(
-                            "{} pastes into deltapanes from anywhere while it runs",
+                            "{} pastes into delgui from anywhere while it runs",
                             h.label
                         ))
                         .color(t.text_muted),
@@ -4074,7 +4074,7 @@ mod tests {
     fn test_app_with_settings(settings: Settings) -> App {
         App::new(
             Delta {
-                path: PathBuf::from("deltapanes-test-delta-does-not-exist"),
+                path: PathBuf::from("delgui-test-delta-does-not-exist"),
                 version: (0, 19, 0),
                 version_string: "delta test".into(),
             },
@@ -4091,7 +4091,7 @@ mod tests {
         let resolved = Arc::new(AtomicBool::new(false));
         let app = App::new(
             Delta {
-                path: PathBuf::from("deltapanes-test-delta-does-not-exist"),
+                path: PathBuf::from("delgui-test-delta-does-not-exist"),
                 version: (0, 19, 0),
                 version_string: "delta test".into(),
             },
@@ -4263,7 +4263,7 @@ mod tests {
     #[test]
     fn a_saved_feature_removed_from_gitconfig_is_disabled() {
         let app = test_app_with_settings(Settings {
-            features: Some(vec!["deltapanes-test-feature-that-does-not-exist".into()]),
+            features: Some(vec!["delgui-test-feature-that-does-not-exist".into()]),
             ..Settings::default()
         });
         assert!(app.features.is_empty());
@@ -4333,7 +4333,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time went backwards")
             .as_nanos();
-        std::env::temp_dir().join(format!("deltapanes-{label}-{}-{nonce}", std::process::id()))
+        std::env::temp_dir().join(format!("delgui-{label}-{}-{nonce}", std::process::id()))
     }
 
     fn file_panel(text: &str) -> Panel {
@@ -4874,7 +4874,7 @@ mod tests {
             !entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with(&format!(".{stem}.deltapanes-"))
+                .starts_with(&format!(".{stem}.delgui-"))
         }));
         let _ = std::fs::remove_file(path);
     }

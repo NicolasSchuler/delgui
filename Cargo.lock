@@ -715,11 +715,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "deltapanes"
+name = "delgui"
 version = "0.1.0"
 dependencies = [
  "arboard",
- "deltapanes-core",
+ "delgui-core",
  "eframe",
  "egui",
  "fontdb",
@@ -731,7 +731,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "deltapanes-core"
+name = "delgui-core"
 version = "0.1.0"
 dependencies = [
  "anstyle-parse",

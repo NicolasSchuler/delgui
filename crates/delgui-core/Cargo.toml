@@ -1,0 +1,18 @@
+[package]
+name = "delgui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+description = "Frontend-agnostic core for delgui: delta invocation and ANSI-to-span parsing"
+keywords = ["diff", "delta", "ansi", "git"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+anstyle-parse.workspace = true
+libc = "0.2"
+notify = "8"

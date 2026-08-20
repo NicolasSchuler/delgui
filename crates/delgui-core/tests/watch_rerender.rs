@@ -5,9 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use deltapanes_core::ansi;
-use deltapanes_core::delta::{Delta, Input, Options};
-use deltapanes_core::watch::FileWatcher;
+use delgui_core::ansi;
+use delgui_core::delta::{Delta, Input, Options};
+use delgui_core::watch::FileWatcher;
 
 fn visible(bytes: &[u8]) -> String {
     ansi::parse(bytes)

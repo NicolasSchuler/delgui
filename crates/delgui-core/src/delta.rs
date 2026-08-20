@@ -71,12 +71,12 @@ impl std::fmt::Display for DeltaError {
             Self::NotFound => write!(
                 f,
                 "`delta` was not found on PATH.\n\
-                 deltapanes renders diffs with the real delta binary and does not\n\
+                 delgui renders diffs with the real delta binary and does not\n\
                  substitute its own renderer.\n\n  brew install git-delta\n  cargo install git-delta"
             ),
             Self::TooOld { found } => write!(
                 f,
-                "found delta {found}, but deltapanes needs at least {}.{}",
+                "found delta {found}, but delgui needs at least {}.{}",
                 MINIMUM_VERSION.0, MINIMUM_VERSION.1
             ),
             Self::UnreadableVersion { output } => {
@@ -89,7 +89,7 @@ impl std::fmt::Display for DeltaError {
             Self::GitNotFound => write!(
                 f,
                 "`git` was not found on PATH.\n\
-                 deltapanes runs `git diff --no-index` before every delta render,\n\
+                 delgui runs `git diff --no-index` before every delta render,\n\
                  so it needs Git too."
             ),
             Self::GitRefused { code, message } => match code {

@@ -16,12 +16,12 @@ mod ui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use deltapanes_core::delta::{self, Delta, DeltaError};
+use delgui_core::delta::{self, Delta, DeltaError};
 
 const USAGE: &str = "\
-deltapanes — a paste-first GUI frontend for delta
+delgui — a paste-first GUI frontend for delta
 
-  deltapanes [OPTIONS] [FILE]...
+  delgui [OPTIONS] [FILE]...
 
   --paste       load the clipboard into the first panel
   --combine     start a result panel, seeded from the first file
@@ -32,12 +32,12 @@ deltapanes — a paste-first GUI frontend for delta
 
 As git's diff and merge tool:
 
-  git config --global diff.tool deltapanes
-  git config --global difftool.deltapanes.cmd 'deltapanes \"$LOCAL\" \"$REMOTE\"'
-  git config --global merge.tool deltapanes
-  git config --global mergetool.deltapanes.cmd \
-      'deltapanes --mergetool \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"'
-  git config --global mergetool.deltapanes.trustExitCode true
+  git config --global diff.tool delgui
+  git config --global difftool.delgui.cmd 'delgui \"$LOCAL\" \"$REMOTE\"'
+  git config --global merge.tool delgui
+  git config --global mergetool.delgui.cmd \
+      'delgui --mergetool \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"'
+  git config --global mergetool.delgui.trustExitCode true
 
 Rendering is done by the real delta binary, so your [delta] gitconfig applies.
 ";
@@ -64,7 +64,7 @@ fn main() -> eframe::Result<()> {
         .iter()
         .find(|a| a.starts_with('-') && !FLAGS.contains(&a.as_str()))
     {
-        eprintln!("deltapanes: unknown option {bad}\n");
+        eprintln!("delgui: unknown option {bad}\n");
         eprint!("{USAGE}");
         std::process::exit(2);
     }
@@ -92,7 +92,7 @@ fn main() -> eframe::Result<()> {
         .then(|| match hotkey::Hotkey::register() {
             Ok(h) => Some(h),
             Err(e) => {
-                eprintln!("deltapanes: could not register the global hotkey: {e}");
+                eprintln!("delgui: could not register the global hotkey: {e}");
                 None
             }
         })
@@ -106,7 +106,7 @@ fn main() -> eframe::Result<()> {
     let mergetool = flag("--mergetool").then(|| {
         let [base, local, remote, merged] = files.as_slice() else {
             eprintln!(
-                "deltapanes: --mergetool needs exactly four files — BASE LOCAL REMOTE MERGED, \
+                "delgui: --mergetool needs exactly four files — BASE LOCAL REMOTE MERGED, \
                  which is what git passes.\n"
             );
             eprint!("{USAGE}");
@@ -129,13 +129,13 @@ fn main() -> eframe::Result<()> {
     });
     let in_mergetool = mergetool.is_some();
     let outcome = eframe::run_native(
-        "deltapanes",
+        "delgui",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1240.0, 860.0])
                 .with_min_inner_size([720.0, 480.0])
-                .with_app_id("deltapanes")
-                .with_title("deltapanes"),
+                .with_app_id("delgui")
+                .with_title("delgui"),
             ..Default::default()
         },
         Box::new(move |cc| {
@@ -176,10 +176,10 @@ fn main() -> eframe::Result<()> {
 /// Say why, in both places someone might be looking: the terminal this may have
 /// been launched from, and the screen of someone who double-clicked it.
 fn cannot_start<T>(error: DeltaError) -> T {
-    eprintln!("deltapanes: {error}");
+    eprintln!("delgui: {error}");
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
-        .set_title("deltapanes can’t start")
+        .set_title("delgui can’t start")
         .set_description(error.to_string())
         .set_buttons(rfd::MessageButtons::Ok)
         .show();

@@ -1,13 +1,19 @@
 [workspace]
 resolver = "3"
-members = ["crates/deltapanes-core", "crates/deltapanes"]
+members = ["crates/delgui-core", "crates/delgui"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/nicolas/deltapanes"
+repository = "https://github.com/NicolasSchuler/delgui"
+homepage = "https://github.com/NicolasSchuler/delgui"
+authors = ["Nicolas Schuler"]
+# Not edition 2024's own 1.85: `std::io::pipe` is stable since 1.87, and it is
+# what lets panel buffers reach delta without a temp file. Clippy's msrv lint
+# found the real floor once `rust-version` was stated at all.
+rust-version = "1.87"
 
 [workspace.dependencies]
-deltapanes-core = { path = "crates/deltapanes-core" }
+delgui-core = { path = "crates/delgui-core" }
 anstyle-parse = "1.0"

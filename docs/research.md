@@ -2,7 +2,7 @@
 
 Measured against **delta 0.19.2**, git 2.55.0, macOS 26.5, on 2026-08-19.
 Every claim here came from running the binary, not from reading its docs.
-The `deltapanes-core` test suite encodes the load-bearing ones as regressions.
+The `delgui-core` test suite encodes the load-bearing ones as regressions.
 
 ## 1. delta's ANSI output is a closed, tiny grammar
 
@@ -24,7 +24,7 @@ that needs a terminal's state machine.
 (parse to styled spans) wins on evidence rather than taste: embedding a terminal
 emulator would buy fidelity for a grammar that contains none of the hard parts,
 while giving up control of selection and search — the two things a diff reviewer
-actually does. The parser is `crates/deltapanes-core/src/ansi.rs`, ~230 lines.
+actually does. The parser is `crates/delgui-core/src/ansi.rs`, ~230 lines.
 Supporting evidence: `egui_term` is v0.1.0 with ~2k downloads and untouched since
 April 2025, so strategy 2 also has no maintained implementation on this stack.
 
@@ -274,7 +274,7 @@ rather than something to smuggle past gitconfig.
 | rendered rows for the first pair | 82 | 48 | 30 |
 
 At the default, the app's own example pair is a single hunk: one button for the whole file. The
-take unit is still git's — deltapanes never decides what a hunk is.
+take unit is still git's — delgui never decides what a hunk is.
 
 **What is still read out of the render** is only which rows each hunk occupies, and only as a
 count: `--hunk-label=␟` marks exactly one row per hunk, at column 0, in every mode tested
@@ -288,7 +288,7 @@ correct by construction. `tests/merge.rs` pins all of it.
 merge mode draws its own separator. A *changed* empty line is not blank in that sense: it carries
 the `ESC[K` fill that paints its background.
 
-**`--no-gitconfig` does not sandbox the diff step by itself.** deltapanes therefore owns that step
+**`--no-gitconfig` does not sandbox the diff step by itself.** delgui therefore owns that step
 for every render, states the algorithm/context/colour behavior explicitly, passes
 `--no-ext-diff --no-textconv`, removes injected config and external-helper environment, and pipes
 the resulting patch into delta. When `inherit_gitconfig` is off it also points global/system config

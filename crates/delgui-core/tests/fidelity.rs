@@ -1,11 +1,11 @@
-//! Tests that pin the assumptions deltapanes rests on.
+//! Tests that pin the assumptions delgui rests on.
 //!
 //! Each of these corresponds to a finding in `docs/research.md`. They run
 //! against the delta binary actually installed, so they double as a canary for
 //! delta upgrades changing something underneath us.
 
-use deltapanes_core::ansi::{self, Color};
-use deltapanes_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
+use delgui_core::ansi::{self, Color};
+use delgui_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -378,7 +378,7 @@ fn end_of_line_background_fill_is_captured() {
 #[test]
 fn buffer_and_path_inputs_agree() {
     let d = delta();
-    let dir = std::env::temp_dir().join(format!("deltapanes-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("delgui-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (pl, pr) = (dir.join("l.rs"), dir.join("r.rs"));
     std::fs::write(&pl, LEFT).unwrap();
@@ -558,8 +558,8 @@ fn partial_stdout_does_not_hide_a_delta_failure() {
 /// when normal gitconfig inheritance is enabled.
 #[test]
 fn hostile_external_diff_environment_is_ignored() {
-    const CHILD: &str = "DELTAPANES_EXTERNAL_DIFF_CHILD";
-    const SENTINEL: &str = "DELTAPANES_EXTERNAL_DIFF_SENTINEL";
+    const CHILD: &str = "DELGUI_EXTERNAL_DIFF_CHILD";
+    const SENTINEL: &str = "DELGUI_EXTERNAL_DIFF_SENTINEL";
     if std::env::var_os(CHILD).is_some() {
         let sentinel = std::path::PathBuf::from(std::env::var_os(SENTINEL).unwrap());
         let d = delta();
@@ -589,7 +589,7 @@ fn hostile_external_diff_environment_is_ignored() {
     let sentinel = dir.join("helper-ran");
     write_executable(
         &helper,
-        "#!/bin/sh\nprintf invoked > \"$DELTAPANES_EXTERNAL_DIFF_SENTINEL\"\nprintf 'not a unified diff\\n'\n",
+        "#!/bin/sh\nprintf invoked > \"$DELGUI_EXTERNAL_DIFF_SENTINEL\"\nprintf 'not a unified diff\\n'\n",
     );
 
     let status = Command::new(std::env::current_exe().unwrap())
@@ -704,7 +704,7 @@ fn a_vanished_file_is_an_error_not_an_empty_diff() {
         ..Options::default()
     };
     let present = Input::Buffer(LEFT.as_bytes().to_vec());
-    let missing = Input::Path("/nonexistent/deltapanes/gone.rs".into());
+    let missing = Input::Path("/nonexistent/delgui/gone.rs".into());
     match d.render(&present, &missing, &opts) {
         Err(DeltaError::GitRefused { message, .. }) => {
             assert!(!message.is_empty(), "delta's complaint was dropped")
@@ -718,7 +718,7 @@ fn unique_test_dir(label: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("deltapanes-{label}-{}-{nonce}", std::process::id()))
+    std::env::temp_dir().join(format!("delgui-{label}-{}-{nonce}", std::process::id()))
 }
 
 fn write_executable(path: &std::path::Path, contents: &str) {
@@ -732,7 +732,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 fn version_floor_is_enforced() {
     let d = delta();
     assert!(
-        (d.version.0, d.version.1) >= deltapanes_core::delta::MINIMUM_VERSION,
+        (d.version.0, d.version.1) >= delgui_core::delta::MINIMUM_VERSION,
         "discover() should have rejected {}",
         d.version_string
     );

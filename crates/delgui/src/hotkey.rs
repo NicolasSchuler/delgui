@@ -1,7 +1,7 @@
 //! Optional system-wide hotkey.
 //!
 //! On macOS this goes through Carbon's `RegisterEventHotKey`, which needs no
-//! accessibility permission. It only works while deltapanes is running --
+//! accessibility permission. It only works while delgui is running --
 //! *launching* the app from a hotkey is a job for launchd, Raycast or a
 //! keyboard tool, not something an application can arrange for itself.
 

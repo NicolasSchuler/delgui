@@ -1,4 +1,4 @@
-# deltapanes
+# delgui
 
 **A paste-first GUI frontend for [`delta`](https://github.com/dandavison/delta).**
 
@@ -13,11 +13,11 @@ gitconfig section.
 
 The gap it fills: delta assumes both sides already exist as paths. When they live in a
 clipboard, a browser, or a log viewer, the workarounds are temp files, process substitution,
-or a web diff tool you cannot paste confidential text into. deltapanes writes no temp files —
+or a web diff tool you cannot paste confidential text into. delgui writes no temp files —
 panel contents reach delta over pipes — and the only thing in the app that ever writes to disk
 is an explicit **Save**.
 
-![deltapanes comparing two Rust files side by side](docs/images/deltapanes.png)
+![delgui comparing two Rust files side by side](docs/images/delgui.png)
 
 ## Contents
 
@@ -39,10 +39,10 @@ is an explicit **Save**.
 | | |
 | --- | --- |
 | `delta` | 0.18 or newer, on `PATH` — `brew install git-delta` or `cargo install git-delta` |
-| `git` | deltapanes owns a hardened `git diff --no-index` step, then pipes the patch into delta |
+| `git` | delgui owns a hardened `git diff --no-index` step, then pipes the patch into delta |
 | platform | macOS and Linux. Windows is not supported: panel contents reach delta as `/dev/fd/N` pipes. |
 
-delta is a hard dependency, not a fallback. If it is missing, deltapanes says so and exits; it
+delta is a hard dependency, not a fallback. If it is missing, delgui says so and exits; it
 does not substitute a renderer of its own. Everything is developed and measured on macOS.
 
 ## Install
@@ -53,18 +53,18 @@ Not yet packaged. Build it:
 git clone <this repository>
 cd delta-gui
 cargo build --release
-./target/release/deltapanes
+./target/release/delgui
 ```
 
 ## Quickstart
 
 ```sh
-deltapanes                      # two empty panels, ready to paste into
-deltapanes a.rs b.rs            # prefilled, compares immediately
-deltapanes --paste file.rs      # clipboard into panel A, file into panel B
-deltapanes --watch a.rs b.rs    # follow both files as they change on disk
-deltapanes --combine a.rs b.rs  # start a result you can take differences into
-deltapanes --hotkey             # register a system-wide paste hotkey
+delgui                      # two empty panels, ready to paste into
+delgui a.rs b.rs            # prefilled, compares immediately
+delgui --paste file.rs      # clipboard into panel A, file into panel B
+delgui --watch a.rs b.rs    # follow both files as they change on disk
+delgui --combine a.rs b.rs  # start a result you can take differences into
+delgui --hotkey             # register a system-wide paste hotkey
 ```
 
 Try it on the bundled fixtures:
@@ -124,12 +124,12 @@ result is refused rather than guessed at.
 ## Git integration
 
 ```sh
-git config --global diff.tool deltapanes
-git config --global difftool.deltapanes.cmd 'deltapanes "$LOCAL" "$REMOTE"'
-git config --global merge.tool deltapanes
-git config --global mergetool.deltapanes.cmd \
-    'deltapanes --mergetool "$BASE" "$LOCAL" "$REMOTE" "$MERGED"'
-git config --global mergetool.deltapanes.trustExitCode true
+git config --global diff.tool delgui
+git config --global difftool.delgui.cmd 'delgui "$LOCAL" "$REMOTE"'
+git config --global merge.tool delgui
+git config --global mergetool.delgui.cmd \
+    'delgui --mergetool "$BASE" "$LOCAL" "$REMOTE" "$MERGED"'
+git config --global mergetool.delgui.trustExitCode true
 ```
 
 `git difftool` opens the two sides as panels. `git mergetool` opens BASE, LOCAL and REMOTE as
@@ -177,7 +177,7 @@ replace unsaved panel text asks first. The full table, both platforms, is in
 [`docs/reference.md`](docs/reference.md#keyboard).
 
 `--hotkey` registers <kbd>⌘⇧D</kbd> system-wide, which focuses the window and pastes the
-clipboard into a fresh panel. It works only while deltapanes is running — an application cannot
+clipboard into a fresh panel. It works only while delgui is running — an application cannot
 arrange to be *launched* by a hotkey; that is a job for launchd, Raycast, or a keyboard tool.
 
 ## Configuration
@@ -188,7 +188,7 @@ Every option, default and flag mapping is documented in
 **Appearance** follows your system light/dark setting by default, and either way the whole
 window agrees with the diff inside it: the theme sets delta's own `--light`/`--dark`, so its red
 and green backgrounds are the ones meant for that mode. You can pick the interface and diff
-fonts from what is installed — deltapanes measures the one you choose and says so if it is not
+fonts from what is installed — delgui measures the one you choose and says so if it is not
 really monospaced, since delta lays its output out in columns.
 
 **delta** shows what your gitconfig already tells delta, which `[delta "name"]` presets exist
@@ -207,19 +207,19 @@ Preferences are remembered; panel contents never are.
 
 | path | role |
 | --- | --- |
-| `crates/deltapanes-core` | delta invocation + ANSI→span parsing, no GUI deps |
-| `crates/deltapanes` | egui frontend: state, theme, fonts, keymap, hotkey |
+| `crates/delgui-core` | delta invocation + ANSI→span parsing, no GUI deps |
+| `crates/delgui` | egui frontend: state, theme, fonts, keymap, hotkey |
 | `docs/reference.md` | generated configuration and feature reference |
 | `docs/research.md` | the measurements the design rests on |
 
-`deltapanes-core` is deliberately frontend-agnostic so a ratatui frontend stays a real option
+`delgui-core` is deliberately frontend-agnostic so a ratatui frontend stays a real option
 rather than an aspiration.
 
 ```sh
 cargo build --release
 cargo test                                           # whole workspace
 cargo clippy --workspace --all-targets
-DELTAPANES_BLESS=1 cargo test -p deltapanes docs::   # regenerate docs/reference.md
+DELGUI_BLESS=1 cargo test -p delgui docs::   # regenerate docs/reference.md
 ```
 
 The suite runs against **your installed delta**, not a fixture, and asserts among other things
@@ -239,7 +239,7 @@ Issues and pull requests are welcome. Two house rules:
 - **Do not run `cargo fmt`.** The code is hand-formatted in a deliberately compact style with no
   `rustfmt.toml`; a blanket reformat would reflow files unrelated to your change. Match the
   surrounding layout by hand.
-- **Do not edit `docs/reference.md`.** It is generated — change `crates/deltapanes/src/docs.rs`
+- **Do not edit `docs/reference.md`.** It is generated — change `crates/delgui/src/docs.rs`
   and re-bless it. A test fails otherwise.
 
 Comments explain *why*, especially where a line encodes a measured finding about delta or the
@@ -251,4 +251,4 @@ explaining the reasoning and what a test now pins down.
 MIT. See [LICENSE](LICENSE).
 
 delta itself is a separate project under its own licence, and is not redistributed here —
-deltapanes runs whichever copy is on your `PATH`.
+delgui runs whichever copy is on your `PATH`.
