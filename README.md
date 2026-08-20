@@ -2,8 +2,9 @@
 
 **A paste-first GUI frontend for [`delta`](https://github.com/dandavison/delta).**
 
+[![CI](https://github.com/NicolasSchuler/delgui/actions/workflows/ci.yml/badge.svg)](https://github.com/NicolasSchuler/delgui/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](rust-toolchain.toml)
+[![Rust 1.87+](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](Cargo.toml)
 [![requires delta ≥ 0.18](https://img.shields.io/badge/requires-delta%20%E2%89%A5%200.18-green.svg)](https://github.com/dandavison/delta)
 
 Two or more editable panels. Paste into both, press <kbd>⌘</kbd><kbd>⏎</kbd>, and get delta's
@@ -47,14 +48,41 @@ does not substitute a renderer of its own. Everything is developed and measured 
 
 ## Install
 
-Not yet packaged. Build it:
+**Homebrew** — the one that also installs delta and git for you:
 
 ```sh
-git clone <this repository>
-cd delta-gui
+brew install NicolasSchuler/tap/delgui
+```
+
+**Install script** — prebuilt binaries for macOS (Apple Silicon and Intel) and
+Linux x86-64:
+
+```sh
+curl -fsSL https://github.com/NicolasSchuler/delgui/releases/latest/download/delgui-installer.sh | sh
+```
+
+This one does *not* bring delta with it. `brew install git-delta`, or see
+[delta's own instructions](https://github.com/dandavison/delta#installation).
+
+**From source** — needs Rust 1.87 or newer:
+
+```sh
+cargo install --git https://github.com/NicolasSchuler/delgui delgui
+```
+
+Or clone and build:
+
+```sh
+git clone https://github.com/NicolasSchuler/delgui
+cd delgui
 cargo build --release
 ./target/release/delgui
 ```
+
+Prebuilt binaries are not signed or notarised, so macOS Gatekeeper will want a
+right-click → **Open** the first time. There is no `.app` bundle yet — see
+[RELEASING.md](RELEASING.md) for why that is a code change rather than a
+packaging one.
 
 ## Quickstart
 
@@ -210,6 +238,7 @@ Preferences are remembered; panel contents never are.
 | `crates/delgui-core` | delta invocation + ANSI→span parsing, no GUI deps |
 | `crates/delgui` | egui frontend: state, theme, fonts, keymap, hotkey |
 | `docs/reference.md` | generated configuration and feature reference |
+| `dist-workspace.toml` | what a tagged release builds and publishes |
 | `docs/research.md` | the measurements the design rests on |
 
 `delgui-core` is deliberately frontend-agnostic so a ratatui frontend stays a real option
@@ -234,7 +263,12 @@ path only**, so `delta file.rs <(pbpaste)` silently loses highlighting where
 
 ## Contributing
 
-Issues and pull requests are welcome. Two house rules:
+Issues and pull requests are welcome. CI builds and tests on macOS and Linux
+against a real delta, and runs weekly so that a delta release which changes its
+output shows up as a failing test rather than as a mis-render. Releases are cut
+by pushing a tag; see [RELEASING.md](RELEASING.md).
+
+Three house rules:
 
 - **Do not run `cargo fmt`.** The code is hand-formatted in a deliberately compact style with no
   `rustfmt.toml`; a blanket reformat would reflow files unrelated to your change. Match the

@@ -1,0 +1,93 @@
+# The suite runs against a real delta binary rather than a fixture, so CI has to
+# install one -- and that is the point of running it here at all: a delta
+# release that changes its output should fail `parser_understands_every_escape_delta_emits`
+# on a schedule, not the next time someone opens the app.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, against whatever delta is current by then.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install delta (macOS)
+        if: runner.os == 'macOS'
+        run: brew install git-delta
+
+      - name: Install delta (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Debian's git-delta lags badly, and the point of the weekly run is to
+          # test the delta people actually have. Note the tag carries no leading
+          # "v": the asset is delta-0.19.2-x86_64-unknown-linux-gnu.tar.gz.
+          version=$(curl -fsSL https://api.github.com/repos/dandavison/delta/releases/latest \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+          test -n "$version"
+          echo "testing against delta $version"
+          name="delta-${version}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/dandavison/delta/releases/download/${version}/${name}.tar.gz" \
+            | tar xz -C /tmp "${name}/delta"
+          sudo install -m755 "/tmp/${name}/delta" /usr/local/bin/delta
+
+      - name: Versions under test
+        run: |
+          delta --version
+          git --version
+          cargo --version
+
+      - name: Install GUI build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # Not `cargo fmt --check`: the tree is hand-formatted in a deliberately
+      # compact style with no rustfmt.toml, so it does not and should not pass.
+
+      - name: Test
+        run: cargo test --workspace
+
+  msrv:
+    name: MSRV (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      # Building is enough: the tests need delta, and the floor is about whether
+      # the code compiles on the Rust version the manifest promises.
+      - run: cargo build --workspace

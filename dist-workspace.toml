@@ -1,0 +1,32 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'. Regenerate .github/workflows/release.yml after any change
+# here with `dist generate`; the workflow is generated, not hand-edited.
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+# No x86_64-pc-windows-msvc, which `dist init` offers by default: panel buffers
+# reach delta as /dev/fd/N pipes and the subprocess teardown kills a process
+# group, both of which are #[cfg(unix)]. Windows would not build, and a target
+# that cannot work has no business in a release matrix.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+install-path = "CARGO_HOME"
+install-updater = false
+# The formula is published to a tap of its own. The repository has to exist and
+# the release token needs write access to it.
+tap = "NicolasSchuler/homebrew-tap"
+publish-jobs = ["homebrew"]
+
+# delta is a hard runtime dependency and git is part of the render pipeline, so
+# the formula says so. This is the single best reason to ship via Homebrew at
+# all: `brew install delgui` then cannot leave you with an app whose first act
+# is to tell you delta is missing.
+[dist.dependencies.homebrew]
+git-delta = { stage = ["run"] }
+git = { stage = ["run"] }
