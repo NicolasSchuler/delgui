@@ -29,26 +29,26 @@ use crate::ui;
 /// than hang, since a diff you wait ten seconds for is a diff you did by eye.
 ///
 /// Decimal megabytes, because that is the unit the message reports in.
-const MAX_PANEL_BYTES: usize = 4_000_000;
+pub(crate) const MAX_PANEL_BYTES: usize = 4_000_000;
 
 /// Above this, editing stops re-rendering by itself and waits to be asked.
 /// delta costs about a second per megabyte, and a diff that recomputes while
 /// you type is worse than one you trigger.
-const AUTO_RENDER_BYTES: usize = 1_000_000;
+pub(crate) const AUTO_RENDER_BYTES: usize = 1_000_000;
 
 /// Delta re-runs on every width change, so resizing has to settle first.
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+pub(crate) const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Typing is a stream of changes, and each one would otherwise be a subprocess.
-const EDIT_DEBOUNCE: Duration = Duration::from_millis(300);
+pub(crate) const EDIT_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// A save is rarely one filesystem event, and a file mid-write reads as
 /// truncated, so watch events are coalesced before re-reading.
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(180);
+pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(180);
 
 /// delta is a two-way tool. More panels means more pairs against one reference,
 /// and past a handful the columns are too narrow to read anyway.
-const MAX_PANELS: usize = 6;
+pub(crate) const MAX_PANELS: usize = 6;
 
 /// Takes to remember. These are snapshots of a buffer that may be megabytes, so
 /// they are bounded twice; the Undo control goes quiet at the end of the history
@@ -56,8 +56,8 @@ const MAX_PANELS: usize = 6;
 /// How long a "Copied" or "Saved to …" confirmation stays up.
 const FLASH: Duration = Duration::from_secs(4);
 
-const UNDO_DEPTH: usize = 100;
-const UNDO_BYTES: usize = 64_000_000;
+pub(crate) const UNDO_DEPTH: usize = 100;
+pub(crate) const UNDO_BYTES: usize = 64_000_000;
 
 /// Where `git mergetool` expects the merge to be written, and whether it was.
 ///

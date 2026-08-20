@@ -29,12 +29,23 @@ pub enum Action {
 }
 
 pub struct Binding {
-    pub label: &'static str,
+    /// Both spellings, not the picked one: `docs::reference` prints a table
+    /// that has to come out the same on every platform, and `chord` resolves at
+    /// compile time.
+    pub mac: &'static str,
+    pub other: &'static str,
     pub describe: &'static str,
     pub group: &'static str,
     pub action: Action,
     key: Key,
     mods: Modifiers,
+}
+
+impl Binding {
+    /// The chord as this platform writes it.
+    pub fn label(&self) -> &'static str {
+        chord(self.mac, self.other)
+    }
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -60,12 +71,16 @@ const fn chord(mac: &'static str, elsewhere: &'static str) -> &'static str {
     }
 }
 
+const COMPARE_CHORD: (&str, &str) = ("⌘⏎", "Ctrl+Enter");
+const HELP_CHORD: (&str, &str) = ("⌘/", "Ctrl+/");
+const SAVE_CHORD: (&str, &str) = ("⌘S", "Ctrl+S");
+
 pub fn compare_label() -> &'static str {
-    chord("⌘⏎", "Ctrl+Enter")
+    chord(COMPARE_CHORD.0, COMPARE_CHORD.1)
 }
 
 pub fn help_label() -> &'static str {
-    chord("⌘/", "Ctrl+/")
+    chord(HELP_CHORD.0, HELP_CHORD.1)
 }
 
 pub fn help_hint() -> &'static str {
@@ -75,7 +90,7 @@ pub fn help_hint() -> &'static str {
 /// ⌘S was the side-by-side toggle until the app could write a file. Once it can,
 /// a user finishing a merge presses ⌘S and must not get a layout flip.
 pub fn save_label() -> &'static str {
-    chord("⌘S", "Ctrl+S")
+    chord(SAVE_CHORD.0, SAVE_CHORD.1)
 }
 
 pub fn settings_hint() -> &'static str {
@@ -85,7 +100,8 @@ pub fn settings_hint() -> &'static str {
 pub fn bindings() -> Vec<Binding> {
     let mut v = vec![
         Binding {
-            label: chord("⌘O", "Ctrl+O"),
+            mac: "⌘O",
+            other: "Ctrl+O",
             describe: "open a file in the shown panel",
             group: "file",
             action: Action::OpenFile,
@@ -93,7 +109,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘W", "Ctrl+W"),
+            mac: "⌘W",
+            other: "Ctrl+W",
             describe: "close the window",
             group: "file",
             action: Action::CloseWindow,
@@ -101,7 +118,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: compare_label(),
+            mac: COMPARE_CHORD.0,
+            other: COMPARE_CHORD.1,
             describe: "re-render now",
             group: "compare",
             action: Action::Compare,
@@ -109,7 +127,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘F", "Ctrl+F"),
+            mac: "⌘F",
+            other: "Ctrl+F",
             describe: "find in the diff",
             group: "compare",
             action: Action::Find,
@@ -120,7 +139,8 @@ pub fn bindings() -> Vec<Binding> {
         // the IDEs use for the next difference -- cannot be borrowed: a bare
         // keypress would fire while typing into a panel.
         Binding {
-            label: chord("⌘G", "Ctrl+G"),
+            mac: "⌘G",
+            other: "Ctrl+G",
             describe: "next match",
             group: "compare",
             action: Action::NextMatch,
@@ -128,7 +148,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘⇧G", "Ctrl+Shift+G"),
+            mac: "⌘⇧G",
+            other: "Ctrl+Shift+G",
             describe: "previous match",
             group: "compare",
             action: Action::PreviousMatch,
@@ -136,7 +157,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
-            label: chord("⌘⌥↓", "Ctrl+Alt+Down"),
+            mac: "⌘⌥↓",
+            other: "Ctrl+Alt+Down",
             describe: "jump to the next difference",
             group: "compare",
             action: Action::NextChange,
@@ -144,7 +166,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_ALT,
         },
         Binding {
-            label: chord("⌘⌥↑", "Ctrl+Alt+Up"),
+            mac: "⌘⌥↑",
+            other: "Ctrl+Alt+Up",
             describe: "jump to the previous difference",
             group: "compare",
             action: Action::PreviousChange,
@@ -152,7 +175,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_ALT,
         },
         Binding {
-            label: chord("⌘R", "Ctrl+R"),
+            mac: "⌘R",
+            other: "Ctrl+R",
             describe: "make the shown panel the baseline",
             group: "compare",
             action: Action::MakeReference,
@@ -160,7 +184,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘N", "Ctrl+N"),
+            mac: "⌘N",
+            other: "Ctrl+N",
             describe: "add a panel",
             group: "panels",
             action: Action::AddPanel,
@@ -168,7 +193,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘⇧W", "Ctrl+Shift+W"),
+            mac: "⌘⇧W",
+            other: "Ctrl+Shift+W",
             describe: "remove the shown panel",
             group: "panels",
             action: Action::RemovePanel,
@@ -176,7 +202,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
-            label: chord("⌘⇧V", "Ctrl+Shift+V"),
+            mac: "⌘⇧V",
+            other: "Ctrl+Shift+V",
             describe: "paste into a fresh panel",
             group: "panels",
             action: Action::PasteIntoNewPanel,
@@ -184,7 +211,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
-            label: chord("⌘⌥S", "Ctrl+Alt+S"),
+            mac: "⌘⌥S",
+            other: "Ctrl+Alt+S",
             describe: "side by side",
             group: "view",
             action: Action::ToggleSideBySide,
@@ -192,7 +220,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_ALT,
         },
         Binding {
-            label: chord("⌘L", "Ctrl+L"),
+            mac: "⌘L",
+            other: "Ctrl+L",
             describe: "line numbers",
             group: "view",
             action: Action::ToggleLineNumbers,
@@ -200,7 +229,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘\\", "Ctrl+\\"),
+            mac: "⌘\\",
+            other: "Ctrl+\\",
             describe: "wrap long lines",
             group: "view",
             action: Action::ToggleWrap,
@@ -208,7 +238,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘,", "Ctrl+,"),
+            mac: "⌘,",
+            other: "Ctrl+,",
             describe: "settings",
             group: "view",
             action: Action::ToggleSettings,
@@ -216,7 +247,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: help_label(),
+            mac: HELP_CHORD.0,
+            other: HELP_CHORD.1,
             describe: "this list",
             group: "view",
             action: Action::ToggleHelp,
@@ -224,7 +256,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: save_label(),
+            mac: SAVE_CHORD.0,
+            other: SAVE_CHORD.1,
             describe: "save the result to a file",
             group: "result",
             action: Action::SaveResult,
@@ -232,7 +265,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘⇧S", "Ctrl+Shift+S"),
+            mac: "⌘⇧S",
+            other: "Ctrl+Shift+S",
             describe: "save the result as a new file",
             group: "result",
             action: Action::SaveResultAs,
@@ -240,7 +274,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
-            label: chord("⌘Z", "Ctrl+Z"),
+            mac: "⌘Z",
+            other: "Ctrl+Z",
             describe: "undo the last take",
             group: "result",
             action: Action::UndoTake,
@@ -248,7 +283,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
-            label: chord("⌘⇧Z", "Ctrl+Shift+Z"),
+            mac: "⌘⇧Z",
+            other: "Ctrl+Shift+Z",
             describe: "redo the last take",
             group: "result",
             action: Action::RedoTake,
@@ -269,7 +305,8 @@ pub fn bindings() -> Vec<Binding> {
     .enumerate()
     {
         v.push(Binding {
-            label: chord("⌘1…6", "Ctrl+1…6"),
+            mac: "⌘1…6",
+            other: "Ctrl+1…6",
             describe: "show that panel's diff",
             group: "panels",
             action: Action::ShowDiff(i),
@@ -303,9 +340,9 @@ pub fn help_rows() -> Vec<HelpRow> {
     let mut rows: Vec<HelpRow> = Vec::new();
     for group in ["file", "compare", "panels", "result", "view"] {
         for b in bindings().into_iter().filter(|b| b.group == group) {
-            if !rows.iter().any(|r| r.label == b.label) {
+            if !rows.iter().any(|r| r.label == b.label()) {
                 rows.push(HelpRow {
-                    label: b.label,
+                    label: b.label(),
                     describe: b.describe,
                     group: b.group,
                 });
@@ -449,7 +486,7 @@ mod tests {
         let rows = help_rows();
         for b in bindings() {
             assert!(
-                rows.iter().any(|r| r.label == b.label),
+                rows.iter().any(|r| r.label == b.label()),
                 "{} has no help row",
                 b.describe
             );

@@ -21,6 +21,7 @@ cargo test -p deltapanes-core --test merge                        # the take ari
 cargo test -p deltapanes-core --test fidelity parser_understands   # one test by name substring
 cargo test -p deltapanes-core watch::tests                         # unit tests inside a module
 cargo clippy --workspace --all-targets
+DELTAPANES_BLESS=1 cargo test -p deltapanes docs::                # regenerate docs/reference.md
 ```
 
 The code is hand-formatted in a deliberately compact style with no `rustfmt.toml`, so
@@ -51,6 +52,7 @@ crates/deltapanes        egui/eframe frontend
   settings.rs            what survives a restart (~/Library/Application Support/deltapanes)
   keys.rs                the single keymap table
   hotkey.rs
+docs/reference.md        generated: every option, chord, flag and limit
 docs/research.md         measured findings; every non-obvious decision below traces here
 ```
 
@@ -267,6 +269,14 @@ else. Following a file on disk (`Panel::watch`) skips edited panels, so a save c
 typing, and only file-backed panels offer it — there is nothing for a paste to follow.
 
 ## Style
+
+`docs/reference.md` is **generated** — edit `crates/deltapanes/src/docs.rs` and re-bless it,
+never the Markdown. The generator is compiled only under `cfg(test)`, and its guards are the
+point of it: each `describe_*` is an exhaustive `match` with no wildcard arm and the `Settings`
+and `Options` defaults are destructured field by field, so adding an `Action`, an enum variant
+or a persisted field fails to compile until it has been documented. It must never read the
+environment — discovering the local delta version or gitconfig would bake this machine into the
+golden file — and chords are stored as both spellings for the same reason.
 
 Comments explain *why*, especially where a line encodes a measured finding about delta or the
 platform; the existing code is dense with these and matching that density is the house style.

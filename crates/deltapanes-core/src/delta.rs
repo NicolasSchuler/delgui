@@ -17,7 +17,8 @@ use std::os::unix::process::CommandExt;
 /// so pinning a floor costs little.
 pub const MINIMUM_VERSION: (u32, u32) = (0, 18);
 
-const PROCESS_LIMITS: ProcessLimits = ProcessLimits {
+/// Public so a frontend can state the ceilings it renders under.
+pub const PROCESS_LIMITS: ProcessLimits = ProcessLimits {
     timeout: Duration::from_secs(15),
     stdout_bytes: 128 * 1024 * 1024,
     stderr_bytes: 1024 * 1024,
@@ -305,10 +306,10 @@ fn over_two_inputs(
 }
 
 #[derive(Clone, Copy)]
-struct ProcessLimits {
-    timeout: Duration,
-    stdout_bytes: usize,
-    stderr_bytes: usize,
+pub struct ProcessLimits {
+    pub timeout: Duration,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
 }
 
 #[derive(Debug)]

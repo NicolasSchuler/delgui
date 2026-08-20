@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+/// Compiled only for tests: it exists to generate `docs/reference.md` and to
+/// fail when the code it documents moves out from under it.
+#[cfg(test)]
+mod docs;
 mod fonts;
 mod hotkey;
 mod keys;
