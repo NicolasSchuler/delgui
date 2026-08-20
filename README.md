@@ -48,41 +48,44 @@ does not substitute a renderer of its own. Everything is developed and measured 
 
 ## Install
 
-**Homebrew** — the one that also installs delta and git for you:
+The repository is private, so there is no public install channel yet: a Homebrew
+formula and a `curl … | sh` installer both fetch release assets anonymously,
+which a private repo refuses. Both are one config change away the moment it goes
+public — see [RELEASING.md](RELEASING.md).
+
+**From a release** — tagged releases attach prebuilt binaries for macOS (Apple
+Silicon and Intel) and Linux x86-64. With the [`gh` CLI](https://cli.github.com),
+authenticated as someone with access:
 
 ```sh
-brew install NicolasSchuler/tap/delgui
+gh release download --repo NicolasSchuler/delgui --pattern '*aarch64-apple-darwin*'
+tar xf delgui-aarch64-apple-darwin.tar.xz
+install -m755 delgui-aarch64-apple-darwin/delgui ~/.local/bin/delgui
 ```
-
-**Install script** — prebuilt binaries for macOS (Apple Silicon and Intel) and
-Linux x86-64:
-
-```sh
-curl -fsSL https://github.com/NicolasSchuler/delgui/releases/latest/download/delgui-installer.sh | sh
-```
-
-This one does *not* bring delta with it. `brew install git-delta`, or see
-[delta's own instructions](https://github.com/dandavison/delta#installation).
 
 **From source** — needs Rust 1.87 or newer:
 
 ```sh
-cargo install --git https://github.com/NicolasSchuler/delgui delgui
-```
-
-Or clone and build:
-
-```sh
-git clone https://github.com/NicolasSchuler/delgui
+git clone git@github.com:NicolasSchuler/delgui.git
 cd delgui
 cargo build --release
 ./target/release/delgui
 ```
 
-Prebuilt binaries are not signed or notarised, so macOS Gatekeeper will want a
-right-click → **Open** the first time. There is no `.app` bundle yet — see
-[RELEASING.md](RELEASING.md) for why that is a code change rather than a
-packaging one.
+Or straight into `~/.cargo/bin`:
+
+```sh
+cargo install --git ssh://git@github.com/NicolasSchuler/delgui delgui
+```
+
+Either way delta is yours to install — `brew install git-delta`, or see
+[delta's own instructions](https://github.com/dandavison/delta#installation).
+
+Binaries are not signed or notarised, so macOS Gatekeeper will want a
+right-click → **Open** the first time. There is no `.app` bundle: a
+Finder-launched GUI inherits launchd's `PATH`, which has no `/opt/homebrew/bin`
+in it, so it would report delta missing for most Homebrew users. That is a code
+change rather than a packaging one.
 
 ## Quickstart
 

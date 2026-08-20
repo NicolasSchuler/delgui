@@ -274,7 +274,9 @@ typing, and only file-backed panels offer it — there is nothing for a paste to
 
 `.github/workflows/release.yml` is **generated** by `dist` from
 `dist-workspace.toml` — change the config and run `dist generate`, never the YAML.
-Releases are cut by pushing a `v*` tag; `RELEASING.md` is the runbook. The release
+Releases are cut by pushing a `v*` tag; `RELEASING.md` is the runbook. `installers`
+is empty while the repository is private, because a shell installer and a Homebrew
+formula both fetch release assets anonymously and would fail for every user. The release
 matrix deliberately omits Windows, because `/dev/fd/N` and the process-group kill
 are `#[cfg(unix)]`, and omits a macOS `.app`, because a Finder-launched GUI
 inherits launchd's `PATH` and `Delta::discover` would not find a Homebrew delta.

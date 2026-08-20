@@ -6,18 +6,61 @@ Release itself — is done by `.github/workflows/release.yml`, which is
 **generated** by [`dist`](https://github.com/axodotdev/cargo-dist) from
 `dist-workspace.toml`.
 
-## Before the first release
+## Installers are off, and why
 
-The Homebrew publish job pushes to a tap repository that has to exist already:
+`installers = []` while the repository is private. This is a constraint, not a
+preference: both the shell installer and a Homebrew formula fetch
+`releases/download/…` with no credentials, which a private repo refuses, and
+Homebrew has no way to authenticate for one at all — [cargo-dist#2267][private]
+is open and unimplemented. Turning them on would produce artifacts that build
+cleanly in CI and then fail for every person who tries to use them.
 
-1. Create `NicolasSchuler/homebrew-tap` on GitHub, public, with a README.
-2. Give the release workflow write access to it. A `GITHUB_TOKEN` is scoped to
-   this repository only, so add a PAT with `contents: write` on the tap as a
+A tagged release still builds all three targets and attaches them, with
+checksums, to a GitHub Release that anyone with repository access can download.
+
+[private]: https://github.com/axodotdev/cargo-dist/issues/2267
+
+## When the repository goes public
+
+Three steps, in this order:
+
+1. **Create the tap.** A Homebrew tap is an ordinary GitHub repository whose
+   name begins with `homebrew-`; nothing is registered with Homebrew itself.
+   `brew install NicolasSchuler/tap/delgui` resolves to `delgui.rb` in
+   `github.com/NicolasSchuler/homebrew-tap`, so that repository has to exist and
+   be public.
+
+   ```sh
+   gh repo create NicolasSchuler/homebrew-tap --public \
+     --description "Homebrew formulae for NicolasSchuler's tools"
+   ```
+
+2. **Give the release workflow write access to it.** `GITHUB_TOKEN` is scoped to
+   this repository alone, so add a PAT with `contents: write` on the tap as a
    repository secret named `HOMEBREW_TAP_TOKEN`.
 
-Until that exists, drop `publish-jobs = ["homebrew"]` from
-`dist-workspace.toml` and regenerate, or the release will fail at the last step
-with the artifacts already built.
+3. **Switch the installers back on** in `dist-workspace.toml` and regenerate:
+
+   ```toml
+   installers = ["shell", "homebrew"]
+   tap = "NicolasSchuler/homebrew-tap"
+   publish-jobs = ["homebrew"]
+
+   # delta is a hard runtime dependency and git is part of the render pipeline,
+   # so the formula says so. This is the best argument for shipping via brew at
+   # all: `brew install delgui` then cannot leave you with an app whose first
+   # act is to tell you delta is missing.
+   [dist.dependencies.homebrew]
+   git-delta = { stage = ["run"] }
+   git = { stage = ["run"] }
+   ```
+
+   ```sh
+   dist generate
+   ```
+
+   Then update the Install section of the README, which currently explains the
+   private-repo situation instead.
 
 ## Cutting a release
 
@@ -66,4 +109,6 @@ committed workflow does not match the config.
   `Delta::discover`'s plain `PATH` lookup would report delta missing for most
   Homebrew users. Teaching `discover` to probe the usual prefixes comes first.
 - **crates.io.** Both crates carry the metadata for it, so `cargo publish -p
-  delgui-core` then `-p delgui` is all it takes when wanted.
+  delgui-core` then `-p delgui` is all it takes when wanted. Note crates.io is
+  public and irreversible — a published version cannot be unpublished, only
+  yanked — so it waits on the same decision the installers do.

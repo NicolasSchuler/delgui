@@ -6,7 +6,13 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
-installers = ["shell", "homebrew"]
+# Empty while the repository is private, and that is a constraint rather than a
+# preference. Both the shell installer and a Homebrew formula fetch
+# `releases/download/...` anonymously, which a private repo refuses; brew has no
+# way to authenticate for it at all (axodotdev/cargo-dist#2267 is open and
+# unimplemented). They would build fine and then fail for every user, so they
+# are off until the repo is public. RELEASING.md records how to switch them on.
+installers = []
 # No x86_64-pc-windows-msvc, which `dist init` offers by default: panel buffers
 # reach delta as /dev/fd/N pipes and the subprocess teardown kills a process
 # group, both of which are #[cfg(unix)]. Windows would not build, and a target
@@ -18,15 +24,3 @@ targets = [
 ]
 install-path = "CARGO_HOME"
 install-updater = false
-# The formula is published to a tap of its own. The repository has to exist and
-# the release token needs write access to it.
-tap = "NicolasSchuler/homebrew-tap"
-publish-jobs = ["homebrew"]
-
-# delta is a hard runtime dependency and git is part of the render pipeline, so
-# the formula says so. This is the single best reason to ship via Homebrew at
-# all: `brew install delgui` then cannot leave you with an app whose first act
-# is to tell you delta is missing.
-[dist.dependencies.homebrew]
-git-delta = { stage = ["run"] }
-git = { stage = ["run"] }
