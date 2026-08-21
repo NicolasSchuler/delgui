@@ -140,7 +140,7 @@ pub fn choice<T: PartialEq + Copy>(
         .inner_margin(Margin::same(2))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 for (value, label) in options {
                     let button = Button::selectable(*current == *value, *label)
                         .corner_radius(CornerRadius::same(5))
@@ -258,17 +258,47 @@ pub fn identical(ui: &mut Ui, t: &Tokens, body: &str) {
     });
 }
 
-/// A labelled row in the settings drawer: label on the left at a fixed width,
-/// control on the right, so a column of them lines up.
+const FIELD_LABEL_WIDTH: f32 = 112.0;
+const FIELD_CONTROL_MIN_WIDTH: f32 = 180.0;
+
+pub fn control_width(ui: &Ui) -> f32 {
+    ui.available_width().min(ui.clip_rect().width()).min(240.0)
+}
+
+fn field_stacks(ui: &Ui, label: &str) -> bool {
+    let available = ui.available_width().min(ui.clip_rect().width());
+    let inline_width = FIELD_LABEL_WIDTH + ui.spacing().item_spacing.x + FIELD_CONTROL_MIN_WIDTH;
+    let label_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            TextStyle::Body.resolve(ui.style()),
+            Color32::WHITE,
+        )
+        .size()
+        .x;
+    available < inline_width || label_width > FIELD_LABEL_WIDTH
+}
+
+/// A labelled row in the settings drawer. Comfortable drawers align controls
+/// in one column; narrow drawers and enlarged labels stack without overflowing.
 pub fn field<R>(ui: &mut Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [96.0, 24.0],
-            egui::Label::new(RichText::new(label).color(t.text_secondary)),
-        );
-        add(ui)
-    })
-    .inner
+    if field_stacks(ui, label) {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(label).color(t.text_secondary));
+            add(ui)
+        })
+        .inner
+    } else {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [FIELD_LABEL_WIDTH, 24.0],
+                egui::Label::new(RichText::new(label).color(t.text_secondary)),
+            );
+            add(ui)
+        })
+        .inner
+    }
 }
 
 pub fn section(ui: &mut Ui, t: &Tokens, title: &str) {
@@ -287,4 +317,32 @@ pub fn status(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
         node.set_live(egui::accesskit::Live::Polite);
     });
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_fields_stack_at_the_supported_narrow_width() {
+        egui::__run_test_ui(|ui| {
+            ui.set_max_width(208.0);
+            assert!(field_stacks(ui, "Theme"));
+
+            let left = ui.cursor().left();
+            let response = field(ui, &Tokens::dark(), "Theme", |ui| {
+                ui.add_sized([180.0, 24.0], Button::new("System"))
+            });
+            assert!(response.rect.left() >= left);
+            assert!(response.rect.right() <= left + 208.0);
+        });
+    }
+
+    #[test]
+    fn settings_fields_align_when_both_columns_fit() {
+        egui::__run_test_ui(|ui| {
+            ui.set_max_width(308.0);
+            assert!(!field_stacks(ui, "Theme"));
+        });
+    }
 }

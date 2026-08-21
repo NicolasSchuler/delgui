@@ -6,8 +6,8 @@ use std::sync::Arc;
 use delgui_core::ansi::{self, Color, Line, Style};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Color32, Context, CursorIcon, FontId, Galley, Key, Modifiers, OpenUrl, Response, Sense, Stroke,
-    Ui, Vec2, Widget, WidgetInfo, WidgetType,
+    Color32, Context, CursorIcon, FontId, Galley, Key, Modifiers, OpenUrl, Rect, Response, Sense,
+    Stroke, Ui, Vec2, Widget, WidgetInfo, WidgetType,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -88,39 +88,121 @@ pub struct EraseFill {
     pub background: Color32,
 }
 
-/// A diff block laid out once and cheap to reuse on every frame.
-///
-/// Cache this alongside the render/style key and draw it with [`Self::label`].
-/// The label keeps egui's cross-label selectable-text behavior, makes OSC 8
-/// spans clickable, and paints `ESC[K` without adding synthetic spaces to the
-/// copied text.
-pub struct PreparedLayout {
+/// Large enough to keep widget overhead low, small enough that scrolling only
+/// submits a few hundred rows to egui's painter and accessibility tree.
+const PREPARED_CHUNK_ROWS: usize = 192;
+const VIEWPORT_OVERSCAN_CHUNKS: usize = 1;
+const RENDERED_DIFF_LABEL: &str = "Rendered diff";
+
+struct PreparedChunk {
     galley: Arc<Galley>,
-    columns: usize,
+    top: f32,
     hyperlinks: Vec<Hyperlink>,
     erase_fills: Vec<EraseFill>,
 }
 
-impl PreparedLayout {
-    pub fn label(&self, column_width: f32) -> PreparedLabel<'_> {
+impl PreparedChunk {
+    fn bottom(&self) -> f32 {
+        self.top + self.galley.size().y
+    }
+
+    fn label(&self, columns: usize, column_width: f32) -> PreparedLabel<'_> {
         PreparedLabel {
-            prepared: self,
+            chunk: self,
+            columns,
             column_width: column_width.max(1.0),
+            keep_selection_alive: false,
+        }
+    }
+}
+
+/// A diff block laid out once and cheap to reuse on every frame.
+///
+/// Cache this alongside the render/style key and draw it with [`Self::show`] or
+/// [`Self::show_viewport`]. The chunks keep egui's cross-label selectable-text
+/// behavior, make OSC 8 spans clickable, and paint `ESC[K` without adding
+/// synthetic spaces to the copied text.
+pub struct PreparedLayout {
+    chunks: Vec<PreparedChunk>,
+    text: String,
+    columns: usize,
+    height: f32,
+    galley_width: f32,
+}
+
+impl PreparedLayout {
+    /// Draw every chunk. Merge mode uses this because control rows interrupt the
+    /// diff and make its vertical positions depend on the surrounding widgets.
+    pub fn show(&self, ui: &mut Ui, column_width: f32) -> Response {
+        let keep_selection_alive = label_selection_active(ui.ctx());
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let mut response: Option<Response> = None;
+            for chunk in &self.chunks {
+                let mut label = chunk.label(self.columns, column_width);
+                label.keep_selection_alive = keep_selection_alive;
+                let chunk_response = ui.add(label);
+                response = Some(match response {
+                    Some(current) => current.union(chunk_response),
+                    None => chunk_response,
+                });
+            }
+            response.unwrap_or_else(|| ui.allocate_response(Vec2::ZERO, Sense::hover()))
+        })
+        .inner
+    }
+
+    /// Draw only chunks intersecting the scroll viewport. Once selection starts,
+    /// all chunks remain registered until it is cleared: egui needs to encounter
+    /// both selection endpoints each frame to preserve cross-widget selection.
+    pub fn show_viewport(&self, ui: &mut Ui, viewport: Rect, column_width: f32) {
+        let origin = ui.cursor().left_top();
+        let width = self
+            .galley_width
+            .max(self.columns as f32 * column_width.max(1.0));
+        ui.set_min_size(Vec2::new(width, self.height));
+
+        let keep_selection_alive = label_selection_active(ui.ctx());
+        let range = if keep_selection_alive {
+            0..self.chunks.len()
+        } else {
+            self.visible_chunk_range(viewport)
+        };
+        for index in range {
+            let chunk = &self.chunks[index];
+            let rect = Rect::from_min_size(
+                origin + Vec2::new(0.0, chunk.top),
+                Vec2::new(width, chunk.galley.size().y),
+            );
+            ui.push_id(("prepared-diff-chunk", index), |ui| {
+                let mut label = chunk.label(self.columns, column_width);
+                label.keep_selection_alive = keep_selection_alive;
+                ui.place(rect, label);
+            });
         }
     }
 
     pub fn text(&self) -> &str {
-        self.galley.text()
+        &self.text
+    }
+
+    fn visible_chunk_range(&self, viewport: Rect) -> Range<usize> {
+        let first_intersecting = self
+            .chunks
+            .partition_point(|chunk| chunk.bottom() < viewport.top());
+        let first = first_intersecting.saturating_sub(VIEWPORT_OVERSCAN_CHUNKS);
+        let after_last = self
+            .chunks
+            .partition_point(|chunk| chunk.top <= viewport.bottom());
+        let end = after_last
+            .saturating_add(VIEWPORT_OVERSCAN_CHUNKS)
+            .min(self.chunks.len());
+        first..end.max(first)
     }
 
     #[cfg(test)]
-    pub fn hyperlinks(&self) -> &[Hyperlink] {
-        &self.hyperlinks
-    }
-
-    #[cfg(test)]
-    pub fn erase_fills(&self) -> &[EraseFill] {
-        &self.erase_fills
+    fn chunk_count(&self) -> usize {
+        self.chunks.len()
     }
 }
 
@@ -137,6 +219,47 @@ pub fn prepare_layout(
     palette: &Palette,
     line_height: f32,
 ) -> PreparedLayout {
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(PREPARED_CHUNK_ROWS));
+    let mut text = String::new();
+    let mut height = 0.0;
+    let mut galley_width: f32 = 0.0;
+
+    for chunk_rows in rows.chunks(PREPARED_CHUNK_ROWS) {
+        let mut chunk = prepare_chunk(
+            ctx,
+            chunk_rows,
+            columns,
+            font.clone(),
+            palette,
+            line_height,
+        );
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(chunk.galley.text());
+        chunk.top = height;
+        height += chunk.galley.size().y;
+        galley_width = galley_width.max(chunk.galley.size().x);
+        chunks.push(chunk);
+    }
+
+    PreparedLayout {
+        chunks,
+        text,
+        columns,
+        height,
+        galley_width,
+    }
+}
+
+fn prepare_chunk(
+    ctx: &Context,
+    rows: &[Line],
+    columns: usize,
+    font: FontId,
+    palette: &Palette,
+    line_height: f32,
+) -> PreparedChunk {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     job.keep_trailing_whitespace = true;
@@ -192,10 +315,9 @@ pub fn prepare_layout(
         }
     }
 
-    let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
-    PreparedLayout {
-        galley,
-        columns,
+    PreparedChunk {
+        galley: ctx.fonts_mut(|fonts| fonts.layout_job(job)),
+        top: 0.0,
         hyperlinks,
         erase_fills,
     }
@@ -203,19 +325,21 @@ pub fn prepare_layout(
 
 /// The selectable widget backed by a cached [`PreparedLayout`].
 pub struct PreparedLabel<'a> {
-    prepared: &'a PreparedLayout,
+    chunk: &'a PreparedChunk,
+    columns: usize,
     column_width: f32,
+    keep_selection_alive: bool,
 }
 
 impl Widget for PreparedLabel<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let prepared = self.prepared;
-        let galley = prepared.galley.clone();
+        let chunk = self.chunk;
+        let galley = chunk.galley.clone();
         let size = Vec2::new(
             galley
                 .size()
                 .x
-                .max(prepared.columns as f32 * self.column_width),
+                .max(self.columns as f32 * self.column_width),
             galley.size().y,
         );
         let mut sense = Sense::hover();
@@ -227,18 +351,19 @@ impl Widget for PreparedLabel<'_> {
         sense |= selection;
         let (rect, mut response) = ui.allocate_exact_size(size, sense);
         let galley_pos = rect.left_top();
-        response
-            .widget_info(|| WidgetInfo::labeled(WidgetType::Label, ui.is_enabled(), galley.text()));
+        response.widget_info(|| {
+            WidgetInfo::labeled(WidgetType::Label, ui.is_enabled(), RENDERED_DIFF_LABEL)
+        });
 
         if ui.is_rect_visible(rect) {
-            for fill in &prepared.erase_fills {
+            for fill in &chunk.erase_fills {
                 let Some(row) = galley.rows.get(fill.row) else {
                     continue;
                 };
                 let row_rect = row.rect().translate(galley_pos.to_vec2());
                 let start = (galley_pos.x + fill.from_column as f32 * self.column_width)
                     .max(row_rect.right());
-                let end = galley_pos.x + prepared.columns as f32 * self.column_width;
+                let end = galley_pos.x + self.columns as f32 * self.column_width;
                 if start < end {
                     ui.painter().rect_filled(
                         egui::Rect::from_min_max(
@@ -250,15 +375,6 @@ impl Widget for PreparedLabel<'_> {
                     );
                 }
             }
-
-            egui::text_selection::LabelSelectionState::label_text_selection(
-                ui,
-                &response,
-                galley_pos,
-                galley.clone(),
-                ui.visuals().text_color(),
-                Stroke::NONE,
-            );
 
             if response.has_focus() {
                 let page = ui.clip_rect().height().max(48.0) * 0.9;
@@ -295,7 +411,7 @@ impl Widget for PreparedLabel<'_> {
                 .filter(|p| rect.contains(*p))
                 .map(|p| galley.cursor_from_pos(p - galley_pos).index.0)
                 .and_then(|index| {
-                    prepared
+                    chunk
                         .hyperlinks
                         .iter()
                         .find(|link| link.char_range.contains(&index))
@@ -318,21 +434,33 @@ impl Widget for PreparedLabel<'_> {
                 }
             }
         }
+        if ui.is_rect_visible(rect) || self.keep_selection_alive {
+            egui::text_selection::LabelSelectionState::label_text_selection(
+                ui,
+                &response,
+                galley_pos,
+                galley,
+                ui.visuals().text_color(),
+                Stroke::NONE,
+            );
+        }
         response.ctx.accesskit_node_builder(response.id, |node| {
-            node.set_label("Rendered diff");
+            node.set_label(RENDERED_DIFF_LABEL);
         });
         response
     }
 }
 
-/// Build one laid-out block of text for a run of rendered rows.
+fn label_selection_active(ctx: &Context) -> bool {
+    ctx.plugin::<egui::text_selection::LabelSelectionState>()
+        .lock()
+        .has_selection()
+}
+
+/// Build the former one-block layout used by regression tests.
 ///
-/// Keeping the diff in as few `LayoutJob`s as possible is what lets egui handle
-/// selection and copy across the view for free -- which the research flagged as
-/// the thing a diff reviewer actually uses, and the reason to parse ANSI rather
-/// than embed a terminal. Merge mode draws one per hunk so it can cut a control
-/// row in between; egui stitches selection across adjacent labels, so that stays
-/// true there.
+/// Production rendering now uses bounded chunks: egui stitches selection across
+/// adjacent labels, while the scroll view can omit chunks outside its viewport.
 ///
 /// The rows are used exactly as given: trimming belongs to `ansi::body`, which
 /// has to be the only place that decides where the body starts, or the row
@@ -475,14 +603,14 @@ mod tests {
             );
             assert_eq!(prepared.text(), "abc");
             assert_eq!(
-                prepared.erase_fills(),
+                prepared.chunks[0].erase_fills,
                 &[EraseFill {
                     row: 0,
                     from_column: 3,
                     background: Color32::BLACK,
                 }]
             );
-            let response = ui.add(prepared.label(7.0));
+            let response = prepared.show(ui, 7.0);
             assert!(response.rect.width() >= 56.0);
         });
     }
@@ -509,13 +637,150 @@ mod tests {
             );
             assert_eq!(prepared.text(), "αβγ!");
             assert_eq!(
-                prepared.hyperlinks(),
+                prepared.chunks[0].hyperlinks,
                 &[Hyperlink {
                     char_range: 1..3,
                     target: "https://example.test/a".into(),
                 }]
             );
         });
+    }
+
+    #[test]
+    fn prepared_layout_preserves_text_across_chunk_boundaries() {
+        egui::__run_test_ui(|ui| {
+            let rows = (0..PREPARED_CHUNK_ROWS + 1)
+                .map(|row| Line {
+                    spans: vec![span(&format!("row {row}"), None)],
+                    fill_to_eol: None,
+                })
+                .collect::<Vec<_>>();
+            let prepared = prepare_layout(
+                ui.ctx(),
+                &rows,
+                16,
+                FontId::monospace(12.0),
+                &palette(),
+                16.0,
+            );
+            let expected = (0..rows.len())
+                .map(|row| format!("row {row}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert_eq!(prepared.chunk_count(), 2);
+            assert_eq!(prepared.text(), expected);
+        });
+    }
+
+    #[test]
+    fn viewport_work_is_bounded_to_nearby_chunks() {
+        egui::__run_test_ui(|ui| {
+            let rows = (0..PREPARED_CHUNK_ROWS * 8)
+                .map(|row| Line {
+                    spans: vec![span(&format!("row {row}"), None)],
+                    fill_to_eol: None,
+                })
+                .collect::<Vec<_>>();
+            let prepared = prepare_layout(
+                ui.ctx(),
+                &rows,
+                16,
+                FontId::monospace(12.0),
+                &palette(),
+                16.0,
+            );
+            let top = prepared.chunks[3].top + 8.0;
+            let viewport = Rect::from_min_size(egui::pos2(0.0, top), Vec2::new(800.0, 40.0));
+
+            assert_eq!(prepared.chunk_count(), 8);
+            assert_eq!(prepared.visible_chunk_range(viewport), 2..5);
+        });
+    }
+
+    #[test]
+    fn accessibility_name_does_not_contain_the_diff() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let secret = "the complete diff must not become the accessibility name";
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let rows = [Line {
+                spans: vec![span(secret, None)],
+                fill_to_eol: None,
+            }];
+            let prepared = prepare_layout(
+                ui.ctx(),
+                &rows,
+                64,
+                FontId::monospace(12.0),
+                &palette(),
+                16.0,
+            );
+            prepared.show(ui, 7.0);
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit tree update");
+
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some(RENDERED_DIFF_LABEL))
+        );
+        assert!(
+            update
+                .nodes
+                .iter()
+                .all(|(_, node)| node.label() != Some(secret))
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn accessibility_tree_contains_only_viewport_chunks() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let rows = (0..PREPARED_CHUNK_ROWS * 8)
+                .map(|row| Line {
+                    spans: vec![span(&format!("row {row}"), None)],
+                    fill_to_eol: None,
+                })
+                .collect::<Vec<_>>();
+            let prepared = prepare_layout(
+                ui.ctx(),
+                &rows,
+                16,
+                FontId::monospace(12.0),
+                &palette(),
+                16.0,
+            );
+            let top = prepared.chunks[3].top + 8.0;
+            prepared.show_viewport(
+                ui,
+                Rect::from_min_size(egui::pos2(0.0, top), Vec2::new(800.0, 40.0)),
+                7.0,
+            );
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit tree update");
+        let rendered = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.label() == Some(RENDERED_DIFF_LABEL))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 3, "one visible chunk plus overscan");
+        assert!(
+            rendered
+                .iter()
+                .all(|(_, node)| node.value().is_some_and(|value| !value.is_empty()))
+        );
+        output.textures_delta.clear();
     }
 
     #[test]

@@ -2678,7 +2678,7 @@ impl App {
                         if let Some(y) = restore {
                             area = area.vertical_scroll_offset(y);
                         }
-                        let out = area.show(ui, |ui| {
+                        let out = area.show_viewport(ui, |ui, viewport| {
                             // delta's colours are reproduced exactly; the only
                             // thing that may be tinted is the selection over
                             // them, whose default washes out on a diff ground.
@@ -2688,7 +2688,7 @@ impl App {
                                 Color32::from_rgb(0xcd, 0xdd, 0xf5)
                             };
                             if !merging || c.hunks.is_empty() {
-                                ui.add(prepared.whole.label(glyph));
+                                prepared.whole.show_viewport(ui, viewport, glyph);
                                 // One rendered line is one laid-out row --
                                 // delta does the wrapping, and `Extend` stops
                                 // egui redoing it -- so where a hunk was drawn
@@ -2713,7 +2713,7 @@ impl App {
                                 if clicked {
                                     take = Some(n);
                                 }
-                                let body = ui.add(prepared.hunks[n].label(glyph));
+                                let body = prepared.hunks[n].show(ui, glyph);
                                 boxes.push((
                                     control.top() - origin,
                                     body.rect.bottom() - control.top(),
@@ -3079,9 +3079,17 @@ impl App {
 
     fn settings_drawer(&mut self, ui: &mut egui::Ui) {
         let t = ui::tokens(ui);
-        egui::ScrollArea::vertical()
+        let drawer_width = ui.available_width().min(ui.clip_rect().width());
+        let content_width = (drawer_width - 8.0).max(1.0);
+        egui::ScrollArea::both()
+            .id_salt("settings-drawer-scroll")
+            .max_width(drawer_width)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Keep ordinary rows on the drawer width. At the maximum UI
+                // font, indivisible native controls may still be wider; the
+                // horizontal axis is enabled as a last-resort path to them.
+                ui.set_width(content_width);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Settings").text_style(TextStyle::Heading));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3108,25 +3116,27 @@ impl App {
                 ui::field(ui, &t, "Interface", |ui| {
                     self.font_combo(ui, false, catalog_ready);
                 });
-                ui::field(ui, &t, "Size", |ui| {
-                    ui.spacing_mut().slider_width = 120.0;
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.ui_pt, UI_PT)
-                            .suffix(" pt")
-                            .text("Interface font size"),
+                ui::field(ui, &t, "Interface size", |ui| {
+                    ui.spacing_mut().slider_width = 112.0;
+                    let response = ui.add(
+                        egui::Slider::new(&mut self.settings.ui_pt, UI_PT).suffix(" pt"),
                     );
+                    response.ctx.accesskit_node_builder(response.id, |node| {
+                        node.set_label("Interface font size");
+                    });
                 });
                 ui.add_space(6.0);
                 ui::field(ui, &t, "Diff", |ui| {
                     self.font_combo(ui, true, catalog_ready);
                 });
-                ui::field(ui, &t, "Size", |ui| {
-                    ui.spacing_mut().slider_width = 120.0;
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.mono_pt, MONO_PT)
-                            .suffix(" pt")
-                            .text("Diff font size"),
+                ui::field(ui, &t, "Diff size", |ui| {
+                    ui.spacing_mut().slider_width = 112.0;
+                    let response = ui.add(
+                        egui::Slider::new(&mut self.settings.mono_pt, MONO_PT).suffix(" pt"),
                     );
+                    response.ctx.accesskit_node_builder(response.id, |node| {
+                        node.set_label("Diff font size");
+                    });
                 });
                 if let Some(p) = self.probe {
                     if !p.fixed_pitch {
@@ -3166,7 +3176,7 @@ impl App {
                         .unwrap_or_else(|| automatic.into());
                     egui::ComboBox::from_id_salt("syntax-theme")
                         .selected_text(current)
-                        .width(180.0)
+                        .width(ui::control_width(ui))
                         .show_ui(ui, |ui| {
                             dirty |= ui
                                 .selectable_value(
@@ -3260,7 +3270,7 @@ impl App {
                 ui::field(ui, &t, "Ignore lines matching", |ui| {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.settings.ignore_matching)
-                            .desired_width(180.0)
+                            .desired_width(ui::control_width(ui))
                             .hint_text("regular expression"),
                     );
                     // On losing focus, not on every keystroke: a half-typed
@@ -3446,7 +3456,7 @@ impl App {
         let salt = if mono { "font-mono" } else { "font-ui" };
         egui::ComboBox::from_id_salt(salt)
             .selected_text(label)
-            .width(180.0)
+            .width(ui::control_width(ui))
             .show_ui(ui, |ui| {
                 let mut pick: Option<Option<(Face, Option<Face>)>> = None;
                 if ui
@@ -4085,6 +4095,64 @@ mod tests {
 
     fn test_app() -> App {
         test_app_with_settings(Settings::default())
+    }
+
+    #[test]
+    fn settings_drawer_stays_inside_its_supported_narrow_width() {
+        for ui_pt in [13.0, 20.0] {
+            let mut app = test_app();
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::fonts::definitions(None, None, None));
+            crate::theme::install(&ctx, ui_pt, 12.5);
+            ctx.enable_accesskit();
+            let mut drawer_rect = egui::Rect::NOTHING;
+            let mut left = 0.0;
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                ui.set_max_width(208.0);
+                left = ui.cursor().left();
+                ui.set_clip_rect(egui::Rect::from_min_size(
+                    ui.cursor().left_top(),
+                    egui::Vec2::new(208.0, ui.clip_rect().height()),
+                ));
+                app.settings_drawer(ui);
+                drawer_rect = ui.min_rect();
+            });
+            let offenders = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .into_iter()
+                .flat_map(|update| &update.nodes)
+                .filter_map(|(_, node)| {
+                    let bounds = node.bounds()?;
+                    (bounds.x1 > f64::from(left + 208.0))
+                        .then(|| node.label().or(node.value()).unwrap_or("").to_owned())
+                })
+                .collect::<Vec<_>>();
+            let clipped_left = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .into_iter()
+                .flat_map(|update| &update.nodes)
+                .filter_map(|(_, node)| {
+                    let bounds = node.bounds()?;
+                    (bounds.x0 < f64::from(left))
+                        .then(|| node.label().or(node.value()).unwrap_or("").to_owned())
+                })
+                .collect::<Vec<_>>();
+            output.textures_delta.clear();
+            assert!(drawer_rect.left() >= left);
+            assert!(
+                clipped_left.is_empty(),
+                "{ui_pt} pt settings content was clipped on the left: {clipped_left:?}",
+            );
+            assert!(
+                drawer_rect.right() <= left + 208.0,
+                "{ui_pt} pt settings rect {drawer_rect:?} exceeded {}; offenders: {offenders:?}",
+                left + 208.0,
+            );
+        }
     }
 
     fn test_mergetool_app(files: &[PathBuf], merged: PathBuf) -> (App, Arc<AtomicBool>) {
