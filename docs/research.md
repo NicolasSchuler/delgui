@@ -382,6 +382,36 @@ refusal never fires on it. And with `trustExitCode = true`, exit 0 **stages** th
 while exit 1 leaves it conflicted (`UU f.txt`) — which is why the exit status is computed from
 whether `MERGED` holds the merge *now*, not from whether a save ever happened.
 
+## 19. Within-line granularity is two independent knobs
+
+delta refines a removed/added line pair into emphasized spans, and **two separate options** decide
+what comes out. `--max-line-distance` (default 0.6) decides whether a pair is close enough to be
+refined at all; `--word-diff-regex` (default `\w+`) decides what a token is. Measured against
+delta 0.19.2, on `"hi"` becoming `"hello"` (`granularity_narrows_what_is_emphasized`):
+
+| flags | emphasized, removed side | added side |
+| --- | --- | --- |
+| defaults | `hi` | `hello` |
+| `--word-diff-regex=.` | `i` | `ello` |
+| `--max-line-distance=0` | — | — |
+
+So character granularity is a regex change, not a distance change, and `--max-line-distance=0` is
+how within-line highlighting is turned off entirely. Raising the distance to 1.0 changed nothing on
+this fixture: it admits *more distant* pairs, it does not make an admitted pair finer. delta's own
+`--help` suggests `--word-diff-regex="\S+" --max-line-distance=1.0` for the opposite end — closer
+to `git --word-diff`.
+
+The app exposes the pair as one control, because "how much of the line is highlighted" is one
+question to a reader, and states only the flag that defines each choice. `--max-line-distance` is
+deliberately left alone for the two regex choices: 0.6 against 0.8 is a tuning someone may have set
+in their gitconfig on purpose, and it is not what the control is about. The corollary is that a
+gitconfig `max-line-distance = 0` leaves the control nothing to size — the same way any other
+inherited `[delta]` key wins, and only while gitconfig inheritance is on to say so.
+
+Character granularity is the default. A one-character change — a `<` that became `<=`, one letter
+in an identifier — is the one a reader is most likely to miss, and word granularity hides it inside
+a marked word that looks like any other marked word.
+
 ## Open items
 
 - **CJK/wide-glyph fidelity.** Measured in §14: no stock macOS CJK font is double-width, so no

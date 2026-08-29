@@ -6,6 +6,7 @@ use egui::{Key, Modifiers};
 pub enum Action {
     OpenFile,
     CloseWindow,
+    Quit,
     Compare,
     Find,
     NextMatch,
@@ -17,6 +18,7 @@ pub enum Action {
     PasteIntoNewPanel,
     ShowDiff(usize),
     MakeReference,
+    SwapSides,
     ToggleSideBySide,
     ToggleLineNumbers,
     ToggleWrap,
@@ -74,6 +76,8 @@ const fn chord(mac: &'static str, elsewhere: &'static str) -> &'static str {
 const COMPARE_CHORD: (&str, &str) = ("⌘⏎", "Ctrl+Enter");
 const HELP_CHORD: (&str, &str) = ("⌘/", "Ctrl+/");
 const SAVE_CHORD: (&str, &str) = ("⌘S", "Ctrl+S");
+const SWAP_CHORD: (&str, &str) = ("⌘⇧R", "Ctrl+Shift+R");
+const PASTE_PANEL_CHORD: (&str, &str) = ("⌘⇧V", "Ctrl+Shift+V");
 
 pub fn compare_label() -> &'static str {
     chord(COMPARE_CHORD.0, COMPARE_CHORD.1)
@@ -81,6 +85,10 @@ pub fn compare_label() -> &'static str {
 
 pub fn help_label() -> &'static str {
     chord(HELP_CHORD.0, HELP_CHORD.1)
+}
+
+pub fn paste_panel_label() -> &'static str {
+    chord(PASTE_PANEL_CHORD.0, PASTE_PANEL_CHORD.1)
 }
 
 pub fn help_hint() -> &'static str {
@@ -91,6 +99,12 @@ pub fn help_hint() -> &'static str {
 /// a user finishing a merge presses ⌘S and must not get a layout flip.
 pub fn save_label() -> &'static str {
     chord(SAVE_CHORD.0, SAVE_CHORD.1)
+}
+
+/// The pair strip's Swap button says its own chord, and the binding below is
+/// built from the same pair: a hardcoded second spelling is how the two drift.
+pub fn swap_label() -> &'static str {
+    chord(SWAP_CHORD.0, SWAP_CHORD.1)
 }
 
 pub fn settings_hint() -> &'static str {
@@ -115,6 +129,22 @@ pub fn bindings() -> Vec<Binding> {
             group: "file",
             action: Action::CloseWindow,
             key: Key::W,
+            mods: CMD,
+        },
+        // Listed for every platform, live where there is no menu bar to own it
+        // -- Linux and Windows. On macOS AppKit claims the chord for the
+        // application menu's Quit item, which `crate::menu` repoints at the
+        // window so that it lands on `close_requested` and the unsaved-work
+        // guard, exactly as ⌘W does. Whichever path delivers it, quitting is
+        // guarded; as shipped it was not, and took a panel of pasted text with
+        // it without asking.
+        Binding {
+            mac: "⌘Q",
+            other: "Ctrl+Q",
+            describe: "quit",
+            group: "file",
+            action: Action::Quit,
+            key: Key::Q,
             mods: CMD,
         },
         Binding {
@@ -184,6 +214,15 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
+            mac: SWAP_CHORD.0,
+            other: SWAP_CHORD.1,
+            describe: "swap the two sides",
+            group: "compare",
+            action: Action::SwapSides,
+            key: Key::R,
+            mods: CMD_SHIFT,
+        },
+        Binding {
             mac: "⌘N",
             other: "Ctrl+N",
             describe: "add a panel",
@@ -202,8 +241,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
-            mac: "⌘⇧V",
-            other: "Ctrl+Shift+V",
+            mac: PASTE_PANEL_CHORD.0,
+            other: PASTE_PANEL_CHORD.1,
             describe: "paste into a fresh panel",
             group: "panels",
             action: Action::PasteIntoNewPanel,

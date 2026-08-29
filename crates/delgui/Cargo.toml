@@ -27,3 +27,10 @@ fontdb = { version = "0.24", default-features = false, features = ["fs", "memmap
 read-fonts = "0.41"
 serde = { version = "1", features = ["derive"] }
 global-hotkey = "0.8"
+
+# Already in the tree under winit. Used for one edit to the menu winit builds:
+# repointing its Quit item away from `terminate:`, which destroys unsaved panels
+# without asking -- see `menu.rs`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem"] }

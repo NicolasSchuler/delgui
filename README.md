@@ -113,7 +113,9 @@ Two panels to start; <kbd>⌘N</kbd> adds more, up to six. delta is a two-way to
 is the **baseline** — click its letter — and the rest are diffed against it, one tab per pair.
 There is no N-way diff and there is not meant to be. The strip under the panels always names
 the pair on screen, so the direction of the diff is never something you have to infer from
-which side is red.
+which side is red — and **Swap** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>R</kbd>) reads the same pair the
+other way round, which is the difference between "what did this patch add" and "what would
+undoing it remove".
 
 A panel is **a buffer that may be backed by a file**. Untouched, it goes to delta as a path, so
 delta infers the syntax itself. Type into it and it says *edited*, and from then on the buffer
@@ -177,6 +179,10 @@ both-sides-added conflict and must not be filled in by "the first empty panel".
 - **Find** with <kbd>⌘F</kbd>: a literal, case-sensitive substring scan over the rendered text,
   walked with <kbd>⌘G</kbd> / <kbd>⌘⇧G</kbd>. Being able to search the diff at all is half of
   why this parses delta's ANSI rather than embedding a terminal.
+- **Choose how finely a changed line is coloured** in Settings → delta. By default only the
+  characters that actually differ are picked out, because a `<` that became a `<=` is the change
+  most easily missed; *Words* is delta's own default, and *Whole lines* is the way `diff` has
+  always looked.
 - **Filter what counts as a difference** in Settings: how much context to show (changes only,
   three lines, or the whole file), whether to ignore whitespace, blank lines, Windows line
   endings, or lines matching a pattern. What is being ignored is always printed beside the
@@ -195,7 +201,7 @@ both-sides-added conflict and must not be filled in by "the first empty panel".
 | <kbd>⌘⌥↓</kbd> · <kbd>⌘⌥↑</kbd> | next difference · previous difference |
 | <kbd>⌘N</kbd> · <kbd>⌘⇧W</kbd> | add a panel · remove the shown panel |
 | <kbd>⌘⇧V</kbd> | paste into a fresh panel |
-| <kbd>⌘R</kbd> | make the shown panel the baseline |
+| <kbd>⌘R</kbd> · <kbd>⌘⇧R</kbd> | make the shown panel the baseline · swap the two sides |
 | <kbd>⌘1</kbd>…<kbd>⌘6</kbd> | show that panel's diff |
 | <kbd>⌘S</kbd> · <kbd>⌘⇧S</kbd> | save the result · save it as a new file |
 | <kbd>⌘Z</kbd> · <kbd>⌘⇧Z</kbd> | undo · redo the last take (only outside a text field) |
@@ -222,8 +228,9 @@ and green backgrounds are the ones meant for that mode. You can pick the interfa
 fonts from what is installed — delgui measures the one you choose and says so if it is not
 really monospaced, since delta lays its output out in columns.
 
-**delta** shows what your gitconfig already tells delta, which `[delta "name"]` presets exist
-and lets you switch them on, and offers delta's syntax themes, labelled light or dark with one
+**delta** offers *Highlight*, which is how much of a changed line is picked out inside it —
+characters, words, or nothing at all. It shows what your gitconfig already tells delta, which
+`[delta "name"]` presets exist and lets you switch them on, and offers delta's syntax themes, labelled light or dark with one
 click to match the window to them. Turning off *use my `[delta]` gitconfig* passes
 `--no-gitconfig`, which is the only way to get output independent of your gitconfig and working
 directory — `GIT_CONFIG_GLOBAL` does not work, delta ignores it.

@@ -668,6 +668,54 @@ impl Whitespace {
     }
 }
 
+/// How finely a changed line is coloured *within* the line.
+///
+/// delta refines a removed/added line pair into emphasized spans, and two
+/// separate knobs decide what comes out: `--max-line-distance` says whether a
+/// pair is close enough to be refined at all, and `--word-diff-regex` says what
+/// a token is. This is the one control over both, because "how much of the line
+/// is highlighted" is one question to a reader.
+///
+/// Measured against delta 0.19.2 on `examples/config_before.rs` vs
+/// `config_after.rs`, on `"hi"` becoming `"hello"`:
+/// `Character` marks `i`, `Word` marks `hi`, and `Line` marks neither -- the
+/// whole line carries the plain removed background and nothing inside it is
+/// picked out. `granularity_narrows_what_is_emphasized` pins exactly that.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Granularity {
+    /// One character is one token, so only the characters that actually differ
+    /// are marked. The finest delta can draw, and the default: a one-character
+    /// change is the one a reader is most likely to miss.
+    #[default]
+    Character,
+    /// delta's own default: `\w+`, so a changed word is marked whole.
+    Word,
+    /// No within-line diff at all. The removed and added lines are coloured as
+    /// wholes, which is what `diff` has always looked like.
+    Line,
+}
+
+impl Granularity {
+    /// The flag that *defines* this mode, and only that one.
+    ///
+    /// `Character` and `Word` leave `--max-line-distance` alone deliberately:
+    /// 0.6 against 0.8 is a real tuning, not a granularity, and a user who set
+    /// it in their gitconfig meant it. The corollary is that a gitconfig
+    /// `max-line-distance = 0` leaves this control nothing to size -- the same
+    /// way any other inherited `[delta]` key wins, and only while
+    /// `inherit_gitconfig` is on to say so.
+    fn arg(self) -> &'static str {
+        match self {
+            // Stated rather than left to delta, for the reason every other
+            // default here is stated: a `[delta]` section can set it, and then
+            // the control would silently do nothing.
+            Self::Character => "--word-diff-regex=.",
+            Self::Word => "--word-diff-regex=\\w+",
+            Self::Line => "--max-line-distance=0",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Terminal columns. delta's whole layout keys off this, so the GUI must
@@ -711,6 +759,10 @@ pub struct Options {
     /// `-w` as `--width` and then refusing the filename. Owning the diff step is
     /// what makes them reachable at all.
     pub whitespace: Whitespace,
+    /// How much of a changed line is picked out inside it. Unlike the ignores
+    /// above this is presentation only -- it reaches delta, never the diff -- so
+    /// merge mode leaves it exactly as the user set it.
+    pub granularity: Granularity,
     pub ignore_blank_lines: bool,
     /// `--ignore-cr-at-eol`. The cheap half of the CRLF problem: a file saved on
     /// Windows against one saved anywhere else differs on every single line.
@@ -760,6 +812,7 @@ impl Default for Options {
             marked_hunks: false,
             pin_hunk_structure: false,
             whitespace: Whitespace::Exact,
+            granularity: Granularity::default(),
             ignore_blank_lines: false,
             ignore_cr_at_eol: false,
             ignore_matching: None,
@@ -899,6 +952,7 @@ impl Options {
         if let Some(l) = &self.default_language {
             a.push(format!("--default-language={l}"));
         }
+        a.push(self.granularity.arg().into());
         // Emitted even when empty, and only then: an omitted `--features` lets
         // `delta.features` and `DELTA_FEATURES` apply, so unticking every box in
         // the UI would otherwise silently leave them all on.
@@ -1105,6 +1159,32 @@ mod tests {
         assert!(args.contains(&"--no-color".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--diff-algorithm")));
         assert!(!args.iter().any(|a| a == "--no-indent-heuristic"));
+    }
+
+    /// One flag per mode, and the one that defines it.
+    ///
+    /// `Character` and `Word` must not touch `--max-line-distance`: that is how
+    /// close two lines have to be to be refined at all, which is a tuning a user
+    /// may have set deliberately and is not what this control is about.
+    #[test]
+    fn each_granularity_states_the_flag_that_defines_it() {
+        let args = |granularity| {
+            Options {
+                granularity,
+                ..Options::default()
+            }
+            .to_args()
+        };
+        let distance = |args: &[String]| args.iter().any(|a| a.starts_with("--max-line-distance"));
+
+        assert!(args(Granularity::Character).contains(&"--word-diff-regex=.".to_owned()));
+        assert!(args(Granularity::Word).contains(&"--word-diff-regex=\\w+".to_owned()));
+        assert!(args(Granularity::Line).contains(&"--max-line-distance=0".to_owned()));
+        assert!(!distance(&args(Granularity::Character)));
+        assert!(!distance(&args(Granularity::Word)));
+        // And the cache follows: three renderings, three keys.
+        assert_ne!(args(Granularity::Character), args(Granularity::Word));
+        assert_ne!(args(Granularity::Word), args(Granularity::Line));
     }
 
     /// The cache key is built from `fingerprint`, and a setting that never

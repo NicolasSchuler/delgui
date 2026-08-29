@@ -20,11 +20,13 @@
 
 use std::fmt::Write as _;
 
-use delgui_core::delta::{Appearance, DeltaError, MINIMUM_VERSION, Options, PROCESS_LIMITS, Whitespace};
+use delgui_core::delta::{
+    Appearance, DeltaError, Granularity, MINIMUM_VERSION, Options, PROCESS_LIMITS, Whitespace,
+};
 
 use crate::app;
 use crate::keys::{self, Action};
-use crate::settings::{Context, MONO_PT, ResultPlacement, Settings, ThemeChoice, UI_PT};
+use crate::settings::{self, Context, MONO_PT, ResultPlacement, Settings, ThemeChoice, UI_PT};
 
 /// Where the generated file lives, relative to the workspace root.
 pub const PATH: &str = "docs/reference.md";
@@ -33,11 +35,26 @@ pub const PATH: &str = "docs/reference.md";
 /// `tests::every_flag_is_documented` fails if one is added without a row.
 fn describe_flag(flag: &str) -> Option<(&'static str, &'static str)> {
     Some(match flag {
-        "--paste" => ("", "Load the clipboard into the first panel at startup. Nothing happens if the clipboard holds no text."),
-        "--combine" => ("", "Start with a result panel, seeded from the first file, ready to take differences into."),
-        "--watch" => ("", "Follow every file given on the command line, re-reading and re-diffing when it changes on disk."),
-        "--hotkey" => ("", "Register a system-wide hotkey that focuses the window and pastes into a fresh panel. Failure to register is reported and the app continues without it."),
-        "--mergetool" => ("BASE LOCAL REMOTE MERGED", "Resolve a merge conflict for Git. Exactly four paths, bound by position."),
+        "--paste" => (
+            "",
+            "Load the clipboard into the first panel at startup. Nothing happens if the clipboard holds no text.",
+        ),
+        "--combine" => (
+            "",
+            "Start with a result panel, seeded from the first file, ready to take differences into.",
+        ),
+        "--watch" => (
+            "",
+            "Follow every file given on the command line, re-reading and re-diffing when it changes on disk.",
+        ),
+        "--hotkey" => (
+            "",
+            "Register a system-wide hotkey that focuses the window and pastes into a fresh panel. Failure to register is reported and the app continues without it.",
+        ),
+        "--mergetool" => (
+            "BASE LOCAL REMOTE MERGED",
+            "Resolve a merge conflict for Git. Exactly four paths, bound by position.",
+        ),
         "--help" => ("", "Print usage to stdout and exit 0."),
         "-h" => ("", "Same as `--help`."),
         _ => return None,
@@ -51,42 +68,91 @@ fn describe_action(action: Action) -> &'static str {
     match action {
         Action::OpenFile => "File picker for the panel whose diff is on screen.",
         Action::CloseWindow => "Close the window. Unsaved panel or result text is confirmed first.",
-        Action::Compare => "Re-read any file-backed panels from disk and render now. This is also how a pair too large to render automatically gets rendered.",
-        Action::Find => "Open the find bar over the rendered diff. A literal, case-sensitive substring scan; Esc closes it.",
+        Action::Quit => {
+            "Quit, confirming unsaved panel or result text first — the same guarded path as closing the window. On macOS the application menu's Quit item claims this chord; delgui repoints that item from `terminate:`, which tears the process down without asking any window to close, at the window itself, so that both routes reach the confirmation."
+        }
+        Action::Compare => {
+            "Re-read any file-backed panels from disk and render now. This is also how a pair too large to render automatically gets rendered."
+        }
+        Action::Find => {
+            "Open the find bar over the rendered diff. A literal, case-sensitive substring scan; Esc closes it."
+        }
         Action::NextMatch => "Move to the next find match, wrapping at the end.",
         Action::PreviousMatch => "Move to the previous find match, wrapping at the start.",
-        Action::NextChange => "Scroll to the next difference. Works in every comparison, not only while building a result.",
+        Action::NextChange => {
+            "Scroll to the next difference. Works in every comparison, not only while building a result."
+        }
         Action::PreviousChange => "Scroll to the previous difference.",
         Action::AddPanel => "Add an empty panel, up to the panel limit.",
-        Action::RemovePanel => "Remove the panel whose diff is on screen, confirming if it holds unsaved text.",
+        Action::RemovePanel => {
+            "Remove the panel whose diff is on screen, confirming if it holds unsaved text."
+        }
         Action::PasteIntoNewPanel => "Add a panel and paste the clipboard into it.",
-        Action::ShowDiff(_) => "Show that panel's diff against the baseline. One chord per panel, matching the panel limit.",
-        Action::MakeReference => "Make the panel on screen the baseline every other panel is diffed against.",
+        Action::ShowDiff(_) => {
+            "Show that panel's diff against the baseline. One chord per panel, matching the panel limit."
+        }
+        Action::MakeReference => {
+            "Make the panel on screen the baseline every other panel is diffed against."
+        }
+        Action::SwapSides => {
+            "Compare the same two panels the other way round: the baseline and the panel on screen exchange places, so what was removed is now added. Not available while a result is being built, where the baseline is the result itself."
+        }
         Action::ToggleSideBySide => "Toggle delta's two-column layout.",
         Action::ToggleLineNumbers => "Toggle line numbers.",
         Action::ToggleWrap => "Toggle wrapping of long lines.",
         Action::ToggleSettings => "Open or close the settings drawer.",
         Action::ToggleHelp => "Open or close the keyboard overlay.",
-        Action::SaveResult => "Write the result to its file. With `--mergetool` this is what writes MERGED and answers Git.",
+        Action::SaveResult => {
+            "Write the result to its file. With `--mergetool` this is what writes MERGED and answers Git."
+        }
         Action::SaveResultAs => "Write the result to a new file, chosen in a dialog.",
-        Action::UndoTake => "Undo the last take. Ignored while a text field has focus, where it is that field's own undo.",
+        Action::UndoTake => {
+            "Undo the last take. Ignored while a text field has focus, where it is that field's own undo."
+        }
         Action::RedoTake => "Redo the last undone take.",
     }
 }
 
 fn describe_context(context: Context) -> &'static str {
     match context {
-        Context::Tight => "Only the changed lines, so each independent change is its own difference.",
+        Context::Tight => {
+            "Only the changed lines, so each independent change is its own difference."
+        }
         Context::Normal => "Git's own default.",
-        Context::Whole => "The entire file with the changes marked. Large enough to cover any file the panel size limit admits.",
+        Context::Whole => {
+            "The entire file with the changes marked. Large enough to cover any file the panel size limit admits."
+        }
     }
 }
 
 fn describe_whitespace(whitespace: Whitespace) -> (&'static str, &'static str) {
     match whitespace {
         Whitespace::Exact => ("Exact", "Every space is a difference. Git's default."),
-        Whitespace::Amount => ("Ignore amount", "`-b`. A line that gained indentation is still reported."),
-        Whitespace::All => ("Ignore all", "`-w`. Whitespace anywhere, indentation included."),
+        Whitespace::Amount => (
+            "Ignore amount",
+            "`-b`. A line that gained indentation is still reported.",
+        ),
+        Whitespace::All => (
+            "Ignore all",
+            "`-w`. Whitespace anywhere, indentation included.",
+        ),
+    }
+}
+
+fn describe_granularity(granularity: Granularity) -> (&'static str, &'static str) {
+    match granularity {
+        Granularity::Character => (
+            "Characters",
+            "`--word-diff-regex=.`. One character is one token, so only the characters that actually differ are picked out. The default: a one-character change is the one a reader is most likely to miss.",
+        ),
+        Granularity::Word => (
+            "Words",
+            "`--word-diff-regex=\\w+`, delta's own default. A changed word is marked whole.",
+        ),
+        Granularity::Line => (
+            "Whole lines",
+            "`--max-line-distance=0`. No within-line diff at all; removed and added lines are coloured as wholes, the way `diff` has always looked.",
+        ),
     }
 }
 
@@ -100,9 +166,15 @@ fn describe_theme(theme: ThemeChoice) -> &'static str {
 
 fn describe_placement(placement: ResultPlacement) -> &'static str {
     match placement {
-        ResultPlacement::Bottom => "A band under the diff. Costs the diff no width, which is the scarce dimension in a side-by-side render.",
-        ResultPlacement::Left => "A full-height column on the left, under the same half of the diff the result's own text appears in.",
-        ResultPlacement::Right => "A full-height column on the right. About eleven columns of diff at a 1600 px window, for the whole result at once.",
+        ResultPlacement::Bottom => {
+            "A band under the diff. Costs the diff no width, which is the scarce dimension in a side-by-side render."
+        }
+        ResultPlacement::Left => {
+            "A full-height column on the left, under the same half of the diff the result's own text appears in."
+        }
+        ResultPlacement::Right => {
+            "A full-height column on the right. About eleven columns of diff at a 1600 px window, for the whole result at once."
+        }
     }
 }
 
@@ -117,14 +189,37 @@ fn describe_appearance(appearance: Appearance) -> &'static str {
 /// added without saying what the user will see.
 fn describe_error(error: &DeltaError) -> (&'static str, &'static str) {
     match error {
-        DeltaError::NotFound => ("`delta` is not on PATH", "Fatal. delgui names the two install commands and exits; it does not substitute a renderer of its own."),
-        DeltaError::TooOld { .. } => ("delta is older than the floor", "Fatal, naming the version found."),
-        DeltaError::UnreadableVersion { .. } => ("`delta --version` said something unparseable", "Fatal."),
-        DeltaError::Refused { .. } => ("delta refused the patch", "Reported in a banner; the previous diff stays on screen."),
-        DeltaError::GitNotFound => ("`git` is not on PATH", "Fatal. Every render owns a `git diff --no-index` step, so Git is part of the pipeline, not an optional extra."),
-        DeltaError::GitRefused { .. } => ("`git diff --no-index` refused", "Reported in a banner. Exit 1 *with* a patch means the inputs differ and is not an error."),
-        DeltaError::TimedOut { .. } => ("a child outran the timeout", "The process group is killed and the failure is reported."),
-        DeltaError::OutputTooLarge { .. } => ("a child outran the output cap", "Reported rather than buffered."),
+        DeltaError::NotFound => (
+            "`delta` is not on PATH",
+            "Fatal. delgui names the two install commands and exits; it does not substitute a renderer of its own.",
+        ),
+        DeltaError::TooOld { .. } => (
+            "delta is older than the floor",
+            "Fatal, naming the version found.",
+        ),
+        DeltaError::UnreadableVersion { .. } => {
+            ("`delta --version` said something unparseable", "Fatal.")
+        }
+        DeltaError::Refused { .. } => (
+            "delta refused the patch",
+            "Reported in a banner; the previous diff stays on screen.",
+        ),
+        DeltaError::GitNotFound => (
+            "`git` is not on PATH",
+            "Fatal. Every render owns a `git diff --no-index` step, so Git is part of the pipeline, not an optional extra.",
+        ),
+        DeltaError::GitRefused { .. } => (
+            "`git diff --no-index` refused",
+            "Reported in a banner. Exit 1 *with* a patch means the inputs differ and is not an error.",
+        ),
+        DeltaError::TimedOut { .. } => (
+            "a child outran the timeout",
+            "The process group is killed and the failure is reported.",
+        ),
+        DeltaError::OutputTooLarge { .. } => (
+            "a child outran the output cap",
+            "Reported rather than buffered.",
+        ),
         DeltaError::Io(_) => ("the child could not be spawned or read", "Reported."),
     }
 }
@@ -158,6 +253,7 @@ pub fn reference() -> String {
         hunk_headers,
         context,
         whitespace,
+        granularity,
         ignore_blank_lines,
         ignore_cr_at_eol,
         ref ignore_matching,
@@ -178,6 +274,7 @@ pub fn reference() -> String {
         marked_hunks: _,
         pin_hunk_structure: _,
         whitespace: _,
+        granularity: _,
         ignore_blank_lines: _,
         ignore_cr_at_eol: _,
         ignore_matching: _,
@@ -221,25 +318,48 @@ pub fn reference() -> String {
     // One of each variant, so the exhaustive match above is actually reached.
     for e in [
         DeltaError::NotFound,
-        DeltaError::TooOld { found: String::new() },
-        DeltaError::UnreadableVersion { output: String::new() },
-        DeltaError::Refused { code: None, message: String::new() },
+        DeltaError::TooOld {
+            found: String::new(),
+        },
+        DeltaError::UnreadableVersion {
+            output: String::new(),
+        },
+        DeltaError::Refused {
+            code: None,
+            message: String::new(),
+        },
         DeltaError::GitNotFound,
-        DeltaError::GitRefused { code: None, message: String::new() },
-        DeltaError::TimedOut { program: "", after: PROCESS_LIMITS.timeout },
-        DeltaError::OutputTooLarge { program: "", stream: "", limit: 0 },
+        DeltaError::GitRefused {
+            code: None,
+            message: String::new(),
+        },
+        DeltaError::TimedOut {
+            program: "",
+            after: PROCESS_LIMITS.timeout,
+        },
+        DeltaError::OutputTooLarge {
+            program: "",
+            stream: "",
+            limit: 0,
+        },
     ] {
         let (what, then) = describe_error(&e);
         let _ = writeln!(d, "| {what} | {then} |");
     }
-    d.push_str("\nThe `Io` case — the child could not be spawned or read — is reported the same way.\n\n");
+    d.push_str(
+        "\nThe `Io` case — the child could not be spawned or read — is reported the same way.\n\n",
+    );
 
     // ---- Command line -----------------------------------------------------
     d.push_str("## Command line\n\n```\ndelgui [OPTIONS] [FILE]...\n```\n\n");
     d.push_str("| flag | takes | what it does |\n| --- | --- | --- |\n");
     for flag in crate::FLAGS {
         let (takes, what) = describe_flag(flag).unwrap_or(("", "undocumented"));
-        let takes = if takes.is_empty() { String::new() } else { format!("`{takes}`") };
+        let takes = if takes.is_empty() {
+            String::new()
+        } else {
+            format!("`{takes}`")
+        };
         let _ = writeln!(d, "| `{flag}` | {takes} | {what} |");
     }
     let _ = write!(
@@ -274,9 +394,13 @@ pub fn reference() -> String {
 
     // ---- Settings ---------------------------------------------------------
     d.push_str("## Settings\n\n");
-    d.push_str("Opened with the settings chord. Everything here is remembered across restarts.\n\n");
+    d.push_str(
+        "Opened with the settings chord. Everything here is remembered across restarts.\n\n",
+    );
 
-    d.push_str("### Appearance\n\n| option | values | default | effect |\n| --- | --- | --- | --- |\n");
+    d.push_str(
+        "### Appearance\n\n| option | values | default | effect |\n| --- | --- | --- | --- |\n",
+    );
     let themes = ThemeChoice::ALL
         .iter()
         .map(|t| t.label())
@@ -313,7 +437,9 @@ pub fn reference() -> String {
         MONO_PT.end()
     );
     d.push_str("Sizes are clamped on load as well as in the UI, so a hand-edited settings file cannot produce a window with 2 pt text and no way back to the control that fixes it.\n\n");
-    d.push_str("Each theme choice in full:\n\n| choice | delta is told | meaning |\n| --- | --- | --- |\n");
+    d.push_str(
+        "Each theme choice in full:\n\n| choice | delta is told | meaning |\n| --- | --- | --- |\n",
+    );
     for t in ThemeChoice::ALL {
         let flag = match t {
             // System resolves to one of the two at render time; there is no
@@ -331,7 +457,9 @@ pub fn reference() -> String {
          and getting it wrong is how you end up with a light diff on dark chrome.\n\n",
     );
 
-    d.push_str("### Syntax\n\n| option | values | default | maps to |\n| --- | --- | --- | --- |\n");
+    d.push_str(
+        "### Syntax\n\n| option | values | default | maps to |\n| --- | --- | --- | --- |\n",
+    );
     let _ = writeln!(
         d,
         "| Theme | whatever `delta --list-syntax-themes` reports, each labelled light or dark | \
@@ -384,11 +512,21 @@ pub fn reference() -> String {
     let _ = writeln!(
         d,
         "| Ignore lines matching | a regular expression | {} | `--ignore-matching-lines=PATTERN`, as one argument so a leading dash stays part of the pattern |\n",
-        if ignore_matching.is_empty() { "empty" } else { ignore_matching.as_str() }
+        if ignore_matching.is_empty() {
+            "empty"
+        } else {
+            ignore_matching.as_str()
+        }
     );
     d.push_str("Context widths in full:\n\n| choice | context | meaning |\n| --- | --- | --- |\n");
     for c in Context::ALL {
-        let _ = writeln!(d, "| {} | {} | {} |", c.label(), lines(c), describe_context(c));
+        let _ = writeln!(
+            d,
+            "| {} | {} | {} |",
+            c.label(),
+            lines(c),
+            describe_context(c)
+        );
     }
     d.push_str("\nWhitespace settings in full:\n\n| choice | meaning |\n| --- | --- |\n");
     for w in [Whitespace::Exact, Whitespace::Amount, Whitespace::All] {
@@ -406,6 +544,16 @@ pub fn reference() -> String {
     );
 
     d.push_str("### delta\n\n| option | values | default | maps to |\n| --- | --- | --- | --- |\n");
+    let granularities = settings::GRANULARITIES
+        .iter()
+        .map(|(_, label)| *label)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let _ = writeln!(
+        d,
+        "| Highlight | {granularities} | {} | `--word-diff-regex=.` · `--word-diff-regex=\\w+` · `--max-line-distance=0` |",
+        describe_granularity(granularity).0
+    );
     let _ = writeln!(
         d,
         "| Hunk headers | on · off | {} | off is `--hunk-header-style=omit` |",
@@ -424,17 +572,38 @@ pub fn reference() -> String {
             Some(_) => "an explicit selection",
         }
     );
+    d.push_str("Highlight granularity in full:\n\n| choice | meaning |\n| --- | --- |\n");
+    for (g, _) in settings::GRANULARITIES {
+        let (label, meaning) = describe_granularity(g);
+        let _ = writeln!(d, "| {label} | {meaning} |");
+    }
+    d.push_str(
+        "\nIt is a delta flag and it colours part of a changed line, rather than deciding which \
+         lines are changed — which is why it is here and not under *differences*, and why it is \
+         left exactly as set while a result is being built. The two flags behind it are \
+         independent in delta: `--max-line-distance` decides whether a removed/added pair is \
+         refined at all, `--word-diff-regex` what a token is. Each choice states only the one \
+         that defines it, so a `max-line-distance` set in your own gitconfig keeps working.\n\n",
+    );
     d.push_str("Turning off gitconfig inheritance is the only way to get output that does not depend on your gitconfig or working directory: delta ignores `GIT_CONFIG_GLOBAL`. Flipping any of the three view toggles in the toolbar also turns it off, and says so — the toolbar cannot honestly claim to control a view that config is overriding.\n\n");
 
     // ---- Toolbar ----------------------------------------------------------
     d.push_str("## Toolbar\n\n| control | default | maps to |\n| --- | --- | --- |\n");
-    let _ = writeln!(d, "| Side by side | {} | `--side-by-side` |", onoff(side_by_side));
+    let _ = writeln!(
+        d,
+        "| Side by side | {} | `--side-by-side` |",
+        onoff(side_by_side)
+    );
     let _ = writeln!(
         d,
         "| Numbers | {} | `--line-numbers`. Off in side-by-side empties `--line-numbers-left-format` and `--line-numbers-right-format` instead, because delta has no `--no-line-numbers` and `--line-numbers=false` exits 2 |",
         onoff(line_numbers)
     );
-    let _ = writeln!(d, "| Wrap | {} | off is `--wrap-max-lines=0` |", onoff(wrap));
+    let _ = writeln!(
+        d,
+        "| Wrap | {} | off is `--wrap-max-lines=0` |",
+        onoff(wrap)
+    );
     let _ = writeln!(
         d,
         "| Columns | {width} at startup | `--width=N`, recomputed from the window's pixel width and the glyph width, debounced by {} ms |\n",
@@ -491,7 +660,9 @@ pub fn reference() -> String {
     d.push_str("### Forced while building a result\n\nSet for that render only, never written to the saved settings.\n\n| forced | to | why |\n| --- | --- | --- |\n");
     d.push_str("| Context | 0 lines | At Git's default of three, a thirteen-line file with four independent changes comes back as a *single* hunk — one button for the whole file. |\n");
     d.push_str("| All four ignores | off | A take splices a difference's lines wholesale, and the correctness check requires the regions between differences to be identical on both sides. |\n");
-    d.push_str("| Hunk headers | off | Merge mode draws its own control row where the header was. |\n");
+    d.push_str(
+        "| Hunk headers | off | Merge mode draws its own control row where the header was. |\n",
+    );
     d.push_str("| Diff shape | `--diff-algorithm=myers --no-indent-heuristic` | A take is a pair of line ranges, so merge mode owns the structure it splices from. A plain render must *not* pin this: `diff.indentHeuristic` is on by default, it decides whether an added function arrives whole or split mid-comment, and delta's own two-file mode honours it. |\n\n");
 
     // ---- Persistence -------------------------------------------------------
@@ -503,10 +674,26 @@ pub fn reference() -> String {
     d.push_str("RON, written on exit and on a 30-second timer. Unknown and missing fields are tolerated, so an older file keeps working.\n\n");
     d.push_str("Saved:\n\n");
     for field in [
-        "theme", "ui_font", "ui_font_strong", "mono_font", "ui_pt", "mono_pt",
-        "side_by_side", "line_numbers", "wrap", "hunk_headers", "context",
-        "whitespace", "ignore_blank_lines", "ignore_cr_at_eol", "ignore_matching",
-        "syntax_theme", "inherit_gitconfig", "features", "settings_open",
+        "theme",
+        "ui_font",
+        "ui_font_strong",
+        "mono_font",
+        "ui_pt",
+        "mono_pt",
+        "side_by_side",
+        "line_numbers",
+        "wrap",
+        "hunk_headers",
+        "context",
+        "whitespace",
+        "granularity",
+        "ignore_blank_lines",
+        "ignore_cr_at_eol",
+        "ignore_matching",
+        "syntax_theme",
+        "inherit_gitconfig",
+        "features",
+        "settings_open",
         "result_placement",
     ] {
         let _ = writeln!(d, "- `{field}`");
@@ -514,7 +701,11 @@ pub fn reference() -> String {
     let _ = write!(
         d,
         "\nThe settings drawer being open is itself remembered: {}.\n\n",
-        if settings_open { "it starts open" } else { "it starts closed" }
+        if settings_open {
+            "it starts open"
+        } else {
+            "it starts closed"
+        }
     );
     d.push_str(
         "**Not saved: panel contents, panel paths, which panel is the baseline, which pair is \
@@ -577,16 +768,57 @@ pub fn reference() -> String {
 
     // ---- Limits ------------------------------------------------------------
     d.push_str("## Limits and timings\n\n| | | |\n| --- | --- | --- |\n");
-    let _ = writeln!(d, "| Panels | {} | delta is two-way; more panels means more pairs against one baseline, and past a handful the columns are too narrow to read. |", app::MAX_PANELS);
-    let _ = writeln!(d, "| Panel size | {} | Beyond this delta is the bottleneck: about 0.8 s at 2 MB, and it produces roughly seven times its input in ANSI. Refused rather than hung. |", bytes(app::MAX_PANEL_BYTES));
-    let _ = writeln!(d, "| Auto-render ceiling | {} | Above this, editing stops re-rendering by itself and waits to be asked. |", bytes(app::AUTO_RENDER_BYTES));
-    let _ = writeln!(d, "| Typing debounce | {} ms | |", app::EDIT_DEBOUNCE.as_millis());
-    let _ = writeln!(d, "| Resize debounce | {} ms | |", app::RESIZE_DEBOUNCE.as_millis());
-    let _ = writeln!(d, "| Watch debounce | {} ms | A save is rarely one filesystem event, and a file mid-write reads as truncated. |", app::WATCH_DEBOUNCE.as_millis());
-    let _ = writeln!(d, "| Undo history | {} takes or {} | Snapshots of a buffer that may be megabytes, so it is bounded twice. |", app::UNDO_DEPTH, bytes(app::UNDO_BYTES));
-    let _ = writeln!(d, "| Subprocess timeout | {} s | The child is killed as a process group. |", PROCESS_LIMITS.timeout.as_secs());
-    let _ = writeln!(d, "| Subprocess stdout | {} | |", bytes(PROCESS_LIMITS.stdout_bytes));
-    let _ = writeln!(d, "| Subprocess stderr | {} | |", bytes(PROCESS_LIMITS.stderr_bytes));
+    let _ = writeln!(
+        d,
+        "| Panels | {} | delta is two-way; more panels means more pairs against one baseline, and past a handful the columns are too narrow to read. |",
+        app::MAX_PANELS
+    );
+    let _ = writeln!(
+        d,
+        "| Panel size | {} | Beyond this delta is the bottleneck: about 0.8 s at 2 MB, and it produces roughly seven times its input in ANSI. Refused rather than hung. |",
+        bytes(app::MAX_PANEL_BYTES)
+    );
+    let _ = writeln!(
+        d,
+        "| Auto-render ceiling | {} | Above this, editing stops re-rendering by itself and waits to be asked. |",
+        bytes(app::AUTO_RENDER_BYTES)
+    );
+    let _ = writeln!(
+        d,
+        "| Typing debounce | {} ms | |",
+        app::EDIT_DEBOUNCE.as_millis()
+    );
+    let _ = writeln!(
+        d,
+        "| Resize debounce | {} ms | |",
+        app::RESIZE_DEBOUNCE.as_millis()
+    );
+    let _ = writeln!(
+        d,
+        "| Watch debounce | {} ms | A save is rarely one filesystem event, and a file mid-write reads as truncated. |",
+        app::WATCH_DEBOUNCE.as_millis()
+    );
+    let _ = writeln!(
+        d,
+        "| Undo history | {} takes or {} | Snapshots of a buffer that may be megabytes, so it is bounded twice. |",
+        app::UNDO_DEPTH,
+        bytes(app::UNDO_BYTES)
+    );
+    let _ = writeln!(
+        d,
+        "| Subprocess timeout | {} s | The child is killed as a process group. |",
+        PROCESS_LIMITS.timeout.as_secs()
+    );
+    let _ = writeln!(
+        d,
+        "| Subprocess stdout | {} | |",
+        bytes(PROCESS_LIMITS.stdout_bytes)
+    );
+    let _ = writeln!(
+        d,
+        "| Subprocess stderr | {} | |",
+        bytes(PROCESS_LIMITS.stderr_bytes)
+    );
     d.push('\n');
     d.push_str("Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Panel contents reach delta as `/dev/fd/N` pipes — no temporary file is ever written, and the only thing in the app that writes a file is an explicit Save.\n\n");
 
@@ -702,7 +934,17 @@ mod tests {
             assert!(doc.contains(describe_theme(t)), "{:?} undocumented", t);
         }
         for w in [Whitespace::Exact, Whitespace::Amount, Whitespace::All] {
-            assert!(doc.contains(describe_whitespace(w).1), "{:?} undocumented", w);
+            assert!(
+                doc.contains(describe_whitespace(w).1),
+                "{:?} undocumented",
+                w
+            );
+        }
+        for (g, _) in settings::GRANULARITIES {
+            assert!(
+                doc.contains(describe_granularity(g).1),
+                "{g:?} undocumented"
+            );
         }
         for a in [Appearance::Dark, Appearance::Light] {
             assert!(!describe_appearance(a).is_empty());

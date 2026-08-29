@@ -433,6 +433,14 @@ struct PreparedDiff {
     hunks: Vec<render::PreparedLayout>,
 }
 
+/// What a panel's ⋯ menu asked for, applied once its borrows are over. A menu
+/// closes on the first click, so at most one of these can be pending.
+#[derive(Clone, Copy)]
+enum PanelRequest {
+    Open,
+    Remove,
+}
+
 /// What the result band's header asked for, applied once its borrows are over.
 #[derive(Default)]
 struct BandActions {
@@ -575,7 +583,12 @@ pub struct App {
     show_help: bool,
 
     cache: HashMap<usize, Cached>,
-    prepared: HashMap<usize, PreparedDiff>,
+    /// One slot, not a map keyed by panel: only `shown` is ever drawn, so every
+    /// other entry was an unreachable galley kept alive -- and a stale entry
+    /// also kept the find bar and *Copy diff* serving a comparison the cache no
+    /// longer held, which is how *Copy diff* could put the previous pair's diff
+    /// on the clipboard after a panel was removed.
+    prepared: Option<PreparedDiff>,
     /// The render currently running, if any. A single bool could not say *what*
     /// was running, so results arrived out of order and a failure could not be
     /// attributed -- which turned one failed render into an unbounded respawn
@@ -639,6 +652,10 @@ pub struct App {
     /// A close request held back while the result holds unsaved work, and the
     /// answer once it has been given.
     quit_guard: bool,
+    /// Whether the platform menu's Quit has been pointed at the window rather
+    /// than at the process. Retried each frame until it takes, because the menu
+    /// winit builds may not exist on the first one. See [`crate::menu`].
+    quit_menu_guarded: bool,
     closing: bool,
     destructive: Option<DestructiveAction>,
     focus_panel: Option<usize>,
@@ -649,6 +666,36 @@ pub struct App {
     tx: Sender<Job>,
     rx: Receiver<Job>,
 }
+
+/// Every label the settings drawer draws through [`ui::field`], as a set --
+/// "Theme" labels both the app theme and the syntax theme. [`ui::field_column`]
+/// sizes the label column from these and [`ui::field`] asserts that the label it
+/// was handed is one of them, so a new field that is not added here fails
+/// `settings_drawer_stays_inside_its_supported_narrow_width`.
+const SETTINGS_FIELDS: &[&str] = &[
+    "Theme",
+    "Interface",
+    "Interface size",
+    "Diff",
+    "Diff size",
+    "Show",
+    "Highlight",
+    "Whitespace",
+    "Ignore lines matching",
+];
+
+/// The width at which the drawer's label column and a usable control fit side
+/// by side -- which is the whole reason the column is measured per drawer.
+///
+/// Measured, not guessed, and pinned by
+/// `the_settings_drawer_aligns_its_fields_at_its_default_width`: at 13 pt in the
+/// system UI font "Ignore lines matching" shapes to 165, plus 8 of gap and the
+/// 180 the size sliders need is 353 of content; the drawer's own scroll
+/// allowance is 6 and the frame's symmetric margin is 32. An earlier 360 was
+/// arithmetic on a 124 pt guess at that label, and left the drawer stacked at
+/// its own default width. A larger UI font stacks the whole drawer, as one,
+/// which is the point of deciding it per drawer rather than per row.
+const SETTINGS_DRAWER_WIDTH: f32 = 400.0;
 
 impl App {
     pub fn new(delta: Delta, mut settings: Settings, launch: Launch) -> Self {
@@ -763,6 +810,7 @@ impl App {
                 wrap: settings.wrap,
                 hunk_headers: settings.hunk_headers,
                 whitespace: settings.whitespace,
+                granularity: settings.granularity,
                 ignore_blank_lines: settings.ignore_blank_lines,
                 ignore_cr_at_eol: settings.ignore_cr_at_eol,
                 syntax_theme: settings.syntax_theme.clone(),
@@ -780,7 +828,7 @@ impl App {
             show_settings,
             show_help: false,
             cache: HashMap::new(),
-            prepared: HashMap::new(),
+            prepared: None,
             in_flight: None,
             failed: None,
             error,
@@ -813,6 +861,7 @@ impl App {
             pending_offset: None,
             restore_offset: None,
             quit_guard: false,
+            quit_menu_guarded: false,
             closing: false,
             destructive: None,
             focus_panel: None,
@@ -1249,6 +1298,38 @@ impl App {
         self.cache.clear();
         self.touch();
         self.normalize();
+    }
+
+    /// Compare the same two panels the other way round.
+    ///
+    /// Which side a panel is on is the whole meaning of red and green: the
+    /// baseline is "before", so `-` is what the baseline has and the shown panel
+    /// does not. Reading the same pair as an undo of itself is an ordinary
+    /// thing to want, and this is the one action that says so.
+    ///
+    /// It exchanges the two rather than adding a "reversed" flag beside them,
+    /// because a second notion of direction is a second thing to keep in step:
+    /// `RenderKey`, the language delta infers from the right-hand path, the pair
+    /// strip's own labels and merge mode's line ranges all read `reference` and
+    /// `shown` already, and all four would have had to learn about the flag.
+    ///
+    /// `MakeReference` is not this. It promotes the shown panel and lets
+    /// `normalize` pick whatever is left, which with more than two panels is the
+    /// first other one -- not the panel that was the baseline a moment ago.
+    fn swap_sides(&mut self) {
+        // The baseline is the result being built, and its candidates are what
+        // it is built from; there is no other way round for that to be.
+        if self.merging() {
+            return;
+        }
+        let (reference, shown) = self.pair();
+        if reference == shown {
+            return;
+        }
+        // Assigned before `set_reference`, whose `normalize` would otherwise see
+        // `shown == reference` and pick a third panel instead of this one.
+        self.shown = reference;
+        self.set_reference(shown);
     }
 
     fn paste_into_new_panel(&mut self) {
@@ -1761,7 +1842,10 @@ impl App {
         for action in ctx.input(keys::pressed) {
             match action {
                 Action::OpenFile => self.choose_file_for_panel(self.shown),
-                Action::CloseWindow => {
+                // One window, so quitting and closing it are the same request.
+                // Both go through `close_requested`, which is the only thing
+                // `quit_guard` can hook -- see the note on the ⌘Q binding.
+                Action::CloseWindow | Action::Quit => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Action::Compare => self.compare_now(ctx),
@@ -1780,6 +1864,7 @@ impl App {
                     let shown = self.shown;
                     self.set_reference(shown);
                 }
+                Action::SwapSides => self.swap_sides(),
                 Action::ToggleSideBySide => {
                     self.opts.side_by_side = !self.opts.side_by_side;
                     self.take_view_control();
@@ -1802,8 +1887,7 @@ impl App {
                         self.open_find();
                     } else {
                         self.show_find = true;
-                        self.pending_find_move =
-                            if action == Action::NextMatch { 1 } else { -1 };
+                        self.pending_find_move = if action == Action::NextMatch { 1 } else { -1 };
                     }
                 }
                 Action::NextChange => self.pending_hunk_move = 1,
@@ -1895,6 +1979,7 @@ impl App {
                     want.1.as_ref(),
                     want.2.as_ref(),
                 ));
+                ui::font_definitions_replaced(ctx);
                 self.probe = None; // measure again once the new faces are live
             }
             ctx.all_styles_mut(|s| crate::theme::type_scale(s, want.3, want.4));
@@ -1956,14 +2041,18 @@ impl App {
                 self.take_view_control();
             }
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label(ui::micro(format!("{} cols", self.columns)).color(t.text_muted))
-                    .on_hover_text(
-                        "delta lays out against a column count, so the window's width is \
-                         translated back into columns and the diff re-rendered on resize.",
-                    );
-                if self.panels.len() < MAX_PANELS && ui::ghost(ui, "+ Panel").clicked() {
-                    self.add_panel();
+            // Utilities right, actions left. Left-packing them put "+ Panel",
+            // "Settings" and "?" hard against the view modes with the whole
+            // right half of the toolbar empty, so the row read as one
+            // undifferentiated run of controls. The column count went with them
+            // -- it is a reading of the diff, not a command, and it was being
+            // shown on the empty screen where there is no diff to have a width.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui::icon(ui, "?", "Help", None)
+                    .on_hover_text(keys::help_hint())
+                    .clicked()
+                {
+                    self.show_help = !self.show_help;
                 }
                 let gear = ui.add(
                     egui::Button::selectable(self.show_settings, "Settings")
@@ -1973,11 +2062,8 @@ impl App {
                 if gear.on_hover_text(keys::settings_hint()).clicked() {
                     self.show_settings = !self.show_settings;
                 }
-                if ui::icon(ui, "?", "Help", None)
-                    .on_hover_text(keys::help_hint())
-                    .clicked()
-                {
-                    self.show_help = !self.show_help;
+                if self.panels.len() < MAX_PANELS && ui::ghost(ui, "+ Panel").clicked() {
+                    self.add_panel();
                 }
             });
         });
@@ -2034,11 +2120,28 @@ impl App {
                     let header = Frame::new()
                         .inner_margin(Margin::symmetric(10, 7))
                         .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
+                            // One row, never wrapped, with fixed metadata and
+                            // actions laid out before the flexible name.
+                            //
+                            // This used to be a `horizontal_wrapped` holding a
+                            // second `horizontal_wrapped` for the actions. A
+                            // nested wrapped layout wraps to *its own* left
+                            // edge, which is halfway across the row, so as soon
+                            // as a card got narrow the actions came off in a
+                            // staircase: "Open…" on its own line at x≈340, "⋯"
+                            // below that. It hit the reference panel first and
+                            // hardest, because `baseline` is the tag that makes
+                            // its header the widest. Reserve the right-hand
+                            // widgets first, then give the name exactly the
+                            // remaining width so it is the only flexible item.
+                            ui.horizontal(|ui| {
                                 let chip = ui.add(
-                                    egui::Button::selectable(is_ref, ui::strong(title(i).to_string()))
-                                        .corner_radius(radius::CHIP)
-                                        .min_size(Vec2::new(24.0, 22.0)),
+                                    egui::Button::selectable(
+                                        is_ref,
+                                        ui::strong(title(i).to_string()),
+                                    )
+                                    .corner_radius(radius::CHIP)
+                                    .min_size(Vec2::new(24.0, 22.0)),
                                 );
                                 if chip
                                     .on_hover_text(if is_ref {
@@ -2050,43 +2153,63 @@ impl App {
                                 {
                                     new_reference = Some(i);
                                 }
+
                                 let panel = &self.panels[i];
-                                ui.label(RichText::new(&panel_label).color(t.text_primary))
-                                    .on_hover_text(
-                                        panel
-                                            .path
-                                            .as_ref()
-                                            .map_or_else(|| panel_label.clone(), |p| p.display().to_string()),
-                                    );
-                                if is_ref {
-                                    ui.label(ui::micro("baseline").color(t.accent));
-                                }
-                                if panel.edited {
-                                    ui.label(ui::micro("edited").color(t.warning)).on_hover_text(
-                                        "The text here no longer matches the file. \
-                                         What you see is what gets compared.",
-                                    );
-                                }
-                                if panel.watch && panel.edited {
-                                    ui.label(ui::micro("follow paused").color(t.warning))
-                                        .on_hover_text(
-                                            "Following is paused while this panel has edits, so a disk change cannot overwrite them.",
-                                        );
-                                }
-                                if let Some(detail) = panel.detail() {
-                                    ui.label(ui::small(detail).color(t.text_muted));
-                                }
-                                ui.horizontal_wrapped(|ui| {
+                                let edited = panel.edited;
+                                let follow_paused = panel.watch && panel.edited;
+                                let detail = panel.detail();
+                                let tooltip = panel.path.as_ref().map_or_else(
+                                    || panel_label.clone(),
+                                    |path| path.display().to_string(),
+                                );
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    match self.panel_menu(ui, i, &t) {
+                                        Some(PanelRequest::Open) => open = Some(i),
+                                        Some(PanelRequest::Remove) => remove = Some(i),
+                                        None => {}
+                                    }
                                     self.language_chip(ui, i, &t);
-                                    if ui::ghost(ui, "Open…")
-                                        .on_hover_text(format!("Load a file into panel {}", title(i)))
-                                        .clicked()
-                                    {
-                                        open = Some(i);
+                                    if let Some(detail) = detail {
+                                        ui.label(ui::small(detail).color(t.text_muted));
                                     }
-                                    if self.panel_menu(ui, i, &t) {
-                                        remove = Some(i);
+                                    if follow_paused {
+                                        ui.label(ui::micro("follow paused").color(t.warning))
+                                            .on_hover_text(
+                                                "Following is paused while this panel has edits, so a disk change cannot overwrite them.",
+                                            );
                                     }
+                                    if edited {
+                                        ui.label(ui::micro("edited").color(t.warning))
+                                            .on_hover_text(
+                                                "The text here no longer matches the file. \
+                                                 What you see is what gets compared.",
+                                            );
+                                    }
+                                    if is_ref {
+                                        ui.label(ui::micro("baseline").color(t.accent));
+                                    }
+
+                                    // The nested left-to-right box keeps the
+                                    // truncated text at the card's left edge;
+                                    // its width is whatever the metadata left.
+                                    let name_width = ui.available_width().max(0.0);
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(name_width, 22.0),
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.set_min_size(Vec2::new(name_width, 22.0));
+                                            ui.set_max_width(name_width);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&panel_label)
+                                                        .color(t.text_primary),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(tooltip);
+                                        },
+                                    );
                                 });
                             });
                         })
@@ -2100,6 +2223,7 @@ impl App {
                         egui::ScrollArea::both()
                             .id_salt(i)
                             .auto_shrink([false, false])
+                            .max_height(whole_rows(ui, EDITOR_PAD))
                             .show(ui, |ui| {
                                 let editor_name = format!(
                                     "Panel {} editor, {}",
@@ -2114,10 +2238,10 @@ impl App {
                                         .background_color(t.surface_sunken)
                                         .desired_width(f32::INFINITY)
                                         .desired_rows(8)
-                                        .hint_text(format!(
-                                            "Panel {} editor — paste here, or drop a file",
-                                            title(i)
-                                        )),
+                                        // Not "Panel A editor — …": the card is
+                                        // already headed by an A chip, and the
+                                        // screen reader gets `editor_name` below.
+                                        .hint_text("Paste here, or drop a file"),
                                 );
                                 ui.ctx().accesskit_node_builder(response.id, |node| {
                                     node.set_label(editor_name);
@@ -2171,8 +2295,11 @@ impl App {
     /// Everything a panel can do, in one button that stays where it was. The
     /// old header grew and shrank as a panel changed state, so the control you
     /// were reaching for moved out from under the cursor.
-    fn panel_menu(&mut self, ui: &mut egui::Ui, i: usize, t: &Tokens) -> bool {
-        let mut remove = false;
+    ///
+    /// The two items that need the whole `App` back before they can run say so
+    /// by returning; the rest borrow it here and are done.
+    fn panel_menu(&mut self, ui: &mut egui::Ui, i: usize, t: &Tokens) -> Option<PanelRequest> {
+        let mut request = None;
         let menu_name = format!("Panel {} options", title(i));
         let button = egui::Button::new(RichText::new("⋯").color(t.text_secondary))
             .frame_when_inactive(false)
@@ -2180,6 +2307,14 @@ impl App {
             .min_size(Vec2::splat(26.0));
         let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
             let has_file = self.panels[i].path.is_some();
+            // Moved in from the header, where it was the item that made the row
+            // too wide to fit and came off in a staircase. Everything else a
+            // panel can do was already here; leaving one action outside was
+            // what kept the header growing.
+            if ui.button("Open…").clicked() {
+                request = Some(PanelRequest::Open);
+                ui.close();
+            }
             if i != self.reference && ui.button("Make baseline").clicked() {
                 let target = i;
                 self.set_reference(target);
@@ -2212,7 +2347,7 @@ impl App {
                 ui.close();
             }
             if self.panels.len() > 2 && ui.button("Remove panel").clicked() {
-                remove = true;
+                request = Some(PanelRequest::Remove);
                 ui.close();
             }
         });
@@ -2223,7 +2358,7 @@ impl App {
                 menu_name.clone(),
             )
         });
-        remove
+        request
     }
 
     /// The syntax delta will use for this panel, shown rather than hidden in a
@@ -2288,6 +2423,13 @@ impl App {
         });
     }
 
+    fn result_seed_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.panels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, panel)| (!panel.text.is_empty()).then_some(index))
+    }
+
     /// Which pair is on screen -- and, while a result is being built, what is
     /// being taken from and how much of it is left.
     ///
@@ -2304,6 +2446,11 @@ impl App {
         let mut undo = false;
         let mut go = None;
         let mut resume = None;
+        let mut swap = false;
+        // Swapping two empty panels is a no-op. Combine stays live because its
+        // menu can always start empty and can seed from a non-active panel.
+        let pair_has_text =
+            !self.panels[reference].text.is_empty() || !self.panels[shown].text.is_empty();
         ui.horizontal_wrapped(|ui| {
             if merging {
                 ui.label(ui::micro("building").color(t.accent));
@@ -2387,10 +2534,7 @@ impl App {
                     egui::containers::menu::MenuButton::from_button(button)
                         .ui(ui, |ui| {
                             ui.label(ui::micro("start a result from").color(t.text_muted));
-                            for i in 0..self.panels.len() {
-                                if self.panels[i].text.is_empty() {
-                                    continue;
-                                }
+                            for i in self.result_seed_indices() {
                                 let label = format!("{} · {}", title(i), self.panel_label(i));
                                 if ui.button(label).clicked() {
                                     seed = Some(Some(i));
@@ -2414,6 +2558,21 @@ impl App {
                     {
                         resume = self.result_panel();
                     }
+                    // An action, so it sits with the actions rather than beside
+                    // the description on the left. Spelled out rather than
+                    // drawn as `⇄`: `ui::icon` may only be handed glyphs the
+                    // font chain is known to have.
+                    if ui::ghost_enabled(ui, "Swap", pair_has_text)
+                        .on_hover_text(format!(
+                            "Compare these two the other way round, so what is removed \
+                             here is added there.  {}",
+                            keys::swap_label(),
+                        ))
+                        .on_disabled_hover_text("Both panels are empty")
+                        .clicked()
+                    {
+                        swap = true;
+                    }
                 }
             });
         });
@@ -2425,6 +2584,9 @@ impl App {
         }
         if let Some(i) = resume {
             self.resume_result(i);
+        }
+        if swap {
+            self.swap_sides();
         }
         if stop {
             self.stop_building();
@@ -2446,6 +2608,10 @@ impl App {
         // double the layout cost of the longest diffs.
         let merging = self.merging();
         let Some(cached) = self.cache.get(&self.shown) else {
+            // `diff_area` calls this first and is called unconditionally from
+            // the central panel, so dropping the slot here is what stops a
+            // layout outliving the comparison it was built for by even a frame.
+            self.prepared = None;
             return;
         };
         let style = LayoutStyleKey {
@@ -2456,9 +2622,11 @@ impl App {
             line_height,
             pixels_per_point: ctx.pixels_per_point(),
         };
+        // `RenderKey` carries `shown`, so a matching key already implies a
+        // matching panel; the slot needs no index of its own.
         if self
             .prepared
-            .get(&self.shown)
+            .as_ref()
             .is_some_and(|prepared| prepared.render_key == cached.key && prepared.style == style)
         {
             return;
@@ -2490,15 +2658,12 @@ impl App {
         } else {
             Vec::new()
         };
-        self.prepared.insert(
-            self.shown,
-            PreparedDiff {
-                render_key: cached.key.clone(),
-                style,
-                whole,
-                hunks,
-            },
-        );
+        self.prepared = Some(PreparedDiff {
+            render_key: cached.key.clone(),
+            style,
+            whole,
+            hunks,
+        });
     }
 
     fn diff_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, glyph: f32) {
@@ -2538,20 +2703,30 @@ impl App {
         let mut move_find = std::mem::take(&mut self.pending_find_move);
         let mut take = None;
         let mut boxes = Vec::new();
+        // Whether the diff owns the keyboard, learned inside the scroll area --
+        // which is the only place that knows -- and painted after it.
+        let mut focused = false;
         let mut offset = self.diff_offset;
 
-        if let Some(prepared) = self.prepared.get(&self.shown)
-            && !prepared.whole.text().is_empty()
+        if let Some(prepared) = self.prepared.as_ref()
+            && !prepared.whole.is_empty()
         {
-            let copy_text = prepared.whole.text().to_owned();
             // From the cache, not from `prepared`: the per-hunk layouts exist
             // only while merging, and the count is what every render knows.
             let hunk_count = self.cache.get(&self.shown).map_or(0, |c| c.hunks.len());
-            let find_lines = find_line_offsets(&copy_text, &self.find_query);
+            let find_lines = prepared.whole.matching_rows(&self.find_query);
             let mut close_find = false;
+            let mut copy = false;
             ui.horizontal_wrapped(|ui| {
                 if hunk_count > 0 {
-                    if ui::ghost(ui, "Previous change").clicked() {
+                    // Live only when there is somewhere to go. With one
+                    // difference these wrapped to the same one, so they were
+                    // full-strength controls that visibly did nothing.
+                    let walkable = hunk_count > 1;
+                    if ui::ghost_enabled(ui, "Previous change", walkable)
+                        .on_disabled_hover_text("Only one difference")
+                        .clicked()
+                    {
                         move_hunk = -1;
                     }
                     ui.label(
@@ -2562,7 +2737,10 @@ impl App {
                         ))
                         .color(t.text_muted),
                     );
-                    if ui::ghost(ui, "Next change").clicked() {
+                    if ui::ghost_enabled(ui, "Next change", walkable)
+                        .on_disabled_hover_text("Only one difference")
+                        .clicked()
+                    {
                         move_hunk = 1;
                     }
                 }
@@ -2572,8 +2750,21 @@ impl App {
                     );
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Beside the diff, which is the only thing it describes --
+                    // it used to sit in the toolbar between the view modes and
+                    // the actions, where it was shown even with both panels
+                    // empty and nothing laid out to any width at all.
+                    ui.label(ui::micro(format!("{} cols", self.columns)).color(t.text_muted))
+                        .on_hover_text(
+                            "delta lays out against a column count, so the window's width is \
+                             translated back into columns and the diff re-rendered on resize.",
+                        );
                     if ui::ghost(ui, "Copy diff").clicked() {
-                        ctx.copy_text(copy_text.clone());
+                        // Deferred: the closure holds `&mut self`, and building
+                        // the string needs the layout back. It used to be built
+                        // every frame instead -- ~14 MB of copying, sixty times
+                        // a second, at a 2 MB pair.
+                        copy = true;
                         self.flash = Some(("Diff copied".into(), Instant::now()));
                     }
                     if let Some((text, at)) = &self.flash
@@ -2584,6 +2775,9 @@ impl App {
                     }
                 });
             });
+            if copy && let Some(prepared) = self.prepared.as_ref() {
+                ctx.copy_text(prepared.whole.to_text());
+            }
             if self.show_find {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Find in diff");
@@ -2666,7 +2860,7 @@ impl App {
                 match self.cache.get(&self.shown) {
                     Some(c) if !render::is_empty(&c.lines) => {
                         let stale = !self.is_fresh();
-                        let Some(prepared) = self.prepared.get(&self.shown) else {
+                        let Some(prepared) = self.prepared.as_ref() else {
                             return;
                         };
                         let mut area = egui::ScrollArea::both()
@@ -2687,6 +2881,13 @@ impl App {
                             } else {
                                 Color32::from_rgb(0xcd, 0xdd, 0xf5)
                             };
+                            // Above the merge/plain branch, and inside the
+                            // viewport closure: that is what makes merge mode
+                            // one tab stop too, puts the region's accessibility
+                            // node in place before the first chunk claims a
+                            // parent, and sends a page-key scroll to *this*
+                            // scroll area.
+                            focused = render::diff_region(ui).has_focus();
                             if !merging || c.hunks.is_empty() {
                                 prepared.whole.show_viewport(ui, viewport, glyph);
                                 // One rendered line is one laid-out row --
@@ -2721,6 +2922,18 @@ impl App {
                             }
                         });
                         offset = out.state.offset.y;
+                        render::scroll_edges(
+                            ui,
+                            &t,
+                            out.inner_rect,
+                            out.state.offset.x,
+                            out.content_size.x,
+                        );
+                        // After the closure, so the ring is not buried under the
+                        // erase fills the chunks paint.
+                        if focused {
+                            render::focus_ring(ui, out.inner_rect);
+                        }
                         if stale {
                             self.stale_pill(ui, &t);
                         }
@@ -2795,7 +3008,13 @@ impl App {
     /// What the result is called, how far it is from disk, and how big it is.
     fn result_identity(&mut self, ui: &mut egui::Ui, t: &Tokens, i: usize) {
         ui.label(ui::micro("result").color(t.accent));
-        ui.label(ui::strong(self.panel_label(i)).color(t.text_primary));
+        // The name only once it *is* one. Until the result is saved,
+        // `Panel::name` has nothing to go on and answers "Result", so the band
+        // read "RESULT Result not saved yet" -- the same fact three times, with
+        // the tag and the status each saying it better than the middle one did.
+        if self.panels[i].saved_to.is_some() {
+            ui.label(ui::strong(self.panel_label(i)).color(t.text_primary));
+        }
         let state = match (&self.panels[i].saved_to, self.panels[i].dirty) {
             (None, _) => "not saved yet",
             (Some(_), true) => "unsaved changes",
@@ -2927,6 +3146,7 @@ impl App {
         egui::ScrollArea::both()
             .id_salt("result-band")
             .auto_shrink([false, false])
+            .max_height(whole_rows(ui, EDITOR_PAD))
             .show(ui, |ui| {
                 let editor_name = format!("Result editor, {}", self.panel_label(i));
                 let response = ui.add(
@@ -3066,9 +3286,13 @@ impl App {
             ui,
             t,
             "Nothing to compare yet",
-            "Put text in two panels and delgui will diff them with the real delta binary.",
+            // Where "drop a file onto a panel" now lives. It was a row in the
+            // list below, keyed on the word `paste` -- set in the chord style,
+            // so a verb was drawn as a key you could press.
+            "Put text in two panels, or drop a file onto one, and delgui will diff \
+             them with the real delta binary.",
             &[
-                ("paste", "into a panel, or drop a file onto it"),
+                (keys::paste_panel_label(), "paste into a new panel"),
                 (keys::compare_label(), "compare"),
                 (keys::help_label(), "keyboard shortcuts"),
             ],
@@ -3080,7 +3304,10 @@ impl App {
     fn settings_drawer(&mut self, ui: &mut egui::Ui) {
         let t = ui::tokens(ui);
         let drawer_width = ui.available_width().min(ui.clip_rect().width());
-        let content_width = (drawer_width - 8.0).max(1.0);
+        // What the scroll area reserves for its own bar, asked for rather than
+        // guessed: the 8 that used to sit here was only safe because the theme
+        // asks for a floating bar, whose allowance is 6.
+        let content_width = (drawer_width - ui.spacing().scroll.allocated_width()).max(1.0);
         egui::ScrollArea::both()
             .id_salt("settings-drawer-scroll")
             .max_width(drawer_width)
@@ -3090,6 +3317,11 @@ impl App {
                 // font, indivisible native controls may still be wider; the
                 // horizontal axis is enabled as a last-resort path to them.
                 ui.set_width(content_width);
+                // Measured here rather than at each row: every `ui::field`
+                // below is a direct child of this `Ui`, so `available_width` is
+                // the same at this point as it is at each of them -- which is
+                // what makes one measurement legitimate for all nine.
+                let fields = ui::field_column(ui, SETTINGS_FIELDS);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Settings").text_style(TextStyle::Heading));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3107,17 +3339,18 @@ impl App {
                 let mut theme = self.settings.theme;
                 let options: Vec<(ThemeChoice, &str)> =
                     ThemeChoice::ALL.iter().map(|c| (*c, c.label())).collect();
-                ui::field(ui, &t, "Theme", |ui| {
+                ui::field(ui, &t, fields, "Theme", |ui| {
                     ui::choice(ui, &t, &mut theme, &options);
                 });
                 self.settings.theme = theme;
 
                 let catalog_ready = self.catalog_rx.is_none();
-                ui::field(ui, &t, "Interface", |ui| {
+                ui::field(ui, &t, fields, "Interface", |ui| {
                     self.font_combo(ui, false, catalog_ready);
                 });
-                ui::field(ui, &t, "Interface size", |ui| {
+                ui::field(ui, &t, fields, "Interface size", |ui| {
                     ui.spacing_mut().slider_width = 112.0;
+                    ui::slider_visuals(ui, &t);
                     let response = ui.add(
                         egui::Slider::new(&mut self.settings.ui_pt, UI_PT).suffix(" pt"),
                     );
@@ -3126,11 +3359,12 @@ impl App {
                     });
                 });
                 ui.add_space(6.0);
-                ui::field(ui, &t, "Diff", |ui| {
+                ui::field(ui, &t, fields, "Diff", |ui| {
                     self.font_combo(ui, true, catalog_ready);
                 });
-                ui::field(ui, &t, "Diff size", |ui| {
+                ui::field(ui, &t, fields, "Diff size", |ui| {
                     ui.spacing_mut().slider_width = 112.0;
+                    ui::slider_visuals(ui, &t);
                     let response = ui.add(
                         egui::Slider::new(&mut self.settings.mono_pt, MONO_PT).suffix(" pt"),
                     );
@@ -3163,7 +3397,7 @@ impl App {
                 ui.add_space(16.0);
                 let mut dirty = false;
                 ui::section(ui, &t, "syntax");
-                ui::field(ui, &t, "Theme", |ui| {
+                ui::field(ui, &t, fields, "Theme", |ui| {
                     let automatic = if self.opts.inherit_gitconfig {
                         "from your gitconfig"
                     } else {
@@ -3238,12 +3472,12 @@ impl App {
                 ui.add_space(16.0);
                 ui::section(ui, &t, "differences");
                 let merging = self.merging();
-                ui::field(ui, &t, "Show", |ui| {
+                ui::field(ui, &t, fields, "Show", |ui| {
                     let options: Vec<(Context, &str)> =
                         Context::ALL.iter().map(|c| (*c, c.label())).collect();
                     dirty |= ui::choice(ui, &t, &mut self.settings.context, &options);
                 });
-                ui::field(ui, &t, "Whitespace", |ui| {
+                ui::field(ui, &t, fields, "Whitespace", |ui| {
                     dirty |= ui::choice(
                         ui,
                         &t,
@@ -3267,7 +3501,7 @@ impl App {
                         "A file saved with CRLF differs from the same file saved with LF on                          every single line.",
                     )
                     .changed();
-                ui::field(ui, &t, "Ignore lines matching", |ui| {
+                ui::field(ui, &t, fields, "Ignore lines matching", |ui| {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.settings.ignore_matching)
                             .desired_width(ui::control_width(ui))
@@ -3290,6 +3524,19 @@ impl App {
 
                 ui.add_space(16.0);
                 ui::section(ui, &t, "delta");
+                // Here rather than under "differences": this is a delta flag and
+                // it colours part of a changed line, where everything in that
+                // section decides which lines are changed at all. Which is also
+                // why it needs no merge-mode exception -- it cannot make
+                // `merge::verify` false.
+                ui::field(ui, &t, fields, "Highlight", |ui| {
+                    dirty |= ui::choice(
+                        ui,
+                        &t,
+                        &mut self.opts.granularity,
+                        &crate::settings::GRANULARITIES,
+                    );
+                });
                 dirty |= ui
                     .checkbox(&mut self.opts.hunk_headers, "Hunk headers")
                     .on_hover_text(
@@ -3438,6 +3685,19 @@ impl App {
     }
 
     fn font_combo(&mut self, ui: &mut egui::Ui, mono: bool, ready: bool) {
+        /// What `None` actually selects, said the same way in both pickers.
+        ///
+        /// It used to read "Default" in the interface picker, which was the one
+        /// label it could not be: `Settings::default` sets `ui_font` to
+        /// [`fonts::default_ui_face`] -- the system font -- while `None` means
+        /// egui's bundled families with `Hack` pushed to the *front* of the
+        /// proportional chain (`fonts::definitions`). Picking "Default" therefore
+        /// put every label, heading and button in the app into a monospace face,
+        /// which is the opposite of the default and reads as an unfinished app.
+        /// The real default is reachable by name: `fonts::scan` lists the same
+        /// face as "System Font", and it compares equal, so it shows as selected.
+        const BUNDLED: &str = "Hack (bundled)";
+
         let current = if mono {
             self.settings.mono_font.clone()
         } else {
@@ -3446,26 +3706,14 @@ impl App {
         let label = current
             .as_ref()
             .map(|f| f.family.clone())
-            .unwrap_or_else(|| {
-                if mono {
-                    "Hack (bundled)".into()
-                } else {
-                    "Default".into()
-                }
-            });
+            .unwrap_or_else(|| BUNDLED.into());
         let salt = if mono { "font-mono" } else { "font-ui" };
         egui::ComboBox::from_id_salt(salt)
             .selected_text(label)
             .width(ui::control_width(ui))
             .show_ui(ui, |ui| {
                 let mut pick: Option<Option<(Face, Option<Face>)>> = None;
-                if ui
-                    .selectable_label(
-                        current.is_none(),
-                        if mono { "Hack (bundled)" } else { "Default" },
-                    )
-                    .clicked()
-                {
+                if ui.selectable_label(current.is_none(), BUNDLED).clicked() {
                     pick = Some(None);
                 }
                 if !ready {
@@ -3807,24 +4055,6 @@ fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
-fn find_line_offsets(text: &str, query: &str) -> Vec<usize> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut matches = Vec::new();
-    let mut last_byte = 0;
-    let mut line = 0;
-    for (byte, _) in text.match_indices(query) {
-        line += text.as_bytes()[last_byte..byte]
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count();
-        matches.push(line);
-        last_byte = byte;
-    }
-    matches
-}
-
 fn moved_cursor(current: usize, len: usize, direction: isize) -> usize {
     debug_assert!(len > 0);
     let current = current.min(len - 1);
@@ -3839,16 +4069,48 @@ fn should_auto_render(resize_settled: bool, edit_settled: bool, pair_bytes: usiz
     resize_settled && edit_settled && pair_bytes <= AUTO_RENDER_BYTES
 }
 
+/// How far a panel editor's first text row sits below the top of its viewport:
+/// the top half of the `TextEdit` frame's `Margin::symmetric(8, 6)`.
+///
+/// The *top* margin only, deliberately. Row `k` spans
+/// `pad + k * row ..= pad + (k + 1) * row`, so a viewport of `pad + n * row`
+/// ends exactly where row `n` does. Counting both margins instead leaves the
+/// bottom six pixels showing the top six pixels of the row after it, which is
+/// the same sliced-glyph artefact one row further down.
+const EDITOR_PAD: f32 = 6.0;
+
+/// The tallest a text viewport can be here without ending in half a line.
+///
+/// A scroll viewport whose height is not `pad + n * row_height` clips its last
+/// row through the middle of the glyphs, and a horizontally sliced `}` at the
+/// bottom edge of a card reads as a rendering fault rather than as more content
+/// below -- which is a bad thing for a diff tool to look like. The leftover
+/// becomes padding inside the card, where it is invisible.
+fn whole_rows(ui: &egui::Ui, pad: f32) -> f32 {
+    let row = ui.text_style_height(&TextStyle::Monospace);
+    let rows = ((ui.available_height() - pad) / row).floor().max(1.0);
+    pad + rows * row
+}
+
 fn panel_card_width(available: f32, count: usize) -> f32 {
     let count = count.max(1) as f32;
     ((available - 8.0 * (count - 1.0)) / count).max(280.0)
 }
 
-fn source_panel_sizes(window_height: f32) -> (f32, f32) {
-    if window_height < 640.0 {
+/// How tall the input row starts out, given the height left under the toolbar.
+///
+/// A share rather than a constant. At a flat 260 a taller window gave every one
+/// of those pixels to the diff: at 1130 the panels still showed seven lines of a
+/// thirteen-line file while 230 of empty card sat under the diff. The split is
+/// draggable and eframe remembers it, so this only decides where it starts --
+/// but where it starts is what most people ever see.
+fn source_panel_sizes(available: f32) -> (f32, f32) {
+    if available < 640.0 {
         (130.0, 96.0)
     } else {
-        (260.0, 160.0)
+        // Capped, because past a point the panels are just a text editor with a
+        // diff underneath, and the diff is the thing being read.
+        ((available * 0.3).clamp(260.0, 420.0), 160.0)
     }
 }
 
@@ -3860,10 +4122,30 @@ fn effective_result_placement(width: f32, preferred: ResultPlacement) -> ResultP
     }
 }
 
-fn result_panel_sizes(window_height: f32, placement: ResultPlacement) -> (f32, f32) {
+/// How big the result band starts out, given what is left under the pair strip.
+///
+/// The bottom placement is a share for the same reason the input row is, and it
+/// needs one more: this is the buffer being *authored*. At a flat 240 -- minus
+/// margins and its own header -- that was four or five visible lines while the
+/// diff above it kept four hundred pixels, which is not an editor either, just a
+/// less cramped one than a column in the panel row would have been.
+fn result_panel_sizes(available: f32, placement: ResultPlacement) -> (f32, f32) {
     match placement {
-        ResultPlacement::Bottom if window_height < 640.0 => (128.0, 88.0),
-        ResultPlacement::Bottom => (240.0, 150.0),
+        ResultPlacement::Bottom => {
+            // 45% of what is left, and note what "left" means: this is called
+            // after the toolbar, the input row and the pair strip have taken
+            // theirs, so on a default 860 window it is handed 504, not 860.
+            // A `< 640` compact branch here -- written as though the argument
+            // were the window height -- therefore matched *always*, which is
+            // why the band was stuck at the compact 128 and showed four lines
+            // of the buffer being authored on any screen.
+            let default = (available * 0.45).clamp(128.0, 520.0);
+            // Never a floor above the default, or a short window is given a
+            // band there is no room for.
+            (default, default.min(150.0))
+        }
+        // A side already shows the whole result at once, and every pixel here
+        // is one delta does not get to lay the diff out in.
         ResultPlacement::Left | ResultPlacement::Right => (440.0, 260.0),
     }
 }
@@ -3876,6 +4158,7 @@ impl eframe::App for App {
             wrap: self.opts.wrap,
             hunk_headers: self.opts.hunk_headers,
             whitespace: self.opts.whitespace,
+            granularity: self.opts.granularity,
             ignore_blank_lines: self.opts.ignore_blank_lines,
             ignore_cr_at_eol: self.opts.ignore_cr_at_eol,
             syntax_theme: self.opts.syntax_theme.clone(),
@@ -3895,6 +4178,9 @@ impl eframe::App for App {
         self.poll_watches();
         self.poll_hotkey(ctx);
         self.publish_resolution();
+        if !self.quit_menu_guarded {
+            self.quit_menu_guarded = crate::menu::guard_quit();
+        }
 
         // delta lays out against a column count, so the GUI's pixel width has to
         // be translated back into columns and the diff re-rendered on resize.
@@ -3915,25 +4201,36 @@ impl eframe::App for App {
             .show(ui, |ui| self.toolbar(ui, ctx));
 
         if self.show_settings && ui.available_width() < 760.0 {
-            let mut open = true;
+            // No title bar: `settings_drawer` draws its own heading and its own
+            // close button, and egui's would stack a second "Settings" and a
+            // second ✕ on top of them -- in default window chrome that matches
+            // nothing else here, with a collapse triangle that folds the drawer
+            // into a stub for no reason anyone asked for.
             egui::Window::new("Settings")
                 .id(egui::Id::new("settings-overlay"))
-                .open(&mut open)
+                .title_bar(false)
                 .resizable(true)
-                .default_width(340.0)
+                .default_width(SETTINGS_DRAWER_WIDTH)
                 .min_width(240.0)
                 .max_width((ui.available_width() - 32.0).max(240.0))
+                // Where the docked drawer would be, rather than over the panels
+                // in the top-left corner. Only a default: the window remembers a
+                // dragged position against its id.
+                .default_pos(
+                    ui.max_rect().right_top() + Vec2::new(-SETTINGS_DRAWER_WIDTH - 16.0, 12.0),
+                )
                 .frame(
                     Frame::window(&ctx.style_of(ctx.theme()))
                         .inner_margin(Margin::symmetric(16, 14)),
                 )
                 .show(ctx, |ui| self.settings_drawer(ui));
-            self.show_settings &= open;
         } else if self.show_settings {
+            // The cap leaves the diff at least 360: at the 760 the branch above
+            // switches over at, that is exactly one default-width drawer.
             let max_width = (ui.available_width() - 360.0).clamp(240.0, 420.0);
             egui::Panel::right("settings")
                 .resizable(true)
-                .default_size(340.0_f32.min(max_width))
+                .default_size(SETTINGS_DRAWER_WIDTH.min(max_width))
                 .min_size(240.0)
                 .max_size(max_width)
                 .frame(
@@ -4117,42 +4414,111 @@ mod tests {
                 app.settings_drawer(ui);
                 drawer_rect = ui.min_rect();
             });
-            let offenders = output
+            // Unwrapped, not iterated: `as_ref().into_iter()` over a `None`
+            // update is an empty scan, and an empty scan finds no offenders.
+            // Every assertion below would then pass without having looked at
+            // anything.
+            let update = output
                 .platform_output
                 .accesskit_update
                 .as_ref()
-                .into_iter()
-                .flat_map(|update| &update.nodes)
-                .filter_map(|(_, node)| {
-                    let bounds = node.bounds()?;
-                    (bounds.x1 > f64::from(left + 208.0))
-                        .then(|| node.label().or(node.value()).unwrap_or("").to_owned())
-                })
-                .collect::<Vec<_>>();
-            let clipped_left = output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .into_iter()
-                .flat_map(|update| &update.nodes)
-                .filter_map(|(_, node)| {
-                    let bounds = node.bounds()?;
-                    (bounds.x0 < f64::from(left))
-                        .then(|| node.label().or(node.value()).unwrap_or("").to_owned())
-                })
-                .collect::<Vec<_>>();
+                .expect("AccessKit tree update");
+            let past = |edge: &dyn Fn(&egui::accesskit::Rect) -> bool| {
+                update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, node)| {
+                        let bounds = node.bounds()?;
+                        edge(&bounds)
+                            .then(|| node.label().or(node.value()).unwrap_or("").to_owned())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let right_edge = f64::from(left + 208.0);
+            let left_edge = f64::from(left);
+            let offenders = past(&|b| b.x1 > right_edge);
+            let clipped_left = past(&|b| b.x0 < left_edge);
             output.textures_delta.clear();
             assert!(drawer_rect.left() >= left);
             assert!(
                 clipped_left.is_empty(),
                 "{ui_pt} pt settings content was clipped on the left: {clipped_left:?}",
             );
+            // At the default type scale, nothing overflows -- and this is the
+            // assertion with teeth. `drawer_rect` has none: the drawer's scroll
+            // area does not auto-shrink, so its `min_rect` is the width it was
+            // given whatever it holds, which is why the widgets themselves have
+            // to be asked where they ended up.
+            //
+            // At the largest UI font the drawer does not promise this, and
+            // asserting it would be asserting against the design: a native
+            // combo box or a checkbox with a long label has no narrower form to
+            // take, which is why `settings_drawer` enables the horizontal axis
+            // and calls it a last resort. Note egui widens a `Ui` to fit an
+            // over-wide child (`Region::expand_to_include_rect`), so the first
+            // control that overflows takes the wrapped prose after it along.
+            if ui_pt == 13.0 {
+                assert!(
+                    offenders.is_empty(),
+                    "{ui_pt} pt settings content overflowed {}: {offenders:?}",
+                    left + 208.0,
+                );
+            }
             assert!(
                 drawer_rect.right() <= left + 208.0,
-                "{ui_pt} pt settings rect {drawer_rect:?} exceeded {}; offenders: {offenders:?}",
+                "{ui_pt} pt settings rect {drawer_rect:?} exceeded {}",
                 left + 208.0,
             );
         }
+    }
+
+    /// The drawer's own default width has to be one the fields fit in side by
+    /// side, or the measurement that decides it is doing nothing: a drawer that
+    /// stacks at its default width stacks always, until the user drags it.
+    #[test]
+    fn the_settings_drawer_aligns_its_fields_at_its_default_width() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            // What `settings_drawer` is handed inside the panel: the default
+            // width less the frame's symmetric margin.
+            ui.set_max_width(SETTINGS_DRAWER_WIDTH - 32.0);
+            app.settings_drawer(ui);
+        });
+        // Cleared before anything that can fail: dropping an unapplied
+        // `TexturesDelta` panics in a destructor, which aborts the process and
+        // hides whatever the real failure was.
+        output.textures_delta.clear();
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("AccessKit tree update");
+        // A plain label's text is its node's *value*; a button's is its name.
+        let first = |text: &str| {
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.value() == Some(text) || node.label() == Some(text))
+                .filter_map(|(_, node)| node.bounds())
+                .min_by(|a, b| a.y0.total_cmp(&b.y0))
+                .unwrap_or_else(|| panic!("no node saying {text:?}"))
+        };
+        // The first "Theme" is the appearance one; its control is the theme
+        // choice, whose first button is `ThemeChoice::System`.
+        let label = first("Theme");
+        let control = first(ThemeChoice::ALL[0].label());
+        assert!(
+            label.y0 < control.y1 && control.y0 < label.y1,
+            "the label spans {}..{} and its control {}..{}: stacked, not aligned",
+            label.y0,
+            label.y1,
+            control.y0,
+            control.y1,
+        );
     }
 
     fn test_mergetool_app(files: &[PathBuf], merged: PathBuf) -> (App, Arc<AtomicBool>) {
@@ -4205,7 +4571,10 @@ mod tests {
         let result = app.result_panel().expect("a result to merge into");
         assert_eq!(app.reference, result);
         assert!(app.merging());
-        assert!(app.panels[result].text.is_empty(), "seeded from an empty base");
+        assert!(
+            app.panels[result].text.is_empty(),
+            "seeded from an empty base"
+        );
         // Nothing has been written, so git is told nothing was resolved.
         assert!(!resolved.load(Ordering::Relaxed));
 
@@ -4225,8 +4594,7 @@ mod tests {
         std::fs::write(&remote, "theirs\n").unwrap();
         let merged = dir.join("conflicted.txt");
 
-        let (mut app, resolved) =
-            test_mergetool_app(&[base, local, remote], merged.clone());
+        let (mut app, resolved) = test_mergetool_app(&[base, local, remote], merged.clone());
         let result = app.result_panel().expect("a result to merge into");
         app.panels[result].text = "resolved\n".into();
         app.panels[result].dirty = true;
@@ -4258,8 +4626,7 @@ mod tests {
         std::fs::write(&local, "two\n").unwrap();
         let merged = dir.join("conflicted.txt");
 
-        let (mut app, resolved) =
-            test_mergetool_app(&[base, local.clone(), local], merged.clone());
+        let (mut app, resolved) = test_mergetool_app(&[base, local.clone(), local], merged.clone());
         let result = app.result_panel().expect("a result to merge into");
 
         app.publish_resolution();
@@ -4379,15 +4746,6 @@ mod tests {
         panel.resniff();
         assert_eq!(panel.line_count, 3);
         assert_eq!(panel.detail().as_deref(), Some("3 lines"));
-    }
-
-    #[test]
-    fn find_reports_the_rendered_line_of_each_match() {
-        assert_eq!(
-            find_line_offsets("zero\nneedle\ntwo needle\n", "needle"),
-            vec![1, 2]
-        );
-        assert!(find_line_offsets("needle", "").is_empty());
     }
 
     #[test]
@@ -4568,6 +4926,53 @@ mod tests {
                 "the mark delta was asked for is still on screen (headers={hunk_headers})",
             );
         }
+    }
+
+    /// Which side a panel is on is the whole meaning of red and green, so
+    /// swapping has to be exact: the same two panels, the other way round.
+    #[test]
+    fn swapping_sides_exchanges_the_two_panels_and_nothing_else() {
+        let mut app = test_app();
+        app.add_panel();
+        app.reference = 0;
+        app.shown = 2;
+        app.swap_sides();
+        assert_eq!((app.reference, app.shown), (2, 0));
+
+        // The difference from `MakeReference`, which promotes the shown panel
+        // and lets `normalize` pick whatever is left: the *first* other panel,
+        // which past two panels is not the one that was the baseline.
+        app.reference = 1;
+        app.shown = 2;
+        app.swap_sides();
+        assert_eq!((app.reference, app.shown), (2, 1));
+        app.reference = 1;
+        app.shown = 2;
+        let shown = app.shown;
+        app.set_reference(shown);
+        assert_eq!((app.reference, app.shown), (2, 0));
+
+        // And back again, which is what makes it a toggle rather than a walk.
+        app.reference = 0;
+        app.shown = 1;
+        app.swap_sides();
+        app.swap_sides();
+        assert_eq!((app.reference, app.shown), (0, 1));
+    }
+
+    /// The baseline is the result being built and its candidates are what it is
+    /// built from; there is no other way round for that to be. The button is
+    /// drawn only in the same branch, so this is the keyboard's guard.
+    #[test]
+    fn swapping_sides_is_refused_while_a_result_is_being_built() {
+        let mut app = test_app();
+        app.panels[0].result = true;
+        app.reference = 0;
+        app.shown = 1;
+        app.building_result = true;
+        assert!(app.merging());
+        app.swap_sides();
+        assert_eq!((app.reference, app.shown), (0, 1));
     }
 
     /// Ignoring differences is a way of *reading* a diff, and building a result
@@ -5062,6 +5467,43 @@ mod tests {
         );
     }
 
+    /// A text viewport must end where a row ends.
+    ///
+    /// The arithmetic is one line and it has been wrong twice: `pad` is the
+    /// `TextEdit` frame's *top* margin only, because that is what offsets row
+    /// zero. Counting both margins leaves the bottom of the viewport showing
+    /// the top few pixels of the row after the last one -- the same sliced
+    /// glyphs, one row further down.
+    #[test]
+    fn an_editor_viewport_ends_on_a_row_boundary() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let row = ui.text_style_height(&TextStyle::Monospace);
+            for slack in [0.0, 1.0, 7.0, row - 0.1] {
+                ui.scope(|ui| {
+                    ui.set_max_height(EDITOR_PAD + 11.0 * row + slack);
+                    let height = whole_rows(ui, EDITOR_PAD);
+                    let rows = (height - EDITOR_PAD) / row;
+                    assert!(
+                        (rows - rows.round()).abs() < 0.001,
+                        "{height} is {rows} rows, not a whole number",
+                    );
+                    assert!(height <= ui.available_height() + 0.001);
+                    assert!(height > ui.available_height() - row);
+                });
+            }
+            // Never zero rows, however little is left: an empty viewport shows
+            // nothing at all, which is worse than a cramped one.
+            ui.scope(|ui| {
+                ui.set_max_height(4.0);
+                assert!(whole_rows(ui, EDITOR_PAD) > EDITOR_PAD);
+            });
+        });
+        out.textures_delta.clear();
+    }
+
     #[test]
     fn panel_width_policy_scrolls_instead_of_crushing_dense_rows() {
         assert_eq!(panel_card_width(600.0, 2), 296.0);
@@ -5070,9 +5512,129 @@ mod tests {
     }
 
     #[test]
+    fn a_long_panel_name_leaves_every_header_item_inside_the_card() {
+        let mut app = test_app();
+        let long_name = format!("{}-implementation.rs", "very-long-component-name".repeat(8));
+        let path = PathBuf::from("/tmp").join(&long_name);
+        let panel = &mut app.panels[0];
+        panel.path = Some(path);
+        panel.text = "fn main() {}\n".into();
+        panel.edited = true;
+        panel.language = Some("rs".into());
+        panel.resniff();
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
+        ctx.enable_accesskit();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(600.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.panel_row(ui, &ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+        let card = app.panel_rects[0];
+        assert!(card.is_positive(), "the first panel card was not laid out");
+
+        let bounds = |text: &str| {
+            update
+                .nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.role() != egui::accesskit::Role::TextRun
+                        && (node.label() == Some(text) || node.value() == Some(text)))
+                    .then(|| node.bounds())
+                    .flatten()
+                })
+                .unwrap_or_else(|| {
+                    let available = update
+                        .nodes
+                        .iter()
+                        .filter_map(|(_, node)| node.label().or(node.value()))
+                        .collect::<Vec<_>>();
+                    panic!("no bounded header node saying {text:?}; available: {available:?}")
+                })
+        };
+        let metadata = [
+            "BASELINE",
+            "EDITED",
+            "1 line",
+            "Panel A language: rs",
+            "Panel A options",
+        ];
+        for text in metadata {
+            let item = bounds(text);
+            assert!(
+                item.x0 + 0.5 >= f64::from(card.left()) && item.x1 <= f64::from(card.right()) + 0.5,
+                "{text:?} at {}..{} escaped card {}..{}",
+                item.x0,
+                item.x1,
+                card.left(),
+                card.right(),
+            );
+        }
+        let name = bounds(&long_name);
+        let baseline = bounds("BASELINE");
+        assert!(
+            name.x0 + 0.5 >= f64::from(card.left()) && name.x1 <= baseline.x0 + 0.5,
+            "name {}..{} did not truncate before baseline {}..{}",
+            name.x0,
+            name.x1,
+            baseline.x0,
+            baseline.x1,
+        );
+    }
+
+    #[test]
+    fn combine_stays_reachable_for_an_empty_pair() {
+        let mut app = test_app();
+        app.add_panel();
+        app.panels[2].text = "seed from panel C\n".into();
+        app.panels[2].resniff();
+        assert!(app.panels[app.reference].text.is_empty());
+        assert!(app.panels[app.shown].text.is_empty());
+        assert_eq!(app.result_seed_indices().collect::<Vec<_>>(), vec![2]);
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(Default::default(), |ui| app.pair_strip(ui, &ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+        let combine = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Combine…"))
+            .expect("the Combine menu button");
+        assert!(
+            !combine.1.is_disabled(),
+            "Start empty and panel C were hidden behind a disabled menu"
+        );
+
+        app.start_result(None);
+        let result = app.result_panel().expect("Start empty created a result");
+        assert!(app.panels[result].text.is_empty());
+        app.start_result(Some(2));
+        assert_eq!(app.panels[result].text, "seed from panel C\n");
+    }
+
+    #[test]
     fn compact_windows_keep_source_and_result_editors_visible() {
         assert_eq!(source_panel_sizes(600.0), (130.0, 96.0));
-        assert_eq!(source_panel_sizes(900.0), (260.0, 160.0));
+        assert_eq!(source_panel_sizes(900.0), (270.0, 160.0));
         assert_eq!(
             effective_result_placement(700.0, ResultPlacement::Right),
             ResultPlacement::Bottom
@@ -5081,9 +5643,45 @@ mod tests {
             effective_result_placement(1_200.0, ResultPlacement::Right),
             ResultPlacement::Right
         );
+        // Both of these are given the space *left* at their call site, not the
+        // window height -- 504 under the pair strip on a default 860 window.
         assert_eq!(
-            result_panel_sizes(600.0, ResultPlacement::Bottom),
-            (128.0, 88.0)
+            result_panel_sizes(280.0, ResultPlacement::Bottom),
+            (128.0, 128.0)
+        );
+        let (default, min) = result_panel_sizes(504.0, ResultPlacement::Bottom);
+        assert!((default - 226.8).abs() < 0.01, "{default}");
+        assert_eq!(min, 150.0);
+    }
+
+    /// The regression the shares replaced: both defaults used to be constants,
+    /// so every pixel a taller window added went to the diff. At 1130 that left
+    /// the panels showing seven lines of a thirteen-line file above 230 of empty
+    /// card, and the result band -- the buffer actually being authored -- at
+    /// four or five visible lines whatever the screen.
+    #[test]
+    fn a_taller_window_gives_the_editors_more_room() {
+        let panels = |h: f32| source_panel_sizes(h).0;
+        let result = |h: f32| result_panel_sizes(h, ResultPlacement::Bottom).0;
+        assert!(panels(1_300.0) > panels(900.0));
+        assert!(result(1_300.0) > result(900.0));
+        // Bounded at both ends: never below what the old constants gave, and
+        // never so far that the diff becomes the smaller half of the window.
+        assert_eq!(panels(700.0), 260.0);
+        assert_eq!(panels(5_000.0), 420.0);
+        assert_eq!(result(700.0), 315.0);
+        assert_eq!(result(5_000.0), 520.0);
+        // The floor is the old compact size, and the minimum never exceeds the
+        // default: a band that cannot be shrunk to fit is how a short window
+        // loses the diff entirely.
+        let (default, min) = result_panel_sizes(200.0, ResultPlacement::Bottom);
+        assert_eq!((default, min), (128.0, 128.0));
+        // A side placement is not a share: it already shows the whole result,
+        // and its width comes straight out of the column count delta lays the
+        // diff out against.
+        assert_eq!(
+            result_panel_sizes(5_000.0, ResultPlacement::Right),
+            (440.0, 260.0)
         );
     }
 

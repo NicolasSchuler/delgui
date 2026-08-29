@@ -5,7 +5,7 @@
 //! delta upgrades changing something underneath us.
 
 use delgui_core::ansi::{self, Color};
-use delgui_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
+use delgui_core::delta::{Appearance, Delta, DeltaError, Granularity, Input, Options, Whitespace};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -252,6 +252,56 @@ fn lines_matching_a_pattern_are_not_differences() {
     assert!(
         !d.diff(&left, &right, &opts).expect("diff").is_empty(),
         "a change that is not all pattern is still a difference",
+    );
+}
+
+/// The text delta picked out *inside* each changed line: the spans whose
+/// background is not the one the rest of that line carries, which is the same
+/// `ESC[K` colour the erase fill uses.
+fn emphasized(rendered: &[u8]) -> Vec<String> {
+    let lines = ansi::parse(rendered);
+    ansi::body(&lines)
+        .iter()
+        .filter_map(|line| {
+            // Only a removed or added line has one; context lines are unpainted.
+            let base = line.fill_to_eol?;
+            let text: String = line
+                .spans
+                .iter()
+                .filter(|span| span.style.bg.is_some_and(|bg| bg != base))
+                .map(|span| span.text.as_str())
+                .collect();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect()
+}
+
+/// What the granularity control actually does, measured rather than assumed.
+///
+/// The two flags behind it are delta's, and neither is validated against
+/// anything: a renamed or dropped option would leave the control silently doing
+/// nothing, which is precisely the failure this file exists to catch.
+#[test]
+fn granularity_narrows_what_is_emphasized() {
+    let d = delta();
+    let left = Input::Buffer("fn main() {\n    let greeting = \"hi\";\n}\n".into());
+    let right = Input::Buffer("fn main() {\n    let greeting = \"hello\";\n}\n".into());
+    let render = |granularity| {
+        let opts = Options {
+            inherit_gitconfig: false,
+            default_language: Some("rs".into()),
+            granularity,
+            ..Options::default()
+        };
+        emphasized(&d.render(&left, &right, &opts).expect("render"))
+    };
+
+    // `hi` becoming `hello` shares an `h`, and only the finest setting says so.
+    assert_eq!(render(Granularity::Character), ["i", "ello"]);
+    assert_eq!(render(Granularity::Word), ["hi", "hello"]);
+    assert!(
+        render(Granularity::Line).is_empty(),
+        "whole-line colouring picks nothing out inside the line",
     );
 }
 

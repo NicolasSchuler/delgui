@@ -5,7 +5,7 @@
 //! `~/Library/Application Support` on a 30-second autosave timer would quietly
 //! undo the whole point. Only preferences are stored.
 
-use delgui_core::delta::Whitespace;
+use delgui_core::delta::{Granularity, Whitespace};
 use serde::{Deserialize, Serialize};
 
 use crate::fonts::Face;
@@ -21,6 +21,22 @@ enum WhitespaceDef {
     Amount,
     All,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Granularity")]
+enum GranularityDef {
+    Character,
+    Word,
+    Line,
+}
+
+/// The labels the drawer offers, in the order it offers them: finest first, so
+/// the row reads as a scale.
+pub const GRANULARITIES: [(Granularity, &str); 3] = [
+    (Granularity::Character, "Characters"),
+    (Granularity::Word, "Words"),
+    (Granularity::Line, "Whole lines"),
+];
 
 /// How much unchanged text each difference is shown with.
 ///
@@ -123,7 +139,7 @@ impl ResultPlacement {
 /// back to the control that fixes it.
 pub const UI_PT: std::ops::RangeInclusive<f32> = 10.0..=20.0;
 pub const MONO_PT: std::ops::RangeInclusive<f32> = 9.0..=24.0;
-const DEFAULT_UI_PT: f32 = 13.0;
+pub const DEFAULT_UI_PT: f32 = 13.0;
 const DEFAULT_MONO_PT: f32 = 12.5;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -147,6 +163,9 @@ pub struct Settings {
     pub context: Context,
     #[serde(with = "WhitespaceDef")]
     pub whitespace: Whitespace,
+    /// How much of a changed line is picked out inside it.
+    #[serde(with = "GranularityDef")]
+    pub granularity: Granularity,
     pub ignore_blank_lines: bool,
     pub ignore_cr_at_eol: bool,
     /// Empty rather than absent when unset: a text field the user cleared and a
@@ -185,6 +204,11 @@ impl Default for Settings {
             hunk_headers: false,
             context: Context::default(),
             whitespace: Whitespace::Exact,
+            // The finest delta can draw. A one-character difference -- a `<`
+            // that became a `<=`, an `i` in an identifier -- is the one a reader
+            // is most likely to miss, and word granularity hides it inside a
+            // marked word that looks the same as its neighbour.
+            granularity: Granularity::Character,
             ignore_blank_lines: false,
             ignore_cr_at_eol: false,
             ignore_matching: String::new(),

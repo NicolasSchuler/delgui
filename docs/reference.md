@@ -146,9 +146,20 @@ All four are forced off while a result is being built. A take copies a differenc
 
 | option | values | default | maps to |
 | --- | --- | --- | --- |
+| Highlight | Characters · Words · Whole lines | Characters | `--word-diff-regex=.` · `--word-diff-regex=\w+` · `--max-line-distance=0` |
 | Hunk headers | on · off | off | off is `--hunk-header-style=omit` |
 | Use my `[delta]` gitconfig | on · off | on | off is `--no-gitconfig`, plus environment scrubbing |
 | Feature presets | one checkbox per `[delta "name"]` section, plus anything named in `delta.features` | seeded from your gitconfig on first run | `--features="a b c"`, emitted even when empty so that unticking everything genuinely disables them |
+
+Highlight granularity in full:
+
+| choice | meaning |
+| --- | --- |
+| Characters | `--word-diff-regex=.`. One character is one token, so only the characters that actually differ are picked out. The default: a one-character change is the one a reader is most likely to miss. |
+| Words | `--word-diff-regex=\w+`, delta's own default. A changed word is marked whole. |
+| Whole lines | `--max-line-distance=0`. No within-line diff at all; removed and added lines are coloured as wholes, the way `diff` has always looked. |
+
+It is a delta flag and it colours part of a changed line, rather than deciding which lines are changed — which is why it is here and not under *differences*, and why it is left exactly as set while a result is being built. The two flags behind it are independent in delta: `--max-line-distance` decides whether a removed/added pair is refined at all, `--word-diff-regex` what a token is. Each choice states only the one that defines it, so a `max-line-distance` set in your own gitconfig keeps working.
 
 Turning off gitconfig inheritance is the only way to get output that does not depend on your gitconfig or working directory: delta ignores `GIT_CONFIG_GLOBAL`. Flipping any of the three view toggles in the toolbar also turns it off, and says so — the toolbar cannot honestly claim to control a view that config is overriding.
 
@@ -191,7 +202,7 @@ Language detection is deliberately biased towards answering "don't know": prose 
 With everything at its default, the pipeline is:
 
 ```
-git --no-pager diff --no-index --no-color --no-ext-diff --no-textconv --unified=3 A B | delta --paging=never --width=120 --file-style=omit --line-numbers --features=
+git --no-pager diff --no-index --no-color --no-ext-diff --no-textconv --unified=3 A B | delta --paging=never --width=120 --file-style=omit --line-numbers --word-diff-regex=. --features=
 ```
 
 | argument | why |
@@ -240,6 +251,7 @@ Saved:
 - `hunk_headers`
 - `context`
 - `whitespace`
+- `granularity`
 - `ignore_blank_lines`
 - `ignore_cr_at_eol`
 - `ignore_matching`
@@ -265,6 +277,7 @@ Chords are written the way each platform writes them.
 | --- | --- | --- | --- |
 | `⌘O` | `Ctrl+O` | open a file in the shown panel | File picker for the panel whose diff is on screen. |
 | `⌘W` | `Ctrl+W` | close the window | Close the window. Unsaved panel or result text is confirmed first. |
+| `⌘Q` | `Ctrl+Q` | quit | Quit, confirming unsaved panel or result text first — the same guarded path as closing the window. On macOS the application menu's Quit item claims this chord; delgui repoints that item from `terminate:`, which tears the process down without asking any window to close, at the window itself, so that both routes reach the confirmation. |
 
 ### compare
 
@@ -277,6 +290,7 @@ Chords are written the way each platform writes them.
 | `⌘⌥↓` | `Ctrl+Alt+Down` | jump to the next difference | Scroll to the next difference. Works in every comparison, not only while building a result. |
 | `⌘⌥↑` | `Ctrl+Alt+Up` | jump to the previous difference | Scroll to the previous difference. |
 | `⌘R` | `Ctrl+R` | make the shown panel the baseline | Make the panel on screen the baseline every other panel is diffed against. |
+| `⌘⇧R` | `Ctrl+Shift+R` | swap the two sides | Compare the same two panels the other way round: the baseline and the panel on screen exchange places, so what was removed is now added. Not available while a result is being built, where the baseline is the result itself. |
 
 ### panels
 

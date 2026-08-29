@@ -8,6 +8,7 @@ mod docs;
 mod fonts;
 mod hotkey;
 mod keys;
+mod menu;
 mod render;
 mod settings;
 mod theme;
