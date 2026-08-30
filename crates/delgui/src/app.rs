@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use delgui_core::ansi::{self, Line};
 use delgui_core::config::{self, DeltaConfig};
@@ -56,6 +56,15 @@ pub(crate) const MAX_PANELS: usize = 6;
 /// How long a "Copied" or "Saved to …" confirmation stays up.
 const FLASH: Duration = Duration::from_secs(4);
 
+/// In a short Combine window, the source and result panels are both useful but
+/// neither may consume the entire operation the screen exists for: inspecting
+/// and taking a difference. These are outer panel sizes, including margins.
+const MIN_DIFF_OUTER_HEIGHT: f32 = 128.0;
+// Frame margins, one maximum-scale control row, its gap, and one complete
+// monospace row. Below this the result's Save/Copy actions are reduced to a
+// clipped sliver at the supported 720×480 / 20 pt combination.
+const MIN_RESULT_OUTER_HEIGHT: f32 = 128.0;
+
 pub(crate) const UNDO_DEPTH: usize = 100;
 pub(crate) const UNDO_BYTES: usize = 64_000_000;
 
@@ -101,6 +110,11 @@ pub struct Panel {
     pub language: Option<String>,
     /// Re-read and re-diff when the bound file changes on disk.
     pub watch: bool,
+    /// A requested or watched reload could not be read. The previous buffer is
+    /// preserved, but it must not continue supporting a "fresh" or
+    /// "identical" claim until a reload succeeds or the user takes local
+    /// control by editing it.
+    disk_stale: bool,
     /// This panel is being assembled out of the others rather than compared with
     /// them. While it is, it is the baseline, so every diff on screen reads "my
     /// result against a candidate" and taking a difference writes here.
@@ -112,6 +126,17 @@ pub struct Panel {
     /// edits* and *Follow changes on disk* in its menu -- three one-click ways to
     /// throw the merge away, in the menu you open to copy it out.
     pub saved_to: Option<PathBuf>,
+    /// The exact text written by the last successful save in this process.
+    ///
+    /// A path alone cannot tell whether another editor replaced the file after
+    /// that save. Keeping the snapshot lets the next plain Save refuse to
+    /// overwrite newer work; Save As remains the explicit path for choosing and
+    /// confirming a replacement through the native file dialog.
+    saved_snapshot: Option<String>,
+    /// Cheap identity of the file created by the last canonical save. This is
+    /// checked on repaint so an external replacement withdraws the saved/Git
+    /// resolution state without re-reading a multi-megabyte result every frame.
+    saved_stamp: Option<SavedFileStamp>,
     /// The result holds work that is not on disk. Distinct from `edited`, which
     /// means "diverged from the file this panel was opened from" and is false for
     /// a result that has never been saved anywhere.
@@ -133,8 +158,11 @@ impl Panel {
             detected: None,
             language: None,
             watch: false,
+            disk_stale: false,
             result: false,
             saved_to: None,
+            saved_snapshot: None,
+            saved_stamp: None,
             dirty: false,
             revision: 0,
             line_count: 0,
@@ -233,6 +261,7 @@ impl Panel {
         self.text = text;
         self.path = Some(path);
         self.edited = false;
+        self.disk_stale = false;
         self.language = None;
         self.resniff();
         Ok(())
@@ -245,6 +274,7 @@ impl Panel {
         let text = read_panel_text(&path)?;
         self.text = text;
         self.edited = false;
+        self.disk_stale = false;
         self.resniff();
         Ok(())
     }
@@ -256,6 +286,37 @@ impl Panel {
         let result = self.result;
         *self = Self::empty();
         self.result = result;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SavedFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn saved_file_stamp(path: &Path) -> Option<SavedFileStamp> {
+    let metadata = path.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(SavedFileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(SavedFileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
     }
 }
 
@@ -323,6 +384,28 @@ fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
         }
     }
     false
+}
+
+/// A notify backend error can name the watched file, its sibling, or the
+/// directory that is actually registered. An error with no paths is global.
+fn watch_error_affects(path: &Path, affected: &[PathBuf]) -> bool {
+    if affected.is_empty() {
+        return true;
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    affected.iter().any(|affected| {
+        paths_refer_to_same_file(path, affected)
+            || paths_refer_to_same_file(parent, affected)
+            || affected
+                .parent()
+                .filter(|affected_parent| !affected_parent.as_os_str().is_empty())
+                .is_some_and(|affected_parent| {
+                    paths_refer_to_same_file(parent, affected_parent)
+                })
+    })
 }
 
 static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -453,6 +536,15 @@ struct BandActions {
     remove: bool,
 }
 
+struct ResultIdentityView {
+    name: Option<String>,
+    state: String,
+    state_is_success: bool,
+    destination: Option<String>,
+    detail: Option<String>,
+    flash: Option<String>,
+}
+
 #[derive(Clone)]
 struct ResultUndo {
     generation: u64,
@@ -469,8 +561,8 @@ enum DestructiveAction {
 }
 
 enum Job {
-    Done(usize, Cached),
-    Failed(RenderKey, String),
+    Done(usize, Cached, Duration),
+    Failed(RenderKey, String, Duration),
 }
 
 /// One render, and -- in merge mode -- the hunks that go with it.
@@ -615,11 +707,11 @@ pub struct App {
     /// content changes use `Panel::revision`, so an unrelated panel does not
     /// invalidate the pair on screen.
     revision: u64,
-    /// A render was asked for outright -- by ⌘⏎, or by taking a difference --
+    /// A render was asked for outright -- by ⌘Enter, or by taking a difference --
     /// rather than following from a keystroke. `tick` will not schedule one for a
     /// pair over `AUTO_RENDER_BYTES` and `schedule` drops it while another is in
     /// flight, so without this a take on a large pair would leave the diff stale
-    /// and every control on it dead until the user pressed ⌘⏎.
+    /// and every control on it dead until the user pressed ⌘Enter.
     requested: bool,
     /// Result identity survives leaving take mode. This flag only controls
     /// whether the result is currently the writable baseline with take controls.
@@ -659,6 +751,22 @@ pub struct App {
     closing: bool,
     destructive: Option<DestructiveAction>,
     focus_panel: Option<usize>,
+    /// One-shot requests that keep a keyboard-selected source card and
+    /// candidate tab visible inside their independent horizontal scroll areas.
+    reveal_panel: Option<usize>,
+    reveal_pair: Option<usize>,
+    /// Stable editor to restore after a destructive confirmation closes.
+    /// Popup items disappear before the modal is drawn, so the currently
+    /// focused id is not necessarily a valid restoration target.
+    destructive_restore_focus: Option<egui::Id>,
+    /// The active modal, the control that had focus before it opened, and the
+    /// modal's safe default control. egui traps focus to a modal layer, but it
+    /// does not choose or restore a meaningful control for us.
+    modal_focus: Option<(egui::Id, Option<egui::Id>, egui::Id)>,
+    /// Focus below a modal is still disabled for the pass in which that modal
+    /// disappears. Restore on the following pass, after the old modal layer has
+    /// been retired, rather than requesting an id egui cannot yet register.
+    pending_modal_focus_restore: Option<(egui::Id, u64)>,
     /// A short confirmation next to the result's own controls -- "Copied",
     /// "Saved to …". Not a banner: these answer a button that was just pressed,
     /// and a dismissible strip across the diff is too much furniture for that.
@@ -797,6 +905,12 @@ impl App {
             let _ = font_tx.send(fonts::scan());
         });
         let show_settings = settings.settings_open;
+        // The empty launch says the panels are ready to paste into, so make
+        // that true without requiring a preparatory click. A launch carrying
+        // files or text keeps focus neutral, and an open Settings drawer keeps
+        // focus with the controls the user left visible.
+        let focus_panel =
+            (!show_settings && panels.iter().all(Panel::is_empty)).then_some(0);
 
         let mut app = Self {
             delta,
@@ -864,7 +978,12 @@ impl App {
             quit_menu_guarded: false,
             closing: false,
             destructive: None,
-            focus_panel: None,
+            focus_panel,
+            reveal_panel: None,
+            reveal_pair: None,
+            destructive_restore_focus: None,
+            modal_focus: None,
+            pending_modal_focus_restore: None,
             flash: None,
             mergetool,
             tx,
@@ -1022,7 +1141,7 @@ impl App {
     /// Start a render if one is warranted and none is running.
     ///
     /// Single-flight on purpose: the previous shape spawned a thread per call
-    /// site with a single `bool` to guard it, so holding ⌘⏎ started twenty-five
+    /// site with a single `bool` to guard it, so holding ⌘Enter started twenty-five
     /// delta processes a second and whichever finished last won -- the visible
     /// diff could go backwards in time.
     fn schedule(&mut self, ctx: &egui::Context) {
@@ -1067,9 +1186,16 @@ impl App {
         );
         let (tx, ctx, columns) = (self.tx.clone(), ctx.clone(), self.columns);
         let job_key = key.clone();
+        eprintln!(
+            "delgui: rendering panel {} against {} ({} bytes, {columns} columns)",
+            title(shown),
+            title(reference),
+            self.pair_bytes(),
+        );
         self.in_flight = Some(key);
         self.requested = false;
         std::thread::spawn(move || {
+            let started = Instant::now();
             let job = match render_job(
                 &delta,
                 &left,
@@ -1079,8 +1205,8 @@ impl App {
                 columns,
                 merging,
             ) {
-                Ok(cached) => Job::Done(shown, cached),
-                Err(e) => Job::Failed(job_key, e.to_string()),
+                Ok(cached) => Job::Done(shown, cached, started.elapsed()),
+                Err(e) => Job::Failed(job_key, e.to_string(), started.elapsed()),
             };
             let _ = tx.send(job);
             ctx.request_repaint();
@@ -1096,12 +1222,17 @@ impl App {
         for i in [reference, shown] {
             if !self.panels[i].edited && self.panels[i].path.is_some() {
                 if let Err(e) = self.panels[i].reload() {
+                    self.panels[i].disk_stale = true;
                     self.error = Some(e);
                     return;
                 }
                 self.touch_panel(i);
             }
         }
+        // Automatic scheduling suppresses a key that has already failed so a
+        // transient delta error cannot spin. Compare is the explicit retry
+        // path, so it must be allowed to try that same key exactly once.
+        self.failed = None;
         self.compared = true;
         self.pending_edit = None;
         self.requested = true;
@@ -1111,7 +1242,7 @@ impl App {
     fn poll(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
             match job {
-                Job::Done(panel, cached) => {
+                Job::Done(panel, cached, elapsed) => {
                     if self.in_flight.as_ref() == Some(&cached.key) {
                         self.in_flight = None;
                     }
@@ -1124,13 +1255,23 @@ impl App {
                     if let Some(problem) = &cached.problem {
                         self.notice = Some(problem.clone());
                     }
+                    eprintln!(
+                        "delgui: render completed in {} ms ({} rows, {} differences)",
+                        elapsed.as_millis(),
+                        cached.lines.len(),
+                        cached.hunks.len(),
+                    );
                     self.cache.insert(panel, cached);
                 }
-                Job::Failed(key, e) => {
+                Job::Failed(key, e, elapsed) => {
                     if self.in_flight.as_ref() == Some(&key) {
                         self.in_flight = None;
                     }
                     self.failed = Some(key);
+                    eprintln!(
+                        "delgui: render failed after {} ms; the previous diff was kept",
+                        elapsed.as_millis(),
+                    );
                     self.error = Some(e);
                 }
             }
@@ -1143,6 +1284,10 @@ impl App {
 
     /// Whether what is on screen was rendered from what is in the panels now.
     fn is_fresh(&self) -> bool {
+        let (reference, shown) = self.pair();
+        if self.panels[reference].disk_stale || self.panels[shown].disk_stale {
+            return false;
+        }
         let key = self.current_key();
         self.cache.get(&self.shown).is_some_and(|c| c.key == key)
     }
@@ -1180,6 +1325,7 @@ impl App {
         self.panels.get(i).is_some_and(|panel| {
             if panel.result {
                 panel.dirty
+                    || (panel.saved_to.is_some() && !self.result_last_save_is_current(i))
             } else if panel.path.is_some() {
                 panel.edited
             } else {
@@ -1211,13 +1357,28 @@ impl App {
     }
 
     fn request_destructive(&mut self, action: DestructiveAction) {
-        let loses_work = self
-            .affected_panels(&action)
-            .into_iter()
-            .any(|i| self.panel_has_unsaved_content(i));
+        let affected = self.affected_panels(&action);
+        let loses_work = affected
+            .iter()
+            .any(|&i| self.panel_has_unsaved_content(i));
         if loses_work {
+            // A confirmation often originates in a popup. Its focused menu
+            // item vanishes when the popup closes, so restoring that id after
+            // Cancel would only let egui's dead-man switch clear focus on the
+            // next pass. Editors remain mounted and are a predictable fallback.
+            self.destructive_restore_focus = match action {
+                DestructiveAction::Remove(_) => Some(panel_edit_id(0)),
+                _ => affected.first().map(|&i| {
+                    if self.panels[i].result {
+                        result_edit_id(i)
+                    } else {
+                        panel_edit_id(i)
+                    }
+                }),
+            };
             self.destructive = Some(action);
         } else {
+            self.destructive_restore_focus = None;
             self.apply_destructive(action);
         }
     }
@@ -1245,11 +1406,112 @@ impl App {
         self.show_help || self.quit_guard || self.destructive.is_some()
     }
 
+    fn enter_modal_focus(
+        &mut self,
+        ctx: &egui::Context,
+        modal: egui::Id,
+        safe_control: egui::Id,
+        restore_focus: Option<egui::Id>,
+    ) {
+        if self.modal_focus.as_ref().is_some_and(|state| state.0 == modal) {
+            return;
+        }
+        let pending_previous = self
+            .pending_modal_focus_restore
+            .take()
+            .map(|(target, _)| target);
+        let previous = self
+            .modal_focus
+            .take()
+            .and_then(|(_, previous, _)| previous)
+            .or(restore_focus)
+            .or(pending_previous)
+            .or_else(|| ctx.memory(|memory| memory.focused()));
+        ctx.memory_mut(|memory| memory.request_focus(safe_control));
+        self.modal_focus = Some((modal, previous, safe_control));
+    }
+
+    fn leave_modal_focus(&mut self, ctx: &egui::Context, modal: egui::Id) {
+        let Some((active, previous, safe_control)) = self.modal_focus else {
+            return;
+        };
+        if active != modal {
+            return;
+        }
+        self.modal_focus = None;
+        ctx.memory_mut(|memory| memory.surrender_focus(safe_control));
+        self.pending_modal_focus_restore =
+            previous.map(|previous| (previous, ctx.cumulative_pass_nr()));
+    }
+
+    fn restore_pending_modal_focus(&mut self, ctx: &egui::Context) {
+        if self.modal_active() {
+            return;
+        }
+        if let Some((target, closed_at)) = self.pending_modal_focus_restore
+            && ctx.cumulative_pass_nr() > closed_at
+        {
+            self.pending_modal_focus_restore = None;
+            ctx.memory_mut(|memory| memory.request_focus(target));
+        }
+    }
+
+    fn mark_modal(
+        ctx: &egui::Context,
+        response: &egui::Response,
+        role: egui::accesskit::Role,
+        label: &'static str,
+    ) {
+        ctx.accesskit_node_builder(response.id, |node| {
+            node.set_role(role);
+            node.set_label(label);
+            node.set_modal();
+            node.set_bounds(egui::accesskit::Rect {
+                x0: f64::from(response.rect.left()),
+                y0: f64::from(response.rect.top()),
+                x1: f64::from(response.rect.right()),
+                y1: f64::from(response.rect.bottom()),
+            });
+        });
+    }
+
+    fn modal_dimensions(ctx: &egui::Context) -> (f32, f32) {
+        let content = ctx.content_rect().size();
+        (
+            (content.x - 64.0).clamp(280.0, 420.0),
+            // Leave room for the frame outside the inner Ui. Keeping this
+            // budget independent of the variable body is what keeps the safe
+            // footer on-screen at the supported 720×480 / 20 pt combination.
+            (content.y - 112.0).clamp(180.0, 620.0),
+        )
+    }
+
+    fn mark_scroll_view(
+        ctx: &egui::Context,
+        id: egui::Id,
+        label: &'static str,
+        bounds: Option<egui::Rect>,
+    ) {
+        ctx.accesskit_node_builder(id, |node| {
+            node.set_role(egui::accesskit::Role::ScrollView);
+            node.set_label(label);
+            if let Some(bounds) = bounds {
+                node.set_bounds(egui::accesskit::Rect {
+                    x0: f64::from(bounds.left()),
+                    y0: f64::from(bounds.top()),
+                    x1: f64::from(bounds.right()),
+                    y1: f64::from(bounds.bottom()),
+                });
+            }
+        });
+    }
+
     fn add_panel(&mut self) {
         if self.panels.len() < MAX_PANELS {
             self.panels.push(Panel::empty());
             self.focused = self.panels.len() - 1;
             self.focus_panel = Some(self.focused);
+            self.reveal_panel = Some(self.focused);
         }
     }
 
@@ -1485,7 +1747,7 @@ impl App {
         self.panels[i].resniff();
         self.panels[i].dirty = true;
         // `edited` as well: `compare_now` re-reads every panel that is not
-        // edited, so on a saved result the next ⌘⏎ would read the take straight
+        // edited, so on a saved result the next ⌘Enter would read the take straight
         // back off disk.
         self.panels[i].edited = self.panels[i].path.is_some();
         forget_text_undo(ctx, result_edit_id(i));
@@ -1576,10 +1838,10 @@ impl App {
 
     /// The destination a plain Save should use without opening a dialog.
     fn result_save_target(&self, i: usize) -> Option<PathBuf> {
-        self.panels[i]
-            .saved_to
-            .clone()
-            .or_else(|| self.mergetool.as_ref().map(|tool| tool.merged.clone()))
+        self.mergetool
+            .as_ref()
+            .map(|tool| tool.merged.clone())
+            .or_else(|| self.panels[i].saved_to.clone())
     }
 
     /// Write the result to a file. The only thing in delgui that writes one.
@@ -1621,11 +1883,81 @@ impl App {
             ));
             return false;
         }
+        self.save_result_to(i, path, ask)
+    }
+
+    /// Write to a destination selected by `save_result`.
+    ///
+    /// `explicit_destination` means the native Save As dialog chose the path.
+    /// In mergetool mode a different explicit destination is an export: Git's
+    /// `MERGED` file remains the canonical Save target and the result stays
+    /// dirty relative to it.
+    fn save_result_to(
+        &mut self,
+        i: usize,
+        path: PathBuf,
+        explicit_destination: bool,
+    ) -> bool {
+        let export_only = self.mergetool.as_ref().is_some_and(|tool| {
+            explicit_destination && !paths_refer_to_same_file(&path, &tool.merged)
+        });
+        let conflict_recovery = if self.mergetool.is_some() {
+            "Use Export copy… to preserve both versions, or choose Git's exact target there to confirm replacing it."
+        } else {
+            "Use Save as… to choose or confirm a destination."
+        };
+
+        // A native Save As dialog owns overwrite confirmation. A later plain
+        // Save does not, so compare the destination with the exact bytes this
+        // process last put there before replacing anything.
+        if !explicit_destination
+            && self.panels[i]
+                .saved_to
+                .as_deref()
+                .is_some_and(|saved| paths_refer_to_same_file(saved, &path))
+            && let Some(snapshot) = self.panels[i].saved_snapshot.as_deref()
+        {
+            match std::fs::read(&path) {
+                Ok(current) if current == snapshot.as_bytes() => {}
+                Ok(_) => {
+                    self.error = Some(format!(
+                        "{} changed outside delgui after the last save. Nothing was overwritten. {conflict_recovery}",
+                        path.display(),
+                    ));
+                    return false;
+                }
+                Err(e) => {
+                    self.error = Some(format!(
+                        "Could not verify {} before saving: {e}. Nothing was overwritten. {conflict_recovery}",
+                        path.display(),
+                    ));
+                    return false;
+                }
+            }
+        }
+
         match atomic_write(&path, self.panels[i].text.as_bytes()) {
             Ok(()) => {
-                self.flash = Some((format!("Saved to {}", path.display()), Instant::now()));
-                self.panels[i].saved_to = Some(path);
-                self.panels[i].dirty = false;
+                if export_only {
+                    eprintln!(
+                        "delgui: exported a result copy ({} bytes); the canonical target is unchanged",
+                        self.panels[i].text.len(),
+                    );
+                    self.flash = Some((
+                        format!("Exported a copy to {}", path.display()),
+                        Instant::now(),
+                    ));
+                } else {
+                    eprintln!(
+                        "delgui: saved the result ({} bytes)",
+                        self.panels[i].text.len(),
+                    );
+                    self.flash = Some((format!("Saved to {}", path.display()), Instant::now()));
+                    self.panels[i].saved_stamp = saved_file_stamp(&path);
+                    self.panels[i].saved_to = Some(path);
+                    self.panels[i].saved_snapshot = Some(self.panels[i].text.clone());
+                    self.panels[i].dirty = false;
+                }
                 // Saving and closing can happen in one frame. Publish here so
                 // Git sees the write even when there is no next frame.
                 self.publish_resolution();
@@ -1689,7 +2021,10 @@ impl App {
                 self.touch_panel(i);
                 self.focus_panel = Some(i);
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                self.panels[i].disk_stale = true;
+                self.error = Some(format!("{e} The previous snapshot is still shown."));
+            }
         }
     }
 
@@ -1753,14 +2088,28 @@ impl App {
     }
 
     fn poll_watches(&mut self) {
-        let Some(watcher) = self.watcher.as_mut() else {
-            return;
+        let (changed, backend_error) = {
+            let Some(watcher) = self.watcher.as_mut() else {
+                return;
+            };
+            let changed = watcher.poll();
+            let errors = watcher.poll_errors();
+            let backend_error = errors.last().map(|latest| {
+                let global = errors.iter().any(|error| error.paths.is_empty());
+                let affected = if global {
+                    Vec::new()
+                } else {
+                    errors
+                        .iter()
+                        .flat_map(|error| error.paths.iter().cloned())
+                        .collect()
+                };
+                (latest.to_string(), affected)
+            });
+            (changed, backend_error)
         };
-        let changed = watcher.poll();
-        if let Some(error) = watcher.poll_errors().into_iter().last() {
-            self.error = Some(format!(
-                "File watching reported an error and may be out of date: {error}"
-            ));
+        if let Some((error, affected)) = backend_error {
+            self.handle_watch_backend_error(&error, &affected);
         }
         if changed.is_empty() {
             return;
@@ -1772,6 +2121,33 @@ impl App {
         if relevant {
             self.pending_reload = Some(Instant::now());
         }
+    }
+
+    fn handle_watch_backend_error(&mut self, error: &str, affected: &[PathBuf]) {
+        let mut marked = 0;
+        for panel in &mut self.panels {
+            let Some(path) = panel.path.as_deref() else {
+                continue;
+            };
+            if panel.watch
+                && !panel.edited
+                && watch_error_affects(path, affected)
+                && !panel.disk_stale
+            {
+                panel.disk_stale = true;
+                marked += 1;
+            }
+        }
+        eprintln!(
+            "delgui: file watcher backend error; {marked} followed panel snapshot(s) marked stale"
+        );
+        self.error = Some(if marked == 0 {
+            format!("File watching reported an error and may be out of date: {error}")
+        } else {
+            format!(
+                "File watching reported an error. {marked} followed panel snapshot(s) may be out of date: {error} Reload from disk retries them."
+            )
+        });
     }
 
     /// Panels a drop would land in, in order. Empty means the pointer is not
@@ -1858,6 +2234,8 @@ impl App {
                 Action::ShowDiff(i) => {
                     if i < self.panels.len() && i != self.reference {
                         self.shown = i;
+                        self.reveal_panel = (!self.panels[i].result).then_some(i);
+                        self.reveal_pair = Some(i);
                     }
                 }
                 Action::MakeReference => {
@@ -1898,6 +2276,12 @@ impl App {
                 Action::SaveResultAs => {
                     let _ = self.save_result(true);
                 }
+                Action::TakeCurrentDifference => {
+                    let hunk_count = self.shown_diff().map_or(0, |cached| cached.hunks.len());
+                    if self.merging() && self.is_fresh() && hunk_count > 0 {
+                        self.take_hunk(self.hunk_cursor.min(hunk_count - 1), ctx);
+                    }
+                }
                 Action::UndoTake => {
                     if !typing {
                         self.undo_take(ctx);
@@ -1926,14 +2310,83 @@ impl App {
         let Some(tool) = &self.mergetool else {
             return;
         };
-        let resolved = self.result_panel().is_some_and(|i| {
-            !self.panels[i].dirty
-                && self.panels[i]
+        let resolved = self
+            .result_panel()
+            .is_some_and(|i| self.result_is_saved_to(i, &tool.merged));
+        tool.resolved.store(resolved, Ordering::Relaxed);
+    }
+
+    fn result_is_saved_to(&self, i: usize, target: &Path) -> bool {
+        self.panels.get(i).is_some_and(|panel| {
+            !panel.dirty
+                && panel.saved_snapshot.is_some()
+                && panel
+                    .saved_stamp
+                    .is_some_and(|stamp| saved_file_stamp(target) == Some(stamp))
+                && panel
                     .saved_to
                     .as_deref()
-                    .is_some_and(|at| paths_refer_to_same_file(at, &tool.merged))
-        });
-        tool.resolved.store(resolved, Ordering::Relaxed);
+                    .is_some_and(|at| paths_refer_to_same_file(at, target))
+        })
+    }
+
+    fn result_last_save_is_current(&self, i: usize) -> bool {
+        self.panels
+            .get(i)
+            .and_then(|panel| panel.saved_to.as_deref())
+            .is_some_and(|target| self.result_is_saved_to(i, target))
+    }
+
+    fn result_bytes_are_saved_to(&self, i: usize, target: &Path) -> bool {
+        self.panels.get(i).is_some_and(|panel| {
+            !panel.dirty
+                && panel
+                    .saved_to
+                    .as_deref()
+                    .is_some_and(|at| paths_refer_to_same_file(at, target))
+                && panel.saved_snapshot.as_deref().is_some_and(|snapshot| {
+                    std::fs::read(target)
+                        .ok()
+                        .is_some_and(|bytes| bytes == snapshot.as_bytes())
+                })
+        })
+    }
+
+    /// Reconcile the cheap saved-file stamp with the exact bytes at the point
+    /// where a false saved claim could lose the only remaining copy: close.
+    /// Repainting only stats the file; closing may read the result once.
+    fn refresh_saved_result_from_disk(&mut self) {
+        let Some(i) = self.result_panel() else {
+            return;
+        };
+        let Some(target) = self.panels[i].saved_to.clone() else {
+            return;
+        };
+        if self.panels[i].dirty || self.panels[i].saved_snapshot.is_none() {
+            return;
+        }
+        self.panels[i].saved_stamp = if self.result_bytes_are_saved_to(i, &target) {
+            saved_file_stamp(&target)
+        } else {
+            None
+        };
+    }
+
+    fn merge_unresolved(&self) -> bool {
+        self.mergetool.as_ref().is_some_and(|tool| {
+            !self
+                .result_panel()
+                .is_some_and(|i| self.result_is_saved_to(i, &tool.merged))
+        })
+    }
+
+    #[cfg(test)]
+    fn merge_unresolved_on_disk(&self) -> bool {
+        self.mergetool.as_ref().is_some_and(|tool| {
+            !self
+                .result_panel()
+                .is_some_and(|i| self.result_bytes_are_saved_to(i, &tool.merged))
+        })
     }
 
     /// The find bar, and the reason it is not there if it cannot be.
@@ -2014,59 +2467,108 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let t = ui::tokens(ui);
-        ui.horizontal_wrapped(|ui| {
-            let ready = {
-                let (a, b) = self.pair();
-                !self.panels[a].text.is_empty() || !self.panels[b].text.is_empty()
-            };
-            let busy = self.in_flight.is_some();
-            let label = if busy { "Rendering…" } else { "Compare" };
-            if ui::primary(ui, &t, label, keys::compare_label(), ready && !busy) {
-                self.compare_now(ctx);
-            }
+        let ready = {
+            let (a, b) = self.pair();
+            !self.panels[a].text.is_empty() || !self.panels[b].text.is_empty()
+        };
+        let busy = self.in_flight.is_some();
+        let label = if busy { "Rendering…" } else { "Compare" };
+        let can_add_panel = self.panels.len() < MAX_PANELS;
+        let mut compare = false;
+        let mut view_changed = false;
+        let mut add_panel = false;
+        let mut toggle_settings = false;
+        let mut toggle_help = false;
+        let strip_height = ui
+            .spacing()
+            .interact_size
+            .y
+            // The segmented rail adds a two-point frame margin on both sides
+            // around buttons whose own height is body text plus padding.
+            .max(ui.text_style_height(&TextStyle::Body) + 16.0);
 
-            ui.add_space(8.0);
-            let view_changed = ui::segmented(
+        // The fixed utilities are laid out first and reserve their width. The
+        // modes own the remaining width and scroll only if a large interface
+        // font makes their indivisible segmented control wider than that lane.
+        // A wrapped row with a nested right-to-left group let both runs paint in
+        // the same pixels at the supported 720 px / 20 pt combination.
+        let opts = &mut self.opts;
+        egui::containers::Sides::new()
+            .shrink_left()
+            .height(strip_height)
+            .show(
                 ui,
-                &t,
-                &mut [
-                    ("Side by side", &mut self.opts.side_by_side),
-                    ("Numbers", &mut self.opts.line_numbers),
-                    ("Wrap", &mut self.opts.wrap),
-                ],
+                |ui| {
+                    ui.horizontal(|ui| {
+                        compare = ui::primary(
+                            ui,
+                            &t,
+                            label,
+                            keys::compare_label(),
+                            ready && !busy,
+                        );
+                        ui.add_space(8.0);
+                        egui::ScrollArea::horizontal()
+                            .id_salt("toolbar-modes")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                                    node.set_role(egui::accesskit::Role::ScrollView);
+                                    node.set_label("View modes");
+                                });
+                                view_changed = ui::segmented(
+                                    ui,
+                                    &t,
+                                    &mut [
+                                        ("Side by side", &mut opts.side_by_side),
+                                        ("Numbers", &mut opts.line_numbers),
+                                        ("Wrap", &mut opts.wrap),
+                                    ],
+                                );
+                            });
+                    });
+                },
+                |ui| {
+                    // This lane lays out from the right edge. Emit its visual
+                    // last item first so the established left-to-right order
+                    // remains + Panel, Settings, Help.
+                    if ui::icon(ui, "?", "Help", None)
+                        .on_hover_text(keys::help_hint())
+                        .clicked()
+                    {
+                        toggle_help = true;
+                    }
+                    let gear = ui.add(
+                        egui::Button::selectable(self.show_settings, "Settings")
+                            .corner_radius(radius::CONTROL)
+                            .min_size(Vec2::new(0.0, 26.0)),
+                    );
+                    if gear.on_hover_text(keys::settings_hint()).clicked() {
+                        toggle_settings = true;
+                    }
+                    if can_add_panel && ui::ghost(ui, "+ Panel").clicked() {
+                        add_panel = true;
+                    }
+                },
             );
-            if view_changed {
-                // An inherited option can turn a mode back on after its button
-                // was switched off. The toolbar is an explicit user command.
-                self.take_view_control();
-            }
 
-            // Utilities right, actions left. Left-packing them put "+ Panel",
-            // "Settings" and "?" hard against the view modes with the whole
-            // right half of the toolbar empty, so the row read as one
-            // undifferentiated run of controls. The column count went with them
-            // -- it is a reading of the diff, not a command, and it was being
-            // shown on the empty screen where there is no diff to have a width.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui::icon(ui, "?", "Help", None)
-                    .on_hover_text(keys::help_hint())
-                    .clicked()
-                {
-                    self.show_help = !self.show_help;
-                }
-                let gear = ui.add(
-                    egui::Button::selectable(self.show_settings, "Settings")
-                        .corner_radius(radius::CONTROL)
-                        .min_size(Vec2::new(0.0, 26.0)),
-                );
-                if gear.on_hover_text(keys::settings_hint()).clicked() {
-                    self.show_settings = !self.show_settings;
-                }
-                if self.panels.len() < MAX_PANELS && ui::ghost(ui, "+ Panel").clicked() {
-                    self.add_panel();
-                }
-            });
-        });
+        if compare {
+            self.compare_now(ctx);
+        }
+        if view_changed {
+            // An inherited option can turn a mode back on after its button was
+            // switched off. The toolbar is an explicit user command.
+            self.take_view_control();
+        }
+        if add_panel {
+            self.add_panel();
+        }
+        if toggle_settings {
+            self.show_settings = !self.show_settings;
+        }
+        if toggle_help {
+            self.show_help = !self.show_help;
+        }
     }
 
     /// One card per panel: what it holds, where it came from, and everything you
@@ -2087,14 +2589,21 @@ impl App {
         // The result has its own band under the diff: it is the buffer being
         // authored, and a sixth of a 260 px strip is not an editor.
         let inputs: Vec<usize> = (0..n).filter(|i| !self.panels[*i].result).collect();
+        let reveal_target = self.reveal_panel.filter(|target| inputs.contains(target));
+        let mut panel_revealed = self.reveal_panel.is_some() && reveal_target.is_none();
         let card_width = panel_card_width(ui.available_width(), inputs.len());
         let row_height = ui.available_height();
         egui::ScrollArea::horizontal()
             .id_salt("input-panels")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                    node.set_role(egui::accesskit::Role::ScrollView);
+                    node.set_label("Input panels");
+                });
                 ui.horizontal(|ui| {
                     for i in inputs {
+                        let mut editor_gained_focus = false;
                         ui.allocate_ui_with_layout(
                             Vec2::new(card_width, row_height),
                             Layout::top_down(Align::Min),
@@ -2156,6 +2665,7 @@ impl App {
 
                                 let panel = &self.panels[i];
                                 let edited = panel.edited;
+                                let disk_stale = panel.disk_stale;
                                 let follow_paused = panel.watch && panel.edited;
                                 let detail = panel.detail();
                                 let tooltip = panel.path.as_ref().map_or_else(
@@ -2172,6 +2682,12 @@ impl App {
                                     self.language_chip(ui, i, &t);
                                     if let Some(detail) = detail {
                                         ui.label(ui::small(detail).color(t.text_muted));
+                                    }
+                                    if disk_stale {
+                                        ui.label(ui::micro("reload failed").color(t.danger))
+                                            .on_hover_text(
+                                                "The file could not be reloaded. The previous snapshot is still here; Reload from disk retries it.",
+                                            );
                                     }
                                     if follow_paused {
                                         ui.label(ui::micro("follow paused").color(t.warning))
@@ -2259,10 +2775,19 @@ impl App {
                                         egui::StrokeKind::Inside,
                                     );
                                 }
+                                if response.gained_focus() {
+                                    editor_gained_focus = true;
+                                }
                                 // Sniffing is bounded but not free, so it
                                 // happens on edit rather than every frame.
                                 if response.changed() {
                                     self.panels[i].resniff();
+                                    // Editing takes deliberate local control of
+                                    // the snapshot. It may differ from disk,
+                                    // which `edited` and `follow paused` say;
+                                    // it is no longer pretending a failed disk
+                                    // reload succeeded.
+                                    self.panels[i].disk_stale = false;
                                     // Editing a file-backed panel detaches the
                                     // buffer from the file. Anything else means
                                     // delta renders the file while the panel
@@ -2274,11 +2799,19 @@ impl App {
                     });
                 });
                 self.panel_rects[i] = card.response.rect;
+                if reveal_target == Some(i) || editor_gained_focus {
+                    card.response.scroll_to_me(Some(Align::Center));
+                    panel_revealed = reveal_target == Some(i);
+                }
                             },
                         );
                     }
                 });
             });
+
+        if panel_revealed {
+            self.reveal_panel = None;
+        }
 
         if let Some(i) = new_reference {
             self.set_reference(i);
@@ -2441,66 +2974,251 @@ impl App {
         let t = ui::tokens(ui);
         let (reference, shown) = self.pair();
         let merging = self.merging();
+        let panel_labels = (0..self.panels.len())
+            .map(|i| self.panel_label(i))
+            .collect::<Vec<_>>();
+        let seeds = self
+            .result_seed_indices()
+            .map(|i| (i, format!("{} · {}", title(i), panel_labels[i])))
+            .collect::<Vec<_>>();
+        let result_panel = self.result_panel();
+        let result_exists = result_panel.is_some();
+        let can_undo = !self.undo.is_empty();
+        let reveal_pair = self.reveal_pair;
+        let fresh = self.is_fresh();
+        let merge_status = merging.then(|| {
+            if !fresh {
+                if self.in_flight.is_some() {
+                    "Comparing…".to_owned()
+                } else {
+                    "Count out of date".to_owned()
+                }
+            } else if self
+                .cache
+                .get(&shown)
+                .is_some_and(|cached| cached.problem.is_some())
+            {
+                "Take unavailable".to_owned()
+            } else {
+                let left = self.cache.get(&shown).map_or(0, |c| c.hunks.len());
+                format!(
+                    "{left} difference{} from {}",
+                    if left == 1 { "" } else { "s" },
+                    title(shown)
+                )
+            }
+        });
         let mut seed: Option<Option<usize>> = None;
         let mut stop = false;
         let mut undo = false;
         let mut go = None;
         let mut resume = None;
         let mut swap = false;
+        let has_candidate_tabs = merging || panel_labels.len() > 2;
+        // A two-panel comparison has no candidate tab strip to scroll. Treat a
+        // reveal request as satisfied now, or it can survive until a later
+        // panel is added and scroll an unrelated candidate into view.
+        let mut pair_revealed = reveal_pair.is_some() && !has_candidate_tabs;
         // Swapping two empty panels is a no-op. Combine stays live because its
         // menu can always start empty and can seed from a non-active panel.
         let pair_has_text =
             !self.panels[reference].text.is_empty() || !self.panels[shown].text.is_empty();
-        ui.horizontal_wrapped(|ui| {
-            if merging {
-                ui.label(ui::micro("building").color(t.accent));
-                ui.label(ui::strong(self.panel_label(reference)).color(t.text_primary));
-                ui.label(ui::micro("from").color(t.text_muted));
-            } else {
-                let lead = if self.panels.len() <= 2 {
-                    "comparing"
-                } else {
-                    "against"
-                };
-                ui.label(ui::micro(lead).color(t.text_muted));
-                let reference_label = if self.panels.len() <= 2 {
-                    format!("{} · {}", title(reference), self.panel_label(reference))
-                } else {
-                    self.panel_label(reference)
-                };
-                ui.label(RichText::new(reference_label).color(t.text_secondary));
-                if self.panels.len() <= 2 {
-                    ui.label(RichText::new("→").color(t.text_muted));
-                    ui.label(
-                        ui::strong(format!("{} · {}", title(shown), self.panel_label(shown)))
-                            .color(t.text_primary),
-                    );
-                }
-            }
-            if merging || self.panels.len() > 2 {
-                ui.add_space(6.0);
-                for i in 0..self.panels.len() {
-                    if i == reference {
-                        continue;
-                    }
-                    let label = format!("{} · {}", title(i), self.panel_label(i));
-                    let tab = egui::Button::selectable(shown == i, label)
-                        .corner_radius(radius::CONTROL)
-                        .min_size(Vec2::new(0.0, 26.0));
-                    if ui.add(tab).clicked() {
-                        go = Some(i);
-                    }
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if merging {
+        let strip_height = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&TextStyle::Body) + 12.0);
+
+        egui::containers::Sides::new()
+            .shrink_left()
+            .height(strip_height)
+            .show(
+                ui,
+                |ui| {
+                    let selector_width = ui.available_width();
+                    let selector = egui::ScrollArea::horizontal()
+                        .id_salt("pair-selector")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let mut tab_ids = Vec::new();
+                            let mut focused_tab = None;
+                            ui.horizontal(|ui| {
+                                if merging {
+                                    ui.label(ui::micro("building").color(t.accent));
+                                    let full = panel_labels[reference].clone();
+                                    ui.add_sized(
+                                        [selector_width.min(220.0), strip_height],
+                                        egui::Label::new(
+                                            ui::strong(&full).color(t.text_primary),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&full);
+                                    ui.label(ui::micro("from").color(t.text_muted));
+                                } else {
+                                    let lead = if panel_labels.len() <= 2 {
+                                        "comparing"
+                                    } else {
+                                        "against"
+                                    };
+                                    ui.label(ui::micro(lead).color(t.text_muted));
+                                    let reference_label = if panel_labels.len() <= 2 {
+                                        format!(
+                                            "{} · {}",
+                                            title(reference), panel_labels[reference]
+                                        )
+                                    } else {
+                                        panel_labels[reference].clone()
+                                    };
+                                    let name_width = if panel_labels.len() <= 2 {
+                                        ((selector_width - 80.0) / 2.0).clamp(80.0, 240.0)
+                                    } else {
+                                        selector_width.min(220.0)
+                                    };
+                                    ui.add_sized(
+                                        [name_width, strip_height],
+                                        egui::Label::new(
+                                            RichText::new(&reference_label)
+                                                .color(t.text_secondary),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&reference_label);
+                                    if panel_labels.len() <= 2 {
+                                        ui.label(RichText::new("→").color(t.text_muted));
+                                        let shown_label = format!(
+                                            "{} · {}",
+                                            title(shown), panel_labels[shown]
+                                        );
+                                        ui.add_sized(
+                                            [name_width, strip_height],
+                                            egui::Label::new(
+                                                ui::strong(&shown_label).color(t.text_primary),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&shown_label);
+                                    }
+                                }
+                                if has_candidate_tabs {
+                                    ui.add_space(6.0);
+                                    ui.scope(|ui| {
+                                        let tab_list_id = ui.unique_id();
+                                        ui.ctx().accesskit_node_builder(tab_list_id, |node| {
+                                            node.set_role(egui::accesskit::Role::TabList);
+                                            node.set_label("Comparison candidates");
+                                        });
+                                        ui.horizontal(|ui| {
+                                            for (i, panel_label) in panel_labels.iter().enumerate() {
+                                                if i == reference {
+                                                    continue;
+                                                }
+                                                let label =
+                                                    format!("{} · {panel_label}", title(i));
+                                                let font = TextStyle::Body.resolve(ui.style());
+                                                let text_width = ui.fonts_mut(|fonts| {
+                                                    fonts
+                                                        .layout_no_wrap(
+                                                            label.clone(),
+                                                            font,
+                                                            t.text_primary,
+                                                        )
+                                                        .size()
+                                                        .x
+                                                });
+                                                let width = (text_width
+                                                    + 2.0 * ui.spacing().button_padding.x)
+                                                    .clamp(48.0, 240.0);
+                                                let tab =
+                                                    egui::Button::selectable(shown == i, &label)
+                                                        .truncate()
+                                                        .corner_radius(radius::CONTROL)
+                                                        .min_size(Vec2::new(0.0, strip_height));
+                                                let response = ui
+                                                    .add_sized([width, strip_height], tab)
+                                                    .on_hover_text(&label);
+                                                ui.ctx().accesskit_node_builder(
+                                                    response.id,
+                                                    |node| {
+                                                        node.set_role(egui::accesskit::Role::Tab);
+                                                        node.set_label(label.as_str());
+                                                        node.clear_toggled();
+                                                        node.set_selected(shown == i);
+                                                    },
+                                                );
+                                                if response.clicked() {
+                                                    go = Some(i);
+                                                }
+                                                tab_ids.push((i, response.id));
+                                                if response.has_focus() {
+                                                    focused_tab = Some(tab_ids.len() - 1);
+                                                    ui.memory_mut(|memory| {
+                                                        memory.set_focus_lock_filter(
+                                                            response.id,
+                                                            egui::EventFilter {
+                                                                horizontal_arrows: true,
+                                                                ..Default::default()
+                                                            },
+                                                        );
+                                                    });
+                                                }
+                                                if response.gained_focus()
+                                                    || reveal_pair == Some(i)
+                                                {
+                                                    response.scroll_to_me(Some(Align::Center));
+                                                    pair_revealed = reveal_pair == Some(i);
+                                                }
+                                            }
+                                        });
+                                        let bounds = ui.clip_rect().intersect(ui.min_rect());
+                                        ui.ctx().accesskit_node_builder(tab_list_id, |node| {
+                                            node.set_bounds(egui::accesskit::Rect {
+                                                x0: f64::from(bounds.left()),
+                                                y0: f64::from(bounds.top()),
+                                                x1: f64::from(bounds.right()),
+                                                y1: f64::from(bounds.bottom()),
+                                            });
+                                        });
+                                    });
+                                }
+                            });
+                            if let Some(current) = focused_tab {
+                                let direction = ui.input_mut(|input| {
+                                    if input.consume_key(egui::Modifiers::NONE, Key::ArrowRight) {
+                                        1
+                                    } else if input
+                                        .consume_key(egui::Modifiers::NONE, Key::ArrowLeft)
+                                    {
+                                        -1
+                                    } else {
+                                        0
+                                    }
+                                });
+                                if direction != 0 && !tab_ids.is_empty() {
+                                    let next = moved_cursor(current, tab_ids.len(), direction);
+                                    let (panel, id) = tab_ids[next];
+                                    go = Some(panel);
+                                    ui.memory_mut(|memory| {
+                                        // A tab that only just gained focus still had the
+                                        // default event filter when egui processed this
+                                        // frame's input. Cancel that pending cardinal move
+                                        // before applying the tab list's explicit wrap.
+                                        memory.move_focus(egui::FocusDirection::None);
+                                        memory.request_focus(id);
+                                    });
+                                }
+                            }
+                        });
+                    let _ = selector;
+                },
+                |ui| {
+                    if merging {
                     if ui::ghost(ui, "Stop building")
                         .on_hover_text("Keep the text, put the take controls away.")
                         .clicked()
                     {
                         stop = true;
                     }
-                    let can_undo = !self.undo.is_empty();
                     if ui
                         .add_enabled(
                             can_undo,
@@ -2515,17 +3233,9 @@ impl App {
                     {
                         undo = true;
                     }
-                    // Per candidate, and said so: taking from one panel can add
-                    // differences against another, so there is no single number
-                    // that counts down to zero.
-                    let left = self.cache.get(&shown).map_or(0, |c| c.hunks.len());
                     ui.label(
-                        ui::small(format!(
-                            "{left} difference{} from {}",
-                            if left == 1 { "" } else { "s" },
-                            title(shown)
-                        ))
-                        .color(t.text_muted),
+                            ui::small(merge_status.as_deref().unwrap_or("Comparing…"))
+                                .color(t.text_muted),
                     );
                 } else {
                     let button = egui::Button::new("Combine…")
@@ -2534,10 +3244,9 @@ impl App {
                     egui::containers::menu::MenuButton::from_button(button)
                         .ui(ui, |ui| {
                             ui.label(ui::micro("start a result from").color(t.text_muted));
-                            for i in self.result_seed_indices() {
-                                let label = format!("{} · {}", title(i), self.panel_label(i));
+                            for (i, label) in &seeds {
                                 if ui.button(label).clicked() {
-                                    seed = Some(Some(i));
+                                    seed = Some(Some(*i));
                                     ui.close();
                                 }
                             }
@@ -2551,12 +3260,12 @@ impl App {
                             "Build a new panel out of these: take the differences you want \
                              from either side, edit it by hand, then save or copy it.",
                         );
-                    if self.result_panel().is_some()
+                    if result_exists
                         && ui::ghost(ui, "Back to the result")
                             .on_hover_text("Make the result the baseline again")
                             .clicked()
                     {
-                        resume = self.result_panel();
+                        resume = result_panel;
                     }
                     // An action, so it sits with the actions rather than beside
                     // the description on the left. Spelled out rather than
@@ -2573,11 +3282,15 @@ impl App {
                     {
                         swap = true;
                     }
-                }
-            });
-        });
+                    }
+                },
+            );
         if let Some(i) = go {
             self.shown = i;
+            self.reveal_panel = (!self.panels[i].result).then_some(i);
+            self.reveal_pair = Some(i);
+        } else if pair_revealed {
+            self.reveal_pair = None;
         }
         if let Some(from) = seed {
             self.request_destructive(DestructiveAction::Reseed(from));
@@ -2697,6 +3410,7 @@ impl App {
         self.prepare_shown_diff(ctx, &font, &palette, line_height);
         let restore = self.restore_offset.take();
         let merging = self.merging();
+        let fresh = self.is_fresh();
         // Claimed before anything borrows `self`, and defaulted to the keyboard's
         // pending move so a chord and a button click go through one path.
         let mut move_hunk = std::mem::take(&mut self.pending_hunk_move);
@@ -2717,39 +3431,74 @@ impl App {
             let find_lines = prepared.whole.matching_rows(&self.find_query);
             let mut close_find = false;
             let mut copy = false;
-            ui.horizontal_wrapped(|ui| {
-                if hunk_count > 0 {
-                    // Live only when there is somewhere to go. With one
-                    // difference these wrapped to the same one, so they were
-                    // full-strength controls that visibly did nothing.
-                    let walkable = hunk_count > 1;
-                    if ui::ghost_enabled(ui, "Previous change", walkable)
-                        .on_disabled_hover_text("Only one difference")
-                        .clicked()
-                    {
-                        move_hunk = -1;
-                    }
-                    ui.label(
-                        ui::small(format!(
-                            "{} of {}",
-                            self.hunk_cursor.min(hunk_count - 1) + 1,
-                            hunk_count
-                        ))
-                        .color(t.text_muted),
-                    );
-                    if ui::ghost_enabled(ui, "Next change", walkable)
-                        .on_disabled_hover_text("Only one difference")
-                        .clicked()
-                    {
-                        move_hunk = 1;
-                    }
-                }
-                if let Some(what) = self.effective_options().ignoring() {
-                    ui.label(ui::small(what).color(t.text_muted)).on_hover_text(
-                        "Some differences are being left out of this diff, from Settings.",
-                    );
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let hunk_cursor = self.hunk_cursor;
+            let ignoring = self.effective_options().ignoring();
+            let copied_status = self.flash.as_ref().is_some_and(|(text, at)| {
+                text == "Diff copied" && at.elapsed() < FLASH
+            });
+            let control_height = ui
+                .spacing()
+                .interact_size
+                .y
+                .max(ui.text_style_height(&TextStyle::Body) + 12.0);
+            egui::containers::Sides::new()
+                .shrink_left()
+                .height(control_height)
+                .show(
+                    ui,
+                    |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("diff-navigation")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                                    node.set_role(egui::accesskit::Role::ScrollView);
+                                    node.set_label("Difference navigation");
+                                });
+                                ui.horizontal(|ui| {
+                                    if hunk_count > 0 {
+                                        // Live only when there is somewhere to go. With one
+                                        // difference these wrapped to the same one, so they were
+                                        // full-strength controls that visibly did nothing.
+                                        let walkable = hunk_count > 1;
+                                        let previous = ui::ghost_enabled(
+                                            ui,
+                                            "Previous change",
+                                            walkable,
+                                        )
+                                        .on_disabled_hover_text("Only one difference");
+                                        if previous.gained_focus() {
+                                            previous.scroll_to_me(Some(Align::Center));
+                                        }
+                                        if previous.clicked() {
+                                            move_hunk = -1;
+                                        }
+                                        ui.label(
+                                            ui::small(format!(
+                                                "{} of {}",
+                                                hunk_cursor.min(hunk_count - 1) + 1,
+                                                hunk_count
+                                            ))
+                                            .color(t.text_muted),
+                                        );
+                                        let next = ui::ghost_enabled(ui, "Next change", walkable)
+                                            .on_disabled_hover_text("Only one difference");
+                                        if next.gained_focus() {
+                                            next.scroll_to_me(Some(Align::Center));
+                                        }
+                                        if next.clicked() {
+                                            move_hunk = 1;
+                                        }
+                                    }
+                                    if let Some(what) = &ignoring {
+                                        ui.label(ui::small(what).color(t.text_muted)).on_hover_text(
+                                            "Some differences are being left out of this diff, from Settings.",
+                                        );
+                                    }
+                                });
+                            });
+                    },
+                    |ui| {
                     // Beside the diff, which is the only thing it describes --
                     // it used to sit in the toolbar between the view modes and
                     // the actions, where it was shown even with both panels
@@ -2759,24 +3508,26 @@ impl App {
                             "delta lays out against a column count, so the window's width is \
                              translated back into columns and the diff re-rendered on resize.",
                         );
-                    if ui::ghost(ui, "Copy diff").clicked() {
+                    if ui::ghost_enabled(ui, "Copy diff", fresh)
+                        .on_disabled_hover_text(
+                            "Re-render the current panels before copying this diff.",
+                        )
+                        .clicked()
+                    {
                         // Deferred: the closure holds `&mut self`, and building
                         // the string needs the layout back. It used to be built
                         // every frame instead -- ~14 MB of copying, sixty times
                         // a second, at a 2 MB pair.
                         copy = true;
-                        self.flash = Some(("Diff copied".into(), Instant::now()));
                     }
-                    if let Some((text, at)) = &self.flash
-                        && text == "Diff copied"
-                        && at.elapsed() < FLASH
-                    {
-                        ui::status(ui, text, t.success);
+                    if copied_status || copy {
+                        ui::status(ui, "Diff copied", t.success);
                     }
-                });
-            });
+                    },
+                );
             if copy && let Some(prepared) = self.prepared.as_ref() {
                 ctx.copy_text(prepared.whole.to_text());
+                self.flash = Some(("Diff copied".into(), Instant::now()));
             }
             if self.show_find {
                 ui.horizontal_wrapped(|ui| {
@@ -2903,23 +3654,30 @@ impl App {
                                 }));
                                 return;
                             }
-                            // Zero spacing so the hunks still read as one block
-                            // with control rows cut into it, rather than as a
-                            // stack of separate cards. Selection stitches across
-                            // adjacent labels, so the diff stays copyable whole.
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            let origin = ui.cursor().top();
-                            for (n, (hunk, _span)) in c.hunks.iter().enumerate() {
-                                let (control, clicked) = self.hunk_control(ui, &t, hunk, !stale);
-                                if clicked {
-                                    take = Some(n);
-                                }
-                                let body = prepared.hunks[n].show(ui, glyph);
-                                boxes.push((
-                                    control.top() - origin,
-                                    body.rect.bottom() - control.top(),
-                                ));
-                            }
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .accessibility_parent(render::diff_region_id()),
+                                |ui| {
+                                    // Zero spacing so the hunks still read as one block
+                                    // with control rows cut into it, rather than as a
+                                    // stack of separate cards. Selection stitches across
+                                    // adjacent labels, so the diff stays copyable whole.
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let origin = ui.cursor().top();
+                                    for (n, (hunk, _span)) in c.hunks.iter().enumerate() {
+                                        let (control, clicked) =
+                                            self.hunk_control(ui, &t, hunk, !stale);
+                                        if clicked {
+                                            take = Some(n);
+                                        }
+                                        let body = prepared.hunks[n].show(ui, glyph);
+                                        boxes.push((
+                                            control.top() - origin,
+                                            body.rect.bottom() - control.top(),
+                                        ));
+                                    }
+                                },
+                            );
                         });
                         offset = out.state.offset.y;
                         render::scroll_edges(
@@ -2980,9 +3738,10 @@ impl App {
                     clicked = ui
                         .add_enabled(live, button)
                         .on_hover_text(format!(
-                            "Replace these lines of {} with {}'s",
+                            "Replace these lines of {} with {}'s.  {}",
                             self.panel_label(self.reference),
-                            self.panel_label(self.shown)
+                            self.panel_label(self.shown),
+                            keys::take_label(),
                         ))
                         .on_disabled_hover_text(
                             "Re-reading the panels — this list is a moment out of date.",
@@ -3005,39 +3764,106 @@ impl App {
         (rect, clicked)
     }
 
+    fn result_identity_view(&mut self, i: usize) -> ResultIdentityView {
+        let name = self.panels[i]
+            .saved_to
+            .is_some()
+            .then(|| self.panel_label(i));
+        let (state, state_is_success) = if let Some(tool) = &self.mergetool {
+            if self.result_is_saved_to(i, &tool.merged) {
+                ("Git target saved".to_owned(), true)
+            } else {
+                ("Git target not saved".to_owned(), false)
+            }
+        } else {
+            match (
+                &self.panels[i].saved_to,
+                self.panels[i].dirty,
+                self.result_last_save_is_current(i),
+            ) {
+                (None, _, _) => ("not saved yet".to_owned(), false),
+                (Some(_), true, _) => ("unsaved changes".to_owned(), false),
+                (Some(_), false, true) => ("saved".to_owned(), true),
+                (Some(_), false, false) => ("saved file missing or changed".to_owned(), false),
+            }
+        };
+        let destination = self
+            .mergetool
+            .as_ref()
+            .map(|tool| format!("Git target: {}", tool.merged.display()))
+            .or_else(|| {
+                self.panels[i]
+                    .saved_to
+                    .as_ref()
+                    .map(|path| format!("Saved to: {}", path.display()))
+            });
+        let flash = match self.flash.clone() {
+            Some((text, at)) if at.elapsed() < FLASH => {
+                Some(text)
+            }
+            Some(_) => {
+                self.flash = None;
+                None
+            }
+            None => None,
+        };
+        ResultIdentityView {
+            name,
+            state,
+            state_is_success,
+            destination,
+            detail: self.panels[i].detail(),
+            flash,
+        }
+    }
+
     /// What the result is called, how far it is from disk, and how big it is.
-    fn result_identity(&mut self, ui: &mut egui::Ui, t: &Tokens, i: usize) {
+    fn result_identity(ui: &mut egui::Ui, t: &Tokens, view: &ResultIdentityView) {
         ui.label(ui::micro("result").color(t.accent));
         // The name only once it *is* one. Until the result is saved,
         // `Panel::name` has nothing to go on and answers "Result", so the band
         // read "RESULT Result not saved yet" -- the same fact three times, with
         // the tag and the status each saying it better than the middle one did.
-        if self.panels[i].saved_to.is_some() {
-            ui.label(ui::strong(self.panel_label(i)).color(t.text_primary));
+        if let Some(name) = &view.name {
+            ui.label(ui::strong(name).color(t.text_primary));
         }
-        let state = match (&self.panels[i].saved_to, self.panels[i].dirty) {
-            (None, _) => "not saved yet",
-            (Some(_), true) => "unsaved changes",
-            (Some(_), false) => "",
-        };
-        if !state.is_empty() {
-            ui.label(ui::small(state).color(t.warning));
+        ui.label(ui::small(&view.state).color(if view.state_is_success {
+            t.success
+        } else {
+            t.warning
+        }));
+        if let Some(full) = &view.destination {
+            let response = ui
+                .add_sized(
+                    [ui.available_width().clamp(96.0, 320.0), 20.0],
+                    egui::Label::new(ui::small(full).color(t.text_muted)).truncate(),
+                )
+                .on_hover_text(full);
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_description(full.as_str());
+            });
         }
-        if let Some(detail) = self.panels[i].detail() {
+        if let Some(detail) = &view.detail {
             ui.label(ui::small(detail).color(t.text_muted));
         }
-        if let Some((text, at)) = self.flash.clone() {
-            if at.elapsed() < FLASH {
-                ui::status(ui, &text, t.success);
-                ui.ctx().request_repaint_after(FLASH);
-            } else {
-                self.flash = None;
-            }
+        if let Some(text) = &view.flash {
+            ui::status(ui, text, t.success);
+            ui.ctx().request_repaint_after(FLASH);
+        }
+    }
+
+    /// Save As is an export in mergetool mode, so name the effect rather than
+    /// suggesting that it retargets Git's canonical MERGED file.
+    fn alternate_result_save_label(&self) -> &'static str {
+        if self.mergetool.is_some() {
+            "Export copy…"
+        } else {
+            "Save as…"
         }
     }
 
     /// The ways out of the feature: the clipboard, a file, or somewhere else.
-    fn result_controls(&mut self, ui: &mut egui::Ui, t: &Tokens, i: usize, act: &mut BandActions) {
+    fn result_controls(&self, ui: &mut egui::Ui, t: &Tokens, i: usize, act: &mut BandActions) {
         let has_text = !self.panels[i].text.is_empty();
         let first_save = self.result_save_target(i).is_none();
         if ui::primary(
@@ -3067,7 +3893,7 @@ impl App {
             .corner_radius(radius::CHIP)
             .min_size(Vec2::splat(26.0));
         let (response, _) = egui::containers::menu::MenuButton::from_button(menu).ui(ui, |ui| {
-            if !first_save && ui.button("Save as…").clicked() {
+            if !first_save && ui.button(self.alternate_result_save_label()).clicked() {
                 act.save = Some(true);
                 ui.close();
             }
@@ -3128,20 +3954,45 @@ impl App {
         let Some(i) = self.result_panel() else {
             return;
         };
+        let identity = self.result_identity_view(i);
         let mut act = BandActions::default();
-        // Placed at the side there is no room for the name and every control on
-        // one line, and a header that truncates is worse than one that stacks.
-        if ui.available_width() < 560.0 {
-            ui.horizontal_wrapped(|ui| self.result_identity(ui, &t, i));
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| self.result_controls(ui, &t, i, &mut act));
-        } else {
-            ui.horizontal(|ui| {
-                self.result_identity(ui, &t, i);
-                ui.add_space(8.0);
-                self.result_controls(ui, &t, i, &mut act);
-            });
-        }
+        let header_height = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&TextStyle::Body) + 12.0);
+        // Controls keep their hit bounds; the potentially long destination and
+        // status own the flexible lane and scroll without adding another row to
+        // the compact result editor.
+        egui::containers::Sides::new()
+            .shrink_left()
+            .height(header_height)
+            .show(
+                ui,
+                |ui| {
+                    let identity_scroll = egui::ScrollArea::horizontal()
+                        .id_salt("result-identity")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let scroll_id = ui.unique_id();
+                            Self::mark_scroll_view(
+                                ctx,
+                                scroll_id,
+                                "Result status and destination",
+                                None,
+                            );
+                            ui.horizontal(|ui| Self::result_identity(ui, &t, &identity));
+                            scroll_id
+                        });
+                    Self::mark_scroll_view(
+                        ctx,
+                        identity_scroll.inner,
+                        "Result status and destination",
+                        Some(identity_scroll.inner_rect),
+                    );
+                },
+                |ui| self.result_controls(ui, &t, i, &mut act),
+            );
         ui.add_space(6.0);
         egui::ScrollArea::both()
             .id_salt("result-band")
@@ -3743,6 +4594,7 @@ impl App {
 
     fn destructive_modal(&mut self, ctx: &egui::Context) {
         let Some(action) = self.destructive.as_ref() else {
+            self.restore_pending_modal_focus(ctx);
             return;
         };
         let affected = self.affected_panels(action);
@@ -3790,7 +4642,10 @@ impl App {
         let mut confirm = false;
         let mut cancel = false;
         let mut save_first = false;
-        let response = egui::Modal::new(egui::Id::new("destructive-confirmation"))
+        let modal_id = egui::Id::new("destructive-confirmation");
+        let mut safe_control = None;
+        let (modal_width, modal_height) = Self::modal_dimensions(ctx);
+        let response = egui::Modal::new(modal_id)
             .frame(
                 Frame::new()
                     .fill(t.surface_overlay)
@@ -3800,14 +4655,37 @@ impl App {
             )
             .backdrop_color(Color32::from_black_alpha(if t.dark { 160 } else { 60 }))
             .show(ctx, |ui| {
-                ui.set_max_width(420.0);
+                ui.set_width(modal_width);
+                ui.set_max_height(modal_height);
                 ui.label(RichText::new(heading).text_style(TextStyle::Heading));
                 ui.add_space(8.0);
-                ui.label(RichText::new(explanation).color(t.text_secondary));
-                if !names.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(names).color(t.warning));
-                }
+                let details = egui::ScrollArea::vertical()
+                    .id_salt("destructive-details")
+                    .auto_shrink([false, true])
+                    // The remaining budget covers a wrapped two-row footer at
+                    // the maximum interface font plus its surrounding gaps.
+                    .max_height((modal_height - 168.0).max(72.0))
+                    .show(ui, |ui| {
+                        let scroll_id = ui.unique_id();
+                        Self::mark_scroll_view(
+                            ctx,
+                            scroll_id,
+                            "Destructive action details",
+                            None,
+                        );
+                        ui.label(RichText::new(explanation).color(t.text_secondary));
+                        if !names.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(names).color(t.warning));
+                        }
+                        scroll_id
+                    });
+                Self::mark_scroll_view(
+                    ctx,
+                    details.inner,
+                    "Destructive action details",
+                    Some(details.inner_rect),
+                );
                 ui.add_space(16.0);
                 ui.horizontal_wrapped(|ui| {
                     if result_affected && ui::ghost(ui, "Save result, then continue").clicked() {
@@ -3816,11 +4694,22 @@ impl App {
                     if ui::ghost(ui, verb).clicked() {
                         confirm = true;
                     }
+                    safe_control = Some(ui.next_auto_id());
                     if ui::primary(ui, &t, "Cancel", "Esc", true) {
                         cancel = true;
                     }
                 });
             });
+        Self::mark_modal(
+            ctx,
+            &response.response,
+            egui::accesskit::Role::AlertDialog,
+            heading,
+        );
+        if let Some(safe_control) = safe_control {
+            let restore_focus = self.destructive_restore_focus.take();
+            self.enter_modal_focus(ctx, modal_id, safe_control, restore_focus);
+        }
         if save_first && self.save_result(false) {
             confirm = true;
         }
@@ -3831,36 +4720,59 @@ impl App {
         } else if cancel || response.should_close() {
             self.destructive = None;
         }
+        if self.destructive.is_none() {
+            self.leave_modal_focus(ctx, modal_id);
+        }
     }
 
     /// Hold a close request while any panel contains work that exists only in
     /// this process. Result contents can be saved; other panels still require an
     /// explicit discard decision.
     fn quit_guard(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            self.refresh_saved_result_from_disk();
+        }
         let unsaved = self.unsaved_panels();
-        if ctx.input(|i| i.viewport().close_requested()) && !unsaved.is_empty() && !self.closing {
+        let merge_unresolved = self.merge_unresolved();
+        if close_requested {
+            if let Some(tool) = &self.mergetool {
+                tool.resolved.store(!merge_unresolved, Ordering::Relaxed);
+            }
+        }
+        if close_requested
+            && (!unsaved.is_empty() || merge_unresolved)
+            && !self.closing
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_help = false;
             self.destructive = None;
             self.quit_guard = true;
         }
         if !self.quit_guard {
+            self.restore_pending_modal_focus(ctx);
             return;
         }
-        if unsaved.is_empty() {
+        if unsaved.is_empty() && !merge_unresolved {
             self.quit_guard = false;
+            self.leave_modal_focus(ctx, egui::Id::new("quit-guard"));
             return;
         }
         let result = self
             .result_panel()
-            .filter(|i| self.panels[*i].dirty && unsaved.contains(i));
+            .filter(|i| unsaved.contains(i));
+        let has_result = self.result_panel().is_some();
         let other_unsaved = unsaved.iter().any(|i| Some(*i) != result);
         let t = Tokens::of(ctx.theme());
         let mut discard = false;
         let mut keep = false;
         let mut save_and_quit = false;
         let mut save_result = false;
-        let response = egui::Modal::new(egui::Id::new("quit-guard"))
+        let modal_id = egui::Id::new("quit-guard");
+        let mut safe_control = None;
+        let save_shortcut = ctx.input(|input| keys::pressed(input).contains(&Action::SaveResult));
+        let (modal_width, modal_height) = Self::modal_dimensions(ctx);
+        let response = egui::Modal::new(modal_id)
             .frame(
                 Frame::new()
                     .fill(t.surface_overlay)
@@ -3870,57 +4782,182 @@ impl App {
             )
             .backdrop_color(Color32::from_black_alpha(if t.dark { 160 } else { 60 }))
             .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(RichText::new("Unsaved panel contents").text_style(TextStyle::Heading));
-                ui.add_space(8.0);
+                ui.set_width(modal_width);
+                ui.set_max_height(modal_height);
                 ui.label(
-                    RichText::new(format!(
-                        "{} panel{} contain{} text or edits that exist only in delgui.",
-                        unsaved.len(),
-                        if unsaved.len() == 1 { "" } else { "s" },
-                        if unsaved.len() == 1 { "s" } else { "" },
-                    ))
-                    .color(t.text_secondary),
+                    RichText::new(if merge_unresolved {
+                        "Git merge is not saved"
+                    } else {
+                        "Unsaved panel contents"
+                    })
+                    .text_style(TextStyle::Heading),
+                );
+                ui.add_space(8.0);
+                let details = egui::ScrollArea::vertical()
+                    .id_salt("quit-details")
+                    .auto_shrink([false, true])
+                    .max_height((modal_height - 168.0).max(72.0))
+                    .show(ui, |ui| {
+                        let scroll_id = ui.unique_id();
+                        Self::mark_scroll_view(ctx, scroll_id, "Unsaved work details", None);
+                        if merge_unresolved {
+                            let target = self
+                                .mergetool
+                                .as_ref()
+                                .map(|tool| tool.merged.display().to_string())
+                                .unwrap_or_default();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Git's target has not been saved: {target}. Quitting unresolved makes the mergetool report failure."
+                                ))
+                                .color(t.text_secondary),
+                            );
+                            if other_unsaved {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} other panel{} also contain unsaved text or edits.",
+                                        unsaved.len().saturating_sub(usize::from(result.is_some())),
+                                        if unsaved.len().saturating_sub(usize::from(result.is_some())) == 1 {
+                                            ""
+                                        } else {
+                                            "s"
+                                        },
+                                    ))
+                                    .color(t.warning),
+                                );
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} panel{} contain{} text or edits that exist only in delgui.",
+                                    unsaved.len(),
+                                    if unsaved.len() == 1 { "" } else { "s" },
+                                    if unsaved.len() == 1 { "s" } else { "" },
+                                ))
+                                .color(t.text_secondary),
+                            );
+                        }
+                        scroll_id
+                    });
+                Self::mark_scroll_view(
+                    ctx,
+                    details.inner,
+                    "Unsaved work details",
+                    Some(details.inner_rect),
                 );
                 ui.add_space(16.0);
                 ui.horizontal_wrapped(|ui| {
-                    if result.is_some() && !other_unsaved {
+                    if merge_unresolved && !other_unsaved && has_result {
+                        if ui::primary(
+                            ui,
+                            &t,
+                            "Save to Git target and quit",
+                            keys::save_label(),
+                            true,
+                        ) {
+                            save_and_quit = true;
+                        }
+                    } else if merge_unresolved && has_result {
+                        if ui::primary(
+                            ui,
+                            &t,
+                            "Save to Git target",
+                            keys::save_label(),
+                            true,
+                        ) {
+                            save_result = true;
+                        }
+                    } else if result.is_some() && !other_unsaved {
                         if ui::primary(ui, &t, "Save and quit", keys::save_label(), true) {
                             save_and_quit = true;
                         }
                     } else if result.is_some() && ui::ghost(ui, "Save result").clicked() {
                         save_result = true;
                     }
-                    if ui::ghost(ui, "Discard and quit").clicked() {
+                    if ui::ghost(
+                        ui,
+                        if merge_unresolved {
+                            if other_unsaved {
+                                "Discard and quit unresolved"
+                            } else {
+                                "Quit unresolved"
+                            }
+                        } else {
+                            "Discard and quit"
+                        },
+                    )
+                    .clicked()
+                    {
                         discard = true;
                     }
+                    safe_control = Some(ui.next_auto_id());
                     if ui::ghost(ui, "Keep working").clicked() {
                         keep = true;
                     }
                 });
             });
+        Self::mark_modal(
+            ctx,
+            &response.response,
+            egui::accesskit::Role::AlertDialog,
+            if merge_unresolved {
+                "Unresolved Git merge"
+            } else {
+                "Unsaved panel contents"
+            },
+        );
+        if let Some(safe_control) = safe_control {
+            self.enter_modal_focus(ctx, modal_id, safe_control, None);
+        }
+        if save_shortcut {
+            if has_result
+                && ((merge_unresolved && !other_unsaved)
+                    || (result.is_some() && !other_unsaved))
+            {
+                save_and_quit = true;
+            } else if has_result && (merge_unresolved || result.is_some()) {
+                save_result = true;
+            }
+        }
         if save_result {
             let _ = self.save_result(false);
         }
         if save_and_quit && self.save_result(false) {
             self.closing = true;
+            self.quit_guard = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if discard {
             self.closing = true;
+            self.quit_guard = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if keep || response.should_close() {
             self.quit_guard = false;
         }
+        if !self.quit_guard {
+            self.leave_modal_focus(ctx, modal_id);
+        }
     }
 
     fn help_modal(&mut self, ctx: &egui::Context) {
+        let modal_id = egui::Id::new("help");
         if !self.show_help {
+            self.leave_modal_focus(ctx, modal_id);
+            self.restore_pending_modal_focus(ctx);
             return;
         }
         let t = Tokens::of(ctx.theme());
-        let response = egui::Modal::new(egui::Id::new("help"))
+        let content = ctx.content_rect().size();
+        let modal_width = (content.x - 64.0).clamp(280.0, 420.0);
+        // Account for the frame's 48 points of vertical margin plus the
+        // heading/footer. A max on the inner Ui alone otherwise still lets the
+        // visible Close action cross the bottom edge at 720×480 and 20 pt.
+        let modal_height = (content.y - 112.0).clamp(140.0, 620.0);
+        let mut close = false;
+        let mut safe_control = None;
+        let response = egui::Modal::new(modal_id)
             .frame(
                 Frame::new()
                     .fill(t.surface_overlay)
@@ -3930,46 +4967,74 @@ impl App {
             )
             .backdrop_color(Color32::from_black_alpha(if t.dark { 160 } else { 60 }))
             .show(ctx, |ui| {
-                ui.set_max_width(420.0);
+                ui.set_width(modal_width);
+                ui.set_max_height(modal_height);
                 ui.label(RichText::new("Keyboard & gestures").text_style(TextStyle::Heading));
                 ui.add_space(12.0);
-                let mut group = "";
-                egui::Grid::new("keys-grid")
-                    .num_columns(2)
-                    .spacing([24.0, 8.0])
-                    .min_row_height(22.0)
+                egui::ScrollArea::both()
+                    .id_salt("help-contents")
+                    .auto_shrink([false, false])
+                    .max_height((modal_height - 92.0).max(100.0))
                     .show(ui, |ui| {
-                        for row in keys::help_rows() {
-                            if row.group != group {
-                                group = row.group;
-                                ui.label("");
-                                ui.label(ui::micro(row.group).color(t.text_muted));
-                                ui.end_row();
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    ui::chord(row.label)
-                                        .color(t.text_primary)
-                                        .background_color(t.surface),
-                                );
+                        ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                            node.set_role(egui::accesskit::Role::ScrollView);
+                            node.set_label("Keyboard shortcuts");
+                        });
+                        let mut group = "";
+                        egui::Grid::new("keys-grid")
+                            .num_columns(2)
+                            .spacing([24.0, 8.0])
+                            .min_row_height(22.0)
+                            .show(ui, |ui| {
+                                for row in keys::help_rows() {
+                                    if row.group != group {
+                                        group = row.group;
+                                        ui.label("");
+                                        ui.label(ui::micro(row.group).color(t.text_muted));
+                                        ui.end_row();
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            ui::chord(row.label)
+                                                .color(t.text_primary)
+                                                .background_color(t.surface),
+                                        );
+                                    });
+                                    ui.label(RichText::new(row.describe).color(t.text_secondary));
+                                    ui.end_row();
+                                }
                             });
-                            ui.label(RichText::new(row.describe).color(t.text_secondary));
-                            ui.end_row();
+                        if let Some(h) = &self.hotkey {
+                            ui.add_space(12.0);
+                            ui.label(
+                                ui::small(format!(
+                                    "{} pastes into delgui from anywhere while it runs",
+                                    h.label
+                                ))
+                                .color(t.text_muted),
+                            );
                         }
                     });
-                if let Some(h) = &self.hotkey {
-                    ui.add_space(12.0);
-                    ui.label(
-                        ui::small(format!(
-                            "{} pastes into delgui from anywhere while it runs",
-                            h.label
-                        ))
-                        .color(t.text_muted),
-                    );
-                }
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    safe_control = Some(ui.next_auto_id());
+                    if ui::primary(ui, &t, "Close", "Esc", true) {
+                        close = true;
+                    }
+                });
             });
-        if response.should_close() {
+        Self::mark_modal(
+            ctx,
+            &response.response,
+            egui::accesskit::Role::Dialog,
+            "Keyboard and gestures",
+        );
+        if let Some(safe_control) = safe_control {
+            self.enter_modal_focus(ctx, modal_id, safe_control, None);
+        }
+        if close || response.should_close() {
             self.show_help = false;
+            self.leave_modal_focus(ctx, modal_id);
         }
     }
 
@@ -4004,18 +5069,32 @@ impl App {
             if at.elapsed() >= WATCH_DEBOUNCE {
                 self.pending_reload = None;
                 let mut reloaded = Vec::new();
+                let mut reload_failures = Vec::new();
                 for (i, p) in self.panels.iter_mut().enumerate() {
                     // Following a file must not silently destroy typing. An
                     // edited panel keeps its buffer and stops tracking.
                     if p.watch && !p.edited {
                         match p.reload() {
                             Ok(()) => reloaded.push(i),
-                            Err(e) => self.error = Some(e),
+                            Err(e) => {
+                                p.disk_stale = true;
+                                reload_failures.push((i, e));
+                            }
                         }
                     }
                 }
                 for i in reloaded {
                     self.touch_panel(i);
+                }
+                if let Some((i, error)) = reload_failures.pop() {
+                    eprintln!(
+                        "delgui: watched panel {} could not reload; the previous snapshot was kept",
+                        title(i),
+                    );
+                    self.error = Some(format!(
+                        "Panel {} could not reload: {error} The previous snapshot is still shown; retry Reload from disk when the file is available.",
+                        title(i),
+                    ));
                 }
             } else {
                 ctx.request_repaint_after(WATCH_DEBOUNCE);
@@ -4104,13 +5183,20 @@ fn panel_card_width(available: f32, count: usize) -> f32 {
 /// thirteen-line file while 230 of empty card sat under the diff. The split is
 /// draggable and eframe remembers it, so this only decides where it starts --
 /// but where it starts is what most people ever see.
-fn source_panel_sizes(available: f32) -> (f32, f32) {
+fn source_panel_sizes(available: f32) -> (f32, f32, f32) {
     if available < 640.0 {
-        (130.0, 96.0)
+        // The maximum is intentional. A split remembered from a tall window
+        // used to survive a resize to 720×480 and leave a bottom Result plus no
+        // central diff at all.
+        (130.0, 96.0, 130.0)
     } else {
         // Capped, because past a point the panels are just a text editor with a
         // diff underneath, and the diff is the thing being read.
-        ((available * 0.3).clamp(260.0, 420.0), 160.0)
+        (
+            (available * 0.3).clamp(260.0, 420.0),
+            160.0,
+            f32::INFINITY,
+        )
     }
 }
 
@@ -4129,7 +5215,7 @@ fn effective_result_placement(width: f32, preferred: ResultPlacement) -> ResultP
 /// margins and its own header -- that was four or five visible lines while the
 /// diff above it kept four hundred pixels, which is not an editor either, just a
 /// less cramped one than a column in the panel row would have been.
-fn result_panel_sizes(available: f32, placement: ResultPlacement) -> (f32, f32) {
+fn result_panel_sizes(available: f32, placement: ResultPlacement) -> (f32, f32, f32) {
     match placement {
         ResultPlacement::Bottom => {
             // 45% of what is left, and note what "left" means: this is called
@@ -4139,14 +5225,17 @@ fn result_panel_sizes(available: f32, placement: ResultPlacement) -> (f32, f32) 
             // were the window height -- therefore matched *always*, which is
             // why the band was stuck at the compact 128 and showed four lines
             // of the buffer being authored on any screen.
-            let default = (available * 0.45).clamp(128.0, 520.0);
+            let max = (available - MIN_DIFF_OUTER_HEIGHT)
+                .max(MIN_RESULT_OUTER_HEIGHT)
+                .min(available.max(0.0));
+            let default = (available * 0.45).clamp(128.0, 520.0).min(max);
             // Never a floor above the default, or a short window is given a
             // band there is no room for.
-            (default, default.min(150.0))
+            (default, default.min(150.0), max)
         }
         // A side already shows the whole result at once, and every pixel here
         // is one delta does not get to lay the diff out in.
-        ResultPlacement::Left | ResultPlacement::Right => (440.0, 260.0),
+        ResultPlacement::Left | ResultPlacement::Right => (440.0, 260.0, f32::INFINITY),
     }
 }
 
@@ -4241,11 +5330,22 @@ impl eframe::App for App {
                 .show(ui, |ui| self.settings_drawer(ui));
         }
 
-        let (source_default, source_min) = source_panel_sizes(ui.available_height());
-        egui::Panel::top("panels")
+        let compact_height = ui.available_height() < 640.0;
+        let (source_default, source_min, source_max) =
+            source_panel_sizes(ui.available_height());
+        // Compact and regular splits have distinct ids. Otherwise clamping a
+        // remembered tall split for a tiled window also overwrites the user's
+        // preferred split when the window is widened again.
+        let source_panel_id = if compact_height {
+            "panels-compact"
+        } else {
+            "panels"
+        };
+        egui::Panel::top(source_panel_id)
             .resizable(true)
             .default_size(source_default)
             .min_size(source_min)
+            .max_size(source_max)
             .show_separator_line(false)
             .frame(
                 Frame::new()
@@ -4274,12 +5374,18 @@ impl eframe::App for App {
             // at the side.
             let placement =
                 effective_result_placement(ui.available_width(), self.settings.result_placement);
-            let (result_default, result_min) = result_panel_sizes(ui.available_height(), placement);
+            let (result_default, result_min, result_max) =
+                result_panel_sizes(ui.available_height(), placement);
             let panel = match placement {
                 // Costs the diff no width, which matters: delta lays out against
                 // a column count, and side by side is the widest thing here.
                 ResultPlacement::Bottom => {
-                    egui::Panel::bottom("result-bottom").default_size(result_default)
+                    let id = if compact_height {
+                        "result-bottom-compact"
+                    } else {
+                        "result-bottom"
+                    };
+                    egui::Panel::bottom(id).default_size(result_default)
                 }
                 ResultPlacement::Left => {
                     egui::Panel::left("result-left").default_size(result_default)
@@ -4291,6 +5397,7 @@ impl eframe::App for App {
             panel
                 .resizable(true)
                 .min_size(result_min)
+                .max_size(result_max)
                 .frame(
                     Frame::new()
                         .fill(t.surface_raised)
@@ -4394,6 +5501,33 @@ mod tests {
         test_app_with_settings(Settings::default())
     }
 
+    fn modal_test_context() -> (egui::Context, egui::Rect) {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, 20.0, 24.0);
+        ctx.enable_accesskit();
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(720.0, 480.0));
+        (ctx, screen)
+    }
+
+    fn screen_input(screen: egui::Rect) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        }
+    }
+
+    fn assert_inside_screen(screen: egui::Rect, bounds: egui::accesskit::Rect, what: &str) {
+        assert!(
+            bounds.x0 >= f64::from(screen.left())
+                && bounds.x1 <= f64::from(screen.right())
+                && bounds.y0 >= f64::from(screen.top())
+                && bounds.y1 <= f64::from(screen.bottom()),
+            "{what} {bounds:?} escaped {screen:?}",
+        );
+    }
+
     #[test]
     fn settings_drawer_stays_inside_its_supported_narrow_width() {
         for ui_pt in [13.0, 20.0] {
@@ -4470,6 +5604,329 @@ mod tests {
                 left + 208.0,
             );
         }
+    }
+
+    #[test]
+    fn help_is_a_named_scrollable_modal_with_a_visible_close_action() {
+        let mut app = test_app();
+        app.show_help = true;
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, 20.0, 24.0);
+        ctx.enable_accesskit();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(720.0, 480.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |_ui| app.help_modal(&ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+
+        let dialog = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Keyboard and gestures"))
+            .expect("named help dialog");
+        assert_eq!(dialog.1.role(), egui::accesskit::Role::Dialog);
+        assert!(dialog.1.is_modal());
+
+        let close = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label == "Close" || label.starts_with("Close "))
+            })
+            .and_then(|(_, node)| node.bounds())
+            .unwrap_or_else(|| {
+                let available = update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, node)| {
+                        node.label()
+                            .or(node.value())
+                            .map(|text| (node.role(), text.to_owned(), node.bounds()))
+                    })
+                    .collect::<Vec<_>>();
+                panic!("bounded Close action; available: {available:?}")
+            });
+        assert!(
+            close.x0 >= f64::from(screen.left())
+                && close.x1 <= f64::from(screen.right())
+                && close.y0 >= f64::from(screen.top())
+                && close.y1 <= f64::from(screen.bottom()),
+            "Close action {close:?} escaped the 720×480 viewport",
+        );
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::ScrollView),
+            "long help contents have no accessible scroll region",
+        );
+        let safe = app.modal_focus.expect("help established a focus contract").2;
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(safe));
+    }
+
+    #[test]
+    fn destructive_alert_keeps_actions_visible_with_long_names_at_max_font() {
+        let mut app = test_app();
+        while app.panels.len() < MAX_PANELS {
+            app.add_panel();
+        }
+        for (i, panel) in app.panels.iter_mut().enumerate() {
+            panel.path = Some(PathBuf::from(format!(
+                "/root/{}/same.rs",
+                format!("segment-{i}-").repeat(28),
+            )));
+            panel.text = "unsaved\n".into();
+            panel.edited = true;
+            panel.resniff();
+        }
+        app.request_destructive(DestructiveAction::LoadFiles(
+            (0..MAX_PANELS)
+                .map(|i| (i, PathBuf::from(format!("replacement-{i}"))))
+                .collect(),
+        ));
+
+        let (ctx, screen) = modal_test_context();
+        let mut output = ctx.run_ui(screen_input(screen), |_ui| app.destructive_modal(&ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+
+        let dialog = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Replace unsaved panel contents?"))
+            .expect("action-specific destructive alert");
+        assert_eq!(dialog.1.role(), egui::accesskit::Role::AlertDialog);
+        assert!(dialog.1.is_modal());
+        assert_inside_screen(
+            screen,
+            dialog.1.bounds().expect("destructive alert bounds"),
+            "destructive alert",
+        );
+
+        for label in ["Replace panels", "Cancel"] {
+            let (id, node) = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label()
+                        .is_some_and(|name| name == label || name.starts_with(&format!("{label} ")))
+                })
+                .unwrap_or_else(|| panic!("visible {label} action"));
+            assert_inside_screen(
+                screen,
+                node.bounds().unwrap_or_else(|| panic!("{label} bounds")),
+                label,
+            );
+            if label == "Cancel" {
+                let safe = app.modal_focus.expect("destructive focus contract").2;
+                assert_eq!(*id, safe.accesskit_id());
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(safe));
+            }
+        }
+        let details = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::ScrollView
+                    && node.label() == Some("Destructive action details")
+            })
+            .expect("accessible destructive details");
+        assert_inside_screen(
+            screen,
+            details.1.bounds().expect("destructive details bounds"),
+            "destructive details",
+        );
+    }
+
+    #[test]
+    fn quit_alert_keeps_actions_visible_with_a_long_git_target_at_max_font() {
+        let dir = temp_path("long-quit-modal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base");
+        let local = dir.join("local");
+        let remote = dir.join("remote");
+        for (path, text) in [(&base, "base\n"), (&local, "local\n"), (&remote, "remote\n")] {
+            std::fs::write(path, text).unwrap();
+        }
+        let merged = PathBuf::from(format!(
+            "/tmp/{}/MERGED",
+            "very-long-segment/".repeat(70),
+        ));
+        let (mut app, _) = test_mergetool_app(&[base, local, remote], merged);
+        let result = app.result_panel().unwrap();
+        app.panels[result].text = "unwritten result\n".into();
+        app.panels[result].dirty = true;
+        app.quit_guard = true;
+
+        let (ctx, screen) = modal_test_context();
+        let mut output = ctx.run_ui(screen_input(screen), |_ui| app.quit_guard(&ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+
+        let dialog = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Unresolved Git merge"))
+            .expect("unresolved merge alert");
+        assert_inside_screen(
+            screen,
+            dialog.1.bounds().expect("quit alert bounds"),
+            "quit alert",
+        );
+        for label in [
+            "Save to Git target and quit",
+            "Quit unresolved",
+            "Keep working",
+        ] {
+            let (id, node) = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label()
+                        .is_some_and(|name| name == label || name.starts_with(&format!("{label} ")))
+                })
+                .unwrap_or_else(|| panic!("visible {label} action"));
+            assert_inside_screen(
+                screen,
+                node.bounds().unwrap_or_else(|| panic!("{label} bounds")),
+                label,
+            );
+            if label == "Keep working" {
+                let safe = app.modal_focus.expect("quit focus contract").2;
+                assert_eq!(*id, safe.accesskit_id());
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(safe));
+            }
+        }
+        let details = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::ScrollView
+                    && node.label() == Some("Unsaved work details")
+            })
+            .expect("accessible unsaved-work details");
+        assert_inside_screen(
+            screen,
+            details.1.bounds().expect("quit details bounds"),
+            "quit details",
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quit_alert_honors_its_displayed_save_shortcut() {
+        let dir = temp_path("quit-save-shortcut");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base");
+        let local = dir.join("local");
+        let remote = dir.join("remote");
+        for (path, text) in [(&base, "base\n"), (&local, "local\n"), (&remote, "remote\n")] {
+            std::fs::write(path, text).unwrap();
+        }
+        let merged = dir.join("MERGED");
+        let (mut app, resolved) =
+            test_mergetool_app(&[base, local, remote], merged.clone());
+        let result = app.result_panel().unwrap();
+        app.panels[result].text = "saved by shortcut\n".into();
+        app.panels[result].dirty = true;
+        app.quit_guard = true;
+
+        let (ctx, screen) = modal_test_context();
+        let mut first = ctx.run_ui(screen_input(screen), |_ui| app.quit_guard(&ctx));
+        first.textures_delta.clear();
+
+        let mut input = screen_input(screen);
+        input
+            .events
+            .push(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        input.events.push(egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let mut output = ctx.run_ui(input, |_ui| app.quit_guard(&ctx));
+        assert_eq!(std::fs::read_to_string(&merged).unwrap(), "saved by shortcut\n");
+        assert!(app.closing);
+        assert!(!app.quit_guard);
+        assert!(resolved.load(Ordering::Relaxed));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close),
+        );
+        output.textures_delta.clear();
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn destructive_alert_restores_a_stable_editor_after_cancel() {
+        let mut app = test_app();
+        app.panels[0].text = "unsaved\n".into();
+        app.panels[0].resniff();
+        app.request_destructive(DestructiveAction::Clear(0));
+        let stable = panel_edit_id(0);
+        let transient = egui::Id::new("vanished-popup-item");
+
+        let (ctx, screen) = modal_test_context();
+        ctx.memory_mut(|memory| memory.request_focus(transient));
+        let render = |ui: &mut egui::Ui, app: &mut App| {
+            ui.interact(
+                egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(40.0, 24.0)),
+                stable,
+                egui::Sense::click(),
+            );
+            app.destructive_modal(&ctx);
+        };
+
+        let mut first = ctx.run_ui(screen_input(screen), |ui| render(ui, &mut app));
+        let safe = app.modal_focus.expect("destructive focus contract").2;
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(safe));
+        first.textures_delta.clear();
+
+        let mut escape = screen_input(screen);
+        escape.events.push(egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut second = ctx.run_ui(escape, |ui| render(ui, &mut app));
+        assert!(app.destructive.is_none());
+        second.textures_delta.clear();
+
+        let mut third = ctx.run_ui(screen_input(screen), |ui| render(ui, &mut app));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(stable));
+        third.textures_delta.clear();
+
+        let mut fourth = ctx.run_ui(screen_input(screen), |ui| render(ui, &mut app));
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(stable),
+            "restored focus survived egui's dead-man pass",
+        );
+        fourth.textures_delta.clear();
     }
 
     /// The drawer's own default width has to be one the fields fit in side by
@@ -4614,6 +6071,172 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn mergetool_export_does_not_retarget_plain_save_or_resolve_git() {
+        let dir = temp_path("mergetool-export");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local, remote) = (dir.join("b"), dir.join("l"), dir.join("r"));
+        std::fs::write(&base, "base\n").unwrap();
+        std::fs::write(&local, "ours\n").unwrap();
+        std::fs::write(&remote, "theirs\n").unwrap();
+        let merged = dir.join("MERGED");
+        let exported = dir.join("copy.txt");
+
+        let (mut app, resolved) =
+            test_mergetool_app(&[base, local, remote], merged.clone());
+        let result = app.result_panel().unwrap();
+        assert_eq!(app.alternate_result_save_label(), "Export copy…");
+        app.panels[result].text = "resolved text\n".into();
+        app.panels[result].dirty = true;
+
+        assert!(app.save_result_to(result, exported.clone(), true));
+        assert_eq!(
+            std::fs::read_to_string(&exported).unwrap(),
+            "resolved text\n"
+        );
+        assert!(!merged.exists());
+        assert_eq!(
+            app.result_save_target(result).as_deref(),
+            Some(merged.as_path())
+        );
+        assert!(app.panels[result].dirty);
+        assert!(app.panels[result].saved_snapshot.is_none());
+        assert!(app.unsaved_panels().contains(&result));
+        assert!(!resolved.load(Ordering::Relaxed));
+
+        assert!(app.save_result(false));
+        assert_eq!(
+            std::fs::read_to_string(&merged).unwrap(),
+            "resolved text\n"
+        );
+        assert!(!app.panels[result].dirty);
+        assert!(resolved.load(Ordering::Relaxed));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unwritten_empty_mergetool_result_cancels_close() {
+        let dir = temp_path("mergetool-unresolved-close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local, remote) = (dir.join("b"), dir.join("l"), dir.join("r"));
+        std::fs::write(&base, "").unwrap();
+        std::fs::write(&local, "ours\n").unwrap();
+        std::fs::write(&remote, "theirs\n").unwrap();
+        let merged = dir.join("MERGED");
+
+        let (mut app, resolved) = test_mergetool_app(&[base, local, remote], merged);
+        let result = app.result_panel().unwrap();
+        assert!(!app.panels[result].dirty);
+        assert!(app.merge_unresolved());
+        assert!(!resolved.load(Ordering::Relaxed));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ctx| app.quit_guard(ctx));
+
+        assert!(app.quit_guard);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        let dialog = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Unresolved Git merge"))
+            .expect("named unresolved-merge alert dialog");
+        assert_eq!(dialog.1.role(), egui::accesskit::Role::AlertDialog);
+        assert!(dialog.1.is_modal());
+        output.textures_delta.clear();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unresolved_mergetool_without_a_result_offers_no_impossible_save() {
+        let dir = temp_path("mergetool-no-result-close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local, remote) = (dir.join("b"), dir.join("l"), dir.join("r"));
+        std::fs::write(&base, "base\n").unwrap();
+        std::fs::write(&local, "ours\n").unwrap();
+        std::fs::write(&remote, "theirs\n").unwrap();
+        let merged = dir.join("MERGED");
+
+        let (mut app, _) = test_mergetool_app(&[base, local, remote], merged);
+        let result = app.result_panel().unwrap();
+        app.remove_panel(result);
+        assert!(app.result_panel().is_none());
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ctx| app.quit_guard(ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+
+        assert!(app.quit_guard);
+        assert!(
+            !update.nodes.iter().any(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with("Save to Git target"))
+            }),
+            "there is no result for the advertised Save action"
+        );
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Quit unresolved"))
+        );
+        output.textures_delta.clear();
+
+        let notice = app.notice.clone();
+        let mut save_input = egui::RawInput::default();
+        save_input
+            .events
+            .push(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        save_input.events.push(egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let mut save_output = ctx.run_ui(save_input, |ctx| app.quit_guard(ctx));
+        assert!(app.quit_guard);
+        assert!(!app.closing);
+        assert_eq!(app.notice, notice, "the hidden Save action was not dispatched");
+        assert!(
+            !save_output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        save_output.textures_delta.clear();
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// The question git asks on exit is whether the file it handed over holds
     /// the merge *now* -- not whether a save ever happened. Saving and then
     /// typing more leaves it unresolved again.
@@ -4632,9 +6255,9 @@ mod tests {
         app.publish_resolution();
         assert!(!resolved.load(Ordering::Relaxed), "nothing written yet");
 
-        app.panels[result].saved_to = Some(merged.clone());
-        app.panels[result].dirty = false;
-        app.publish_resolution();
+        app.panels[result].text = "merged\n".into();
+        app.panels[result].dirty = true;
+        assert!(app.save_result(false));
         assert!(resolved.load(Ordering::Relaxed), "written where git asked");
 
         app.panels[result].dirty = true;
@@ -4648,6 +6271,52 @@ mod tests {
         assert!(!resolved.load(Ordering::Relaxed), "not git's file");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_external_git_target_replacement_withdraws_resolution_and_guards_close() {
+        let dir = temp_path("mergetool-external-replacement");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, local, remote) = (dir.join("b"), dir.join("l"), dir.join("r"));
+        std::fs::write(&base, "base\n").unwrap();
+        std::fs::write(&local, "ours\n").unwrap();
+        std::fs::write(&remote, "theirs\n").unwrap();
+        let merged = dir.join("MERGED");
+        let (mut app, resolved) =
+            test_mergetool_app(&[base, local, remote], merged.clone());
+        let result = app.result_panel().unwrap();
+        app.panels[result].text = "resolved text\n".into();
+        app.panels[result].dirty = true;
+        assert!(app.save_result(false));
+        assert!(resolved.load(Ordering::Relaxed));
+
+        std::fs::write(&merged, "external replacement\n").unwrap();
+        app.publish_resolution();
+        assert!(app.merge_unresolved());
+        assert!(app.merge_unresolved_on_disk());
+        assert!(
+            !resolved.load(Ordering::Relaxed),
+            "an externally replaced MERGED file must not keep the success exit state",
+        );
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ctx| app.quit_guard(ctx));
+        assert!(app.quit_guard);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        output.textures_delta.clear();
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[derive(Default)]
@@ -5080,6 +6749,25 @@ mod tests {
         assert!(app.error.is_none());
     }
 
+    #[test]
+    fn explicit_compare_retries_an_exact_failed_render_once() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.panels[0].text = "left\n".into();
+        app.panels[1].text = "right\n".into();
+        app.compared = true;
+        let key = app.current_key();
+        app.failed = Some(key.clone());
+
+        app.schedule(&ctx);
+        assert!(app.in_flight.is_none(), "automatic retries stay suppressed");
+        assert_eq!(app.failed.as_ref(), Some(&key));
+
+        app.compare_now(&ctx);
+        assert_eq!(app.in_flight.as_ref(), Some(&key));
+        assert!(app.failed.is_none());
+    }
+
     /// A panel with hunks in the cache, as if a merge-mode render had landed.
     fn merging_app(base: &str, cand: &str, hunks: Vec<(Hunk, Range<usize>)>) -> App {
         let mut app = test_app();
@@ -5114,9 +6802,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_hunk_controls_belong_to_the_diff_scroll_view() {
+        let mut app = merging_app("a\n", "b\n", vec![(hunk(0..1, 0..1), 0..2)]);
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n");
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.diff_area(ui, &ctx, 8.0),
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+
+        let control = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with("Use B's version"))
+            })
+            .map(|(id, _)| *id)
+            .expect("merge hunk control");
+        let (scroll_id, scroll) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Diff scroll region"))
+            .expect("diff ScrollView");
+        assert_eq!(scroll.role(), egui::accesskit::Role::ScrollView);
+        let mut pending = scroll.children().to_vec();
+        let mut found = false;
+        while let Some(id) = pending.pop() {
+            if id == control {
+                found = true;
+                break;
+            }
+            if let Some((_, node)) = update.nodes.iter().find(|(candidate, _)| *candidate == id) {
+                pending.extend_from_slice(node.children());
+            }
+        }
+        assert!(
+            found,
+            "merge control is outside the diff ScrollView {scroll_id:?} accessibility subtree",
+        );
+    }
+
     /// A take writes the candidate's lines into the result, and says so: without
     /// `edited`, `compare_now` re-reads a saved result from disk and the take is
-    /// silently undone by the next ⌘⏎.
+    /// silently undone by the next ⌘Enter.
     #[test]
     fn taking_a_difference_rewrites_the_result_and_marks_it_unsaved() {
         let ctx = egui::Context::default();
@@ -5292,6 +7038,138 @@ mod tests {
         assert!(app.error.is_some());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "input\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_plain_save_refuses_to_overwrite_an_external_change() {
+        let dir = temp_path("result-external-change");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result.txt");
+
+        let mut app = test_app();
+        assert_eq!(app.alternate_result_save_label(), "Save as…");
+        app.start_result(None);
+        let result = app.result_panel().unwrap();
+        app.panels[result].saved_to = Some(path.clone());
+        app.panels[result].text = "first save\n".into();
+        app.panels[result].dirty = true;
+
+        assert!(app.save_result(false));
+        assert_eq!(
+            app.panels[result].saved_snapshot.as_deref(),
+            Some("first save\n")
+        );
+
+        std::fs::write(&path, "external change\n").unwrap();
+        app.panels[result].text = "later delgui edit\n".into();
+        app.panels[result].dirty = true;
+
+        assert!(!app.save_result(false));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "external change\n"
+        );
+        assert!(app.panels[result].dirty);
+        assert_eq!(
+            app.panels[result].saved_snapshot.as_deref(),
+            Some("first save\n")
+        );
+        let error = app.error.as_deref().expect("conflict explanation");
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("changed outside delgui"));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_externally_replaced_result_is_not_reported_saved_and_guards_close() {
+        let dir = temp_path("result-external-replacement-close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result.txt");
+
+        let mut app = test_app();
+        app.start_result(None);
+        let result = app.result_panel().unwrap();
+        app.panels[result].saved_to = Some(path.clone());
+        app.panels[result].text = "delgui result\n".into();
+        app.panels[result].dirty = true;
+        assert!(app.save_result(false));
+
+        std::fs::write(&path, "external replacement\n").unwrap();
+
+        assert!(app.panel_has_unsaved_content(result));
+        assert_eq!(
+            app.result_identity_view(result).state,
+            "saved file missing or changed"
+        );
+        assert!(!app.save_result(false));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "external replacement\n"
+        );
+        assert_eq!(app.panels[result].text, "delgui result\n");
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ctx| app.quit_guard(ctx));
+        assert!(app.quit_guard);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        output.textures_delta.clear();
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_deleted_result_destination_is_unsaved_and_guards_close() {
+        let dir = temp_path("result-deleted-destination-close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result.txt");
+
+        let mut app = test_app();
+        app.start_result(None);
+        let result = app.result_panel().unwrap();
+        app.panels[result].saved_to = Some(path.clone());
+        app.panels[result].text = "only in delgui now\n".into();
+        app.panels[result].dirty = true;
+        assert!(app.save_result(false));
+
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(app.panel_has_unsaved_content(result));
+        assert_eq!(
+            app.result_identity_view(result).state,
+            "saved file missing or changed"
+        );
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ctx| app.quit_guard(ctx));
+        assert!(app.quit_guard);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert_eq!(app.panels[result].text, "only in delgui now\n");
+        output.textures_delta.clear();
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -5512,6 +7390,55 @@ mod tests {
     }
 
     #[test]
+    fn a_newly_added_panel_scrolls_into_the_minimum_width_viewport() {
+        let mut app = test_app();
+        while app.panels.len() < MAX_PANELS {
+            app.add_panel();
+        }
+        let added = MAX_PANELS - 1;
+        assert_eq!(app.focus_panel, Some(added));
+        assert_eq!(app.reveal_panel, Some(added));
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, 20.0, 24.0);
+        ctx.enable_accesskit();
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(720.0, 480.0));
+        let mut last_update = None;
+        // `scroll_to_me` is resolved when the ScrollArea ends and its offset is
+        // visible on the following pass. A third pass proves the landed state is
+        // stable rather than only protected by egui's newly-focused grace pass.
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(screen_input(screen), |ui| app.panel_row(ui, &ctx));
+            last_update = output.platform_output.accesskit_update.take();
+            output.textures_delta.clear();
+        }
+
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(panel_edit_id(added)));
+        assert!(app.reveal_panel.is_none());
+        let card = app.panel_rects[added];
+        assert!(
+            card.left() >= screen.left() && card.right() <= screen.right(),
+            "new Panel F card {card:?} stayed outside the 720-point viewport {screen:?}",
+        );
+        let update = last_update.expect("AccessKit tree update");
+        let editor = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with("Panel F editor"))
+            })
+            .and_then(|(_, node)| node.bounds())
+            .expect("bounded Panel F editor");
+        assert!(
+            editor.x0 >= f64::from(screen.left()) && editor.x1 <= f64::from(screen.right()),
+            "focused Panel F editor {editor:?} stayed outside the 720-point viewport",
+        );
+    }
+
+    #[test]
     fn a_long_panel_name_leaves_every_header_item_inside_the_card() {
         let mut app = test_app();
         let long_name = format!("{}-implementation.rs", "very-long-component-name".repeat(8));
@@ -5623,6 +7550,43 @@ mod tests {
             !combine.1.is_disabled(),
             "Start empty and panel C were hidden behind a disabled menu"
         );
+        assert!(
+            update.nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::TabList
+                    && node.label() == Some("Comparison candidates")
+            }),
+            "the candidate selector has no tab-list semantics",
+        );
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::Tab)
+                .count(),
+            2,
+            "every non-baseline candidate should be an accessible tab",
+        );
+        let tabs = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::Tab)
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        assert!(
+            tabs.iter().all(|node| node.is_selected().is_some()),
+            "every accessible tab must publish selected or not-selected state",
+        );
+        assert_eq!(
+            tabs.iter()
+                .filter(|node| node.is_selected() == Some(true))
+                .count(),
+            1,
+            "exactly one comparison candidate is selected",
+        );
+        assert!(
+            tabs.iter().all(|node| node.toggled().is_none()),
+            "Tab nodes must not retain Button::selectable's toggled state",
+        );
 
         app.start_result(None);
         let result = app.result_panel().expect("Start empty created a result");
@@ -5632,9 +7596,113 @@ mod tests {
     }
 
     #[test]
+    fn candidate_arrows_move_exactly_once_and_wrap() {
+        fn pass(
+            app: &mut App,
+            ctx: &egui::Context,
+            input: egui::RawInput,
+        ) -> egui::accesskit::TreeUpdate {
+            let mut output = ctx.run_ui(input, |ui| app.pair_strip(ui, ctx));
+            let update = output
+                .platform_output
+                .accesskit_update
+                .take()
+                .expect("AccessKit tree update");
+            output.textures_delta.clear();
+            update
+        }
+
+        let mut app = test_app();
+        while app.panels.len() < 5 {
+            app.add_panel();
+        }
+        for (i, panel) in app.panels.iter_mut().enumerate() {
+            panel.text = format!("panel {i}\n");
+            panel.resniff();
+        }
+        app.reference = 0;
+        app.shown = 1;
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, 20.0, 24.0);
+        ctx.enable_accesskit();
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(720.0, 480.0));
+        let initial = pass(&mut app, &ctx, screen_input(screen));
+        let tab = |prefix: &str| {
+            initial
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Tab
+                        && node
+                            .label()
+                            .is_some_and(|label| label.starts_with(prefix))
+                })
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("candidate tab {prefix}"))
+        };
+        let first = tab("B ·");
+        let second = tab("C ·");
+        let last = tab("E ·");
+
+        let focus = |target| {
+            let mut input = screen_input(screen);
+            input
+                .events
+                .push(egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        target_node: target,
+                        data: None,
+                    },
+                ));
+            input
+        };
+        assert_eq!(pass(&mut app, &ctx, focus(first)).focus, first);
+
+        let arrow_right = || {
+            let mut input = screen_input(screen);
+            input.events.push(egui::Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input
+        };
+        let moved = pass(&mut app, &ctx, arrow_right());
+        assert_eq!(app.shown, 2, "one Right arrow selects the next candidate");
+        assert_eq!(moved.focus, second, "focus must not skip a second tab");
+
+        assert_eq!(pass(&mut app, &ctx, focus(last)).focus, last);
+        let wrapped = pass(&mut app, &ctx, arrow_right());
+        assert_eq!(app.shown, 1, "Right from the last candidate wraps first");
+        assert_eq!(wrapped.focus, first);
+    }
+
+    #[test]
+    fn a_two_panel_pair_consumes_an_unneeded_reveal_request() {
+        let mut app = test_app();
+        app.reveal_pair = Some(app.shown);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
+        let mut output = ctx.run_ui(Default::default(), |ui| app.pair_strip(ui, &ctx));
+        output.textures_delta.clear();
+        assert!(app.reveal_pair.is_none());
+    }
+
+    #[test]
     fn compact_windows_keep_source_and_result_editors_visible() {
-        assert_eq!(source_panel_sizes(600.0), (130.0, 96.0));
-        assert_eq!(source_panel_sizes(900.0), (270.0, 160.0));
+        assert_eq!(source_panel_sizes(600.0), (130.0, 96.0, 130.0));
+        assert_eq!(
+            source_panel_sizes(900.0),
+            (270.0, 160.0, f32::INFINITY)
+        );
         assert_eq!(
             effective_result_placement(700.0, ResultPlacement::Right),
             ResultPlacement::Bottom
@@ -5647,11 +7715,69 @@ mod tests {
         // window height -- 504 under the pair strip on a default 860 window.
         assert_eq!(
             result_panel_sizes(280.0, ResultPlacement::Bottom),
-            (128.0, 128.0)
+            (128.0, 128.0, 152.0)
         );
-        let (default, min) = result_panel_sizes(504.0, ResultPlacement::Bottom);
+        let (default, min, max) = result_panel_sizes(504.0, ResultPlacement::Bottom);
         assert!((default - 226.8).abs() < 0.01, "{default}");
         assert_eq!(min, 150.0);
+        assert_eq!(max, 376.0);
+    }
+
+    #[test]
+    fn compact_maximum_font_result_keeps_actions_and_one_editor_row_visible() {
+        let mut app = test_app();
+        app.panels[0].text = "result\n".into();
+        app.panels[1].text = "candidate\n".into();
+        app.start_result(Some(0));
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, 20.0, 24.0);
+        ctx.enable_accesskit();
+        // A 128-point outer bottom panel leaves 104 points after its symmetric
+        // 12-point frame margins. This is the exact compact floor.
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(696.0, MIN_RESULT_OUTER_HEIGHT - 24.0),
+        );
+        let mut output = ctx.run_ui(screen_input(screen), |ui| app.result_band(ui, &ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update");
+        output.textures_delta.clear();
+
+        for name in ["Save", "Result status and destination"] {
+            let node = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label()
+                        .is_some_and(|label| label == name || label.starts_with(name))
+                })
+                .unwrap_or_else(|| panic!("visible {name}"));
+            let bounds = node.1.bounds().unwrap_or_else(|| panic!("{name} bounds"));
+            assert_inside_screen(screen, bounds, name);
+            assert!(bounds.y1 > bounds.y0, "{name} has no visible height");
+        }
+        let editor = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label()
+                    .is_some_and(|label| label.starts_with("Result editor"))
+            })
+            .expect("visible Result editor")
+            .1
+            .bounds()
+            .expect("Result editor bounds");
+        // TextEdit advertises its full six-row content rectangle inside a
+        // scroll viewport. Only the intersection must be on-screen, and it
+        // must contain at least one complete maximum-scale row.
+        let visible_height = editor.y1.min(f64::from(screen.bottom()))
+            - editor.y0.max(f64::from(screen.top()));
+        assert!(visible_height >= 32.0, "only {visible_height} pt of the result editor is visible");
     }
 
     /// The regression the shares replaced: both defaults used to be constants,
@@ -5674,14 +7800,14 @@ mod tests {
         // The floor is the old compact size, and the minimum never exceeds the
         // default: a band that cannot be shrunk to fit is how a short window
         // loses the diff entirely.
-        let (default, min) = result_panel_sizes(200.0, ResultPlacement::Bottom);
-        assert_eq!((default, min), (128.0, 128.0));
+        let (default, min, max) = result_panel_sizes(200.0, ResultPlacement::Bottom);
+        assert_eq!((default, min, max), (128.0, 128.0, 128.0));
         // A side placement is not a share: it already shows the whole result,
         // and its width comes straight out of the column count delta lays the
         // diff out against.
         assert_eq!(
             result_panel_sizes(5_000.0, ResultPlacement::Right),
-            (440.0, 260.0)
+            (440.0, 260.0, f32::INFINITY)
         );
     }
 
@@ -5713,6 +7839,88 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("Could not read"))
         );
+    }
+
+    #[test]
+    fn a_failed_watched_reload_preserves_the_buffer_but_marks_the_diff_stale() {
+        let dir = temp_path("watch-reload-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("watched.txt");
+        std::fs::write(&path, "before\n").unwrap();
+
+        let mut app = test_app();
+        app.panels[0].text = "reference\n".into();
+        app.panels[1].bind(path.clone()).unwrap();
+        app.panels[1].watch = true;
+        app.compared = true;
+        app.cache.insert(
+            app.shown,
+            Cached {
+                key: app.current_key(),
+                lines: Vec::new(),
+                columns: app.columns,
+                hunks: Vec::new(),
+                problem: None,
+            },
+        );
+        assert!(app.is_fresh());
+        assert!(app.reports_no_differences());
+
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        app.pending_reload = Some(Instant::now() - WATCH_DEBOUNCE);
+        app.tick(&egui::Context::default());
+
+        assert_eq!(app.panels[1].text, "before\n");
+        assert!(app.panels[1].disk_stale);
+        assert!(app.shown_diff().is_some(), "keep the last readable fallback");
+        assert!(!app.is_fresh());
+        assert!(!app.reports_no_differences());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("Could not read"))
+        );
+
+        std::fs::write(&path, "after\n").unwrap();
+        app.reload_panel(1);
+        assert!(!app.panels[1].disk_stale);
+        assert_eq!(app.panels[1].text, "after\n");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_watcher_backend_error_marks_only_affected_followed_snapshots_stale() {
+        let first_dir = temp_path("watch-backend-error-first");
+        let second_dir = temp_path("watch-backend-error-second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("first.txt");
+        let second = second_dir.join("second.txt");
+        std::fs::write(&first, "first\n").unwrap();
+        std::fs::write(&second, "second\n").unwrap();
+
+        let mut app = test_app();
+        app.panels[0].bind(first).unwrap();
+        app.panels[0].watch = true;
+        app.panels[1].bind(second).unwrap();
+        app.panels[1].watch = true;
+
+        app.handle_watch_backend_error("backend failed", std::slice::from_ref(&first_dir));
+
+        assert!(app.panels[0].disk_stale);
+        assert!(!app.panels[1].disk_stale, "an unrelated watch stayed usable");
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("1 followed panel snapshot"))
+        );
+
+        app.handle_watch_backend_error("global backend failure", &[]);
+        assert!(app.panels[1].disk_stale, "a pathless backend error is global");
+
+        std::fs::remove_dir_all(first_dir).ok();
+        std::fs::remove_dir_all(second_dir).ok();
     }
 
     #[test]

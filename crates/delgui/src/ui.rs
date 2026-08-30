@@ -156,7 +156,11 @@ pub fn segmented(ui: &mut Ui, t: &Tokens, items: &mut [(&str, &mut bool)]) -> bo
                     let button = Button::selectable(**on, *label)
                         .corner_radius(CornerRadius::same(5))
                         .min_size(Vec2::new(0.0, 24.0));
-                    if ui.add(button).clicked() {
+                    let response = ui.add(button);
+                    if response.gained_focus() {
+                        response.scroll_to_me(Some(Align::Center));
+                    }
+                    if response.clicked() {
                         **on = !**on;
                         changed = true;
                     }
@@ -252,43 +256,99 @@ pub fn banner(ui: &mut Ui, t: &Tokens, tone: Tone, text: &str) -> bool {
 /// Centred guidance for a region with nothing in it yet. A one-line hint in the
 /// top-left corner reads as a status message; this reads as an invitation.
 pub fn empty_state(ui: &mut Ui, t: &Tokens, title: &str, body: &str, rows: &[(&str, &str)]) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.22);
-        ui.label(
-            RichText::new(title)
-                .text_style(TextStyle::Heading)
-                .color(t.text_primary),
-        );
-        ui.add_space(6.0);
-        ui.label(RichText::new(body).color(t.text_secondary));
-        if !rows.is_empty() {
-            ui.add_space(16.0);
-            // Bounded so `vertical_centered` has something narrower than the
-            // whole card to centre; a full-width grid would sit against the
-            // left edge under a centred heading.
-            ui.scope(|ui| {
-                ui.set_max_width(300.0);
-                egui::Grid::new("empty-rows")
-                    .num_columns(2)
-                    .spacing([14.0, 8.0])
-                    .show(ui, |ui| {
-                        for (key, what) in rows {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    chord(*key)
-                                        .color(t.text_secondary)
-                                        .background_color(t.surface_raised),
-                                );
-                            });
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.label(RichText::new(*what).color(t.text_muted));
-                            });
-                            ui.end_row();
-                        }
-                    });
+    let _ = empty_state_scroll(ui, t, title, body, rows);
+}
+
+const EMPTY_STATE_COMPACT_HEIGHT: f32 = 320.0;
+const EMPTY_STATE_COMPACT_TOP: f32 = 12.0;
+
+fn empty_state_scroll(
+    ui: &mut Ui,
+    t: &Tokens,
+    title: &str,
+    body: &str,
+    rows: &[(&str, &str)],
+) -> egui::scroll_area::ScrollAreaOutput<(egui::Rect, egui::Rect)> {
+    let viewport_height = ui.available_height();
+    let top_space = if viewport_height < EMPTY_STATE_COMPACT_HEIGHT {
+        let progress = ((viewport_height - 120.0)
+            / (EMPTY_STATE_COMPACT_HEIGHT - 120.0))
+            .clamp(0.0, 1.0);
+        egui::lerp(
+            EMPTY_STATE_COMPACT_TOP..=EMPTY_STATE_COMPACT_HEIGHT * 0.22,
+            progress,
+        )
+    } else {
+        viewport_height * 0.22
+    };
+    let content_width = ui.available_width();
+    egui::ScrollArea::vertical()
+        .id_salt("empty-state-scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let accessibility = ui.unique_id();
+            ui.ctx().accesskit_node_builder(accessibility, |node| {
+                node.set_role(egui::accesskit::Role::ScrollView);
+                node.set_label("Getting started");
             });
-        }
-    });
+            // A scroll area's content width follows its children. Hold it open
+            // to the viewport so the existing centred hierarchy stays centred
+            // rather than collapsing to the width of its longest label.
+            ui.set_min_width(content_width);
+            let contents = ui.vertical_centered(|ui| {
+                ui.add_space(top_space);
+                let title = ui
+                    .label(
+                        RichText::new(title)
+                            .text_style(TextStyle::Heading)
+                            .color(t.text_primary),
+                    )
+                    .rect;
+                ui.add_space(6.0);
+                let body = ui
+                    .label(RichText::new(body).color(t.text_secondary))
+                    .rect;
+                if !rows.is_empty() {
+                    ui.add_space(16.0);
+                    // Bounded so `vertical_centered` has something narrower than the
+                    // whole card to centre; a full-width grid would sit against the
+                    // left edge under a centred heading.
+                    ui.scope(|ui| {
+                        ui.set_max_width(300.0);
+                        egui::Grid::new("empty-rows")
+                            .num_columns(2)
+                            .spacing([14.0, 8.0])
+                            .show(ui, |ui| {
+                                for (key, what) in rows {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            chord(*key)
+                                                .color(t.text_secondary)
+                                                .background_color(t.surface_raised),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        ui.label(RichText::new(*what).color(t.text_muted));
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                }
+                (title, body)
+            })
+            .inner;
+            let bounds = ui.clip_rect().intersect(ui.min_rect());
+            ui.ctx().accesskit_node_builder(accessibility, |node| {
+                node.set_bounds(egui::accesskit::Rect {
+                    x0: f64::from(bounds.left()),
+                    y0: f64::from(bounds.top()),
+                    x1: f64::from(bounds.right()),
+                    y1: f64::from(bounds.bottom()),
+                });
+            });
+            contents
+        })
 }
 
 /// The two inputs matched. Deliberately not styled as an error or as emptiness:
@@ -562,6 +622,72 @@ mod tests {
             assert!(response.rect.left() >= left);
             assert!(response.rect.right() <= left + 208.0);
         });
+    }
+
+    #[test]
+    fn short_empty_state_keeps_guidance_visible_and_exposes_vertical_scroll() {
+        let ctx = test_ctx(13.0);
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let t = Tokens::dark();
+            let rows = [
+                ("⌘O", "open a file"),
+                ("⌘V", "paste text"),
+                ("drop", "drop a file"),
+                ("⌘N", "add a panel"),
+                ("⌘/", "show shortcuts"),
+            ];
+            let output = ui
+                .allocate_ui(Vec2::new(420.0, 120.0), |ui| {
+                    let expected_id = ui.id().with(egui::IdSalt::new("empty-state-scroll"));
+                    let output = empty_state_scroll(
+                        ui,
+                        &t,
+                        "Nothing to compare yet",
+                        "Load content into two panels to begin.",
+                        &rows,
+                    );
+                    assert_eq!(output.id, expected_id);
+                    output
+                })
+                .inner;
+
+            assert!(
+                output.content_size.y > output.inner_rect.height(),
+                "short empty state did not create a vertical scroll path: content {}, viewport {}",
+                output.content_size.y,
+                output.inner_rect.height(),
+            );
+            let (title, body) = output.inner;
+            assert!(
+                output.inner_rect.contains_rect(title),
+                "title {title:?} is outside initial viewport {:?}",
+                output.inner_rect,
+            );
+            assert!(
+                output.inner_rect.contains_rect(body),
+                "body {body:?} is outside initial viewport {:?}",
+                output.inner_rect,
+            );
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("AccessKit tree update");
+        let scroll = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::ScrollView
+                    && node.label() == Some("Getting started")
+            })
+            .expect("named empty-state scroll view");
+        let bounds = scroll.1.bounds().expect("empty-state scroll bounds");
+        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+        assert!(bounds.x1 - bounds.x0 <= 420.0);
+        assert!(bounds.y1 - bounds.y0 <= 120.0);
+        output.textures_delta.clear();
     }
 
     #[test]

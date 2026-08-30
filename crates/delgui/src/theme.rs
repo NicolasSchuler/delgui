@@ -321,14 +321,16 @@ pub fn install(ctx: &egui::Context, ui_pt: f32, mono_pt: f32) {
         // platform Reduce Motion preference on all supported backends; a zero
         // duration is the predictable accessible behavior everywhere.
         s.animation_time = 0.0;
+        s.scroll_animation = egui::style::ScrollAnimation::none();
     });
 }
 
 #[cfg(test)]
 mod tests {
-    use egui::Color32;
+    use egui::style::ScrollAnimation;
+    use egui::{Color32, Theme};
 
-    use super::Tokens;
+    use super::{Tokens, install};
 
     fn luminance(color: Color32) -> f64 {
         let linear = |channel: u8| {
@@ -367,6 +369,17 @@ mod tests {
                 let ratio = contrast(tokens.text_muted, background);
                 assert!(ratio >= 4.5, "{name} muted text contrast was {ratio:.3}:1");
             }
+        }
+    }
+
+    #[test]
+    fn install_disables_transition_and_programmatic_scroll_motion() {
+        let ctx = egui::Context::default();
+        install(&ctx, 13.0, 12.5);
+        for theme in [Theme::Dark, Theme::Light] {
+            let style = ctx.style_of(theme);
+            assert_eq!(style.animation_time, 0.0);
+            assert_eq!(style.scroll_animation, ScrollAnimation::none());
         }
     }
 }

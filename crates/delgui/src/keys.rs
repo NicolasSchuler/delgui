@@ -26,6 +26,7 @@ pub enum Action {
     ToggleHelp,
     SaveResult,
     SaveResultAs,
+    TakeCurrentDifference,
     UndoTake,
     RedoTake,
 }
@@ -62,9 +63,10 @@ const CMD_ALT: Modifiers = Modifiers {
 
 /// Chords are written the way the platform writes them.
 ///
-/// It is not only convention: `⏎` exists in macOS's system font and in none of
-/// the fonts egui bundles, so away from macOS it would be drawn as an empty box
-/// -- which is exactly what the primary button used to show.
+/// It is not only convention: `⏎` is absent from the fonts egui bundles, so
+/// relying on platform fallback can draw the primary shortcut as an empty box.
+/// Writing the key name keeps the chord legible with the application's actual
+/// font set on every platform.
 const fn chord(mac: &'static str, elsewhere: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
         mac
@@ -73,9 +75,10 @@ const fn chord(mac: &'static str, elsewhere: &'static str) -> &'static str {
     }
 }
 
-const COMPARE_CHORD: (&str, &str) = ("⌘⏎", "Ctrl+Enter");
+const COMPARE_CHORD: (&str, &str) = ("⌘Enter", "Ctrl+Enter");
 const HELP_CHORD: (&str, &str) = ("⌘/", "Ctrl+/");
 const SAVE_CHORD: (&str, &str) = ("⌘S", "Ctrl+S");
+const TAKE_CHORD: (&str, &str) = ("⌘⇧Enter", "Ctrl+Shift+Enter");
 const SWAP_CHORD: (&str, &str) = ("⌘⇧R", "Ctrl+Shift+R");
 const PASTE_PANEL_CHORD: (&str, &str) = ("⌘⇧V", "Ctrl+Shift+V");
 
@@ -99,6 +102,10 @@ pub fn help_hint() -> &'static str {
 /// a user finishing a merge presses ⌘S and must not get a layout flip.
 pub fn save_label() -> &'static str {
     chord(SAVE_CHORD.0, SAVE_CHORD.1)
+}
+
+pub fn take_label() -> &'static str {
+    chord(TAKE_CHORD.0, TAKE_CHORD.1)
 }
 
 /// The pair strip's Swap button says its own chord, and the binding below is
@@ -313,6 +320,15 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
+            mac: TAKE_CHORD.0,
+            other: TAKE_CHORD.1,
+            describe: "take the current difference into the result",
+            group: "result",
+            action: Action::TakeCurrentDifference,
+            key: Key::Enter,
+            mods: CMD_SHIFT,
+        },
+        Binding {
             mac: "⌘Z",
             other: "Ctrl+Z",
             describe: "undo the last take",
@@ -361,7 +377,24 @@ pub fn bindings() -> Vec<Binding> {
 pub fn pressed(input: &egui::InputState) -> Vec<Action> {
     bindings()
         .into_iter()
-        .filter(|b| input.key_pressed(b.key) && input.modifiers.matches_exact(b.mods))
+        .filter(|b| {
+            if b.action == Action::TakeCurrentDifference {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if *key == b.key && modifiers.matches_exact(b.mods)
+                    )
+                })
+            } else {
+                input.key_pressed(b.key) && input.modifiers.matches_exact(b.mods)
+            }
+        })
         .map(|b| b.action)
         .collect()
 }
@@ -416,13 +449,19 @@ mod tests {
     use super::*;
 
     fn dispatch(key: Key, modifiers: Modifiers) -> Vec<Action> {
-        let ctx = egui::Context::default();
+        dispatch_on(&egui::Context::default(), key, modifiers)
+    }
+
+    fn dispatch_on(ctx: &egui::Context, key: Key, modifiers: Modifiers) -> Vec<Action> {
         let mut input = egui::RawInput::default();
         input.events.push(egui::Event::ModifiersChanged(modifiers));
         input.events.push(egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
+            // Egui derives this from `keys_down`, ignoring what an integration
+            // supplied. A second press on the same Context is therefore the
+            // deterministic way to exercise a repeat event.
             repeat: false,
             modifiers,
         });
@@ -501,6 +540,7 @@ mod tests {
             (Key::W, CMD_SHIFT, Action::RemovePanel),
             (Key::S, CMD, Action::SaveResult),
             (Key::S, CMD_SHIFT, Action::SaveResultAs),
+            (Key::Enter, CMD_SHIFT, Action::TakeCurrentDifference),
             (Key::S, CMD_ALT, Action::ToggleSideBySide),
             (Key::Z, CMD, Action::UndoTake),
             (Key::Z, CMD_SHIFT, Action::RedoTake),
@@ -530,6 +570,28 @@ mod tests {
                 b.describe
             );
         }
+    }
+
+    #[test]
+    fn compare_chord_uses_only_bundled_font_safe_glyphs() {
+        let compare = bindings()
+            .into_iter()
+            .find(|binding| binding.action == Action::Compare)
+            .expect("compare has a binding");
+        assert_eq!(compare.mac, "⌘Enter");
+        assert_eq!(compare.other, "Ctrl+Enter");
+        assert!(!compare.mac.contains('⏎'));
+        assert_eq!(compare_label(), compare.label());
+    }
+
+    #[test]
+    fn holding_the_take_chord_does_not_take_successive_differences() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            dispatch_on(&ctx, Key::Enter, CMD_SHIFT),
+            vec![Action::TakeCurrentDifference]
+        );
+        assert!(dispatch_on(&ctx, Key::Enter, CMD_SHIFT).is_empty());
     }
 
     /// The number keys are a block: one help row, one per selectable panel.

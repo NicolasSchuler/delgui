@@ -283,7 +283,7 @@ Chords are written the way each platform writes them.
 
 | macOS | elsewhere | | |
 | --- | --- | --- | --- |
-| `⌘⏎` | `Ctrl+Enter` | re-render now | Re-read any file-backed panels from disk and render now. This is also how a pair too large to render automatically gets rendered. |
+| `⌘Enter` | `Ctrl+Enter` | re-render now | Re-read any file-backed panels from disk and render now. This is also how a pair too large to render automatically gets rendered. |
 | `⌘F` | `Ctrl+F` | find in the diff | Open the find bar over the rendered diff. A literal, case-sensitive substring scan; Esc closes it. |
 | `⌘G` | `Ctrl+G` | next match | Move to the next find match, wrapping at the end. |
 | `⌘⇧G` | `Ctrl+Shift+G` | previous match | Move to the previous find match, wrapping at the start. |
@@ -306,7 +306,8 @@ Chords are written the way each platform writes them.
 | macOS | elsewhere | | |
 | --- | --- | --- | --- |
 | `⌘S` | `Ctrl+S` | save the result to a file | Write the result to its file. With `--mergetool` this is what writes MERGED and answers Git. |
-| `⌘⇧S` | `Ctrl+Shift+S` | save the result as a new file | Write the result to a new file, chosen in a dialog. |
+| `⌘⇧S` | `Ctrl+Shift+S` | save the result as a new file | Write the result to a file chosen in a dialog. In mergetool mode, choosing a destination other than Git's MERGED target exports a copy without retargeting later saves or marking the conflict resolved; explicitly choosing MERGED writes and resolves it. |
+| `⌘⇧Enter` | `Ctrl+Shift+Enter` | take the current difference into the result | While building a result, take the currently selected difference from the shown candidate into the result. |
 | `⌘Z` | `Ctrl+Z` | undo the last take | Undo the last take. Ignored while a text field has focus, where it is that field's own undo. |
 | `⌘⇧Z` | `Ctrl+Shift+Z` | redo the last take | Redo the last undone take. |
 
@@ -363,7 +364,7 @@ Applied to both children of every render.
 | Subprocess stdout | 128 MiB | |
 | Subprocess stderr | 1 MiB | |
 
-Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Panel contents reach delta as `/dev/fd/N` pipes — no temporary file is ever written, and the only thing in the app that writes a file is an explicit Save.
+Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.
 
 ---
 

@@ -7,16 +7,16 @@
 [![Rust 1.87+](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](Cargo.toml)
 [![requires delta ≥ 0.18](https://img.shields.io/badge/requires-delta%20%E2%89%A5%200.18-green.svg)](https://github.com/dandavison/delta)
 
-Two or more editable panels. Paste into both, press <kbd>⌘</kbd><kbd>⏎</kbd>, and get delta's
+Two or more editable panels. Paste into both, press <kbd>⌘</kbd><kbd>Enter</kbd>, and get delta's
 real output — same syntax highlighting, same word-level diff, same side-by-side layout as in
 your terminal. Rendering is done by the actual `delta` binary, so it honours your `[delta]`
 gitconfig section.
 
 The gap it fills: delta assumes both sides already exist as paths. When they live in a
 clipboard, a browser, or a log viewer, the workarounds are temp files, process substitution,
-or a web diff tool you cannot paste confidential text into. delgui writes no temp files —
-panel contents reach delta over pipes — and the only thing in the app that ever writes to disk
-is an explicit **Save**.
+or a web diff tool you cannot paste confidential text into. Comparison inputs reach delta over
+pipes, without temporary files. Only an explicit **Save** writes result contents to disk;
+preferences and window geometry are persisted separately.
 
 ![delgui comparing two Rust files side by side](docs/images/delgui.png)
 
@@ -151,8 +151,9 @@ change is its own difference. It has to be: at git's default of three,
 `examples/config_before.rs` and `config_after.rs` — thirteen lines with four separate changes —
 come back as a *single* hunk, which is one button for the whole file.
 
-Takes are undoable (<kbd>⌘Z</kbd> outside a text field), and a take that no longer fits the
-result is refused rather than guessed at.
+Take the current difference with <kbd>⌘</kbd><kbd>⇧</kbd><kbd>Enter</kbd> or its button. Takes are
+undoable (<kbd>⌘Z</kbd> outside a text field), and a take that no longer fits the result is refused
+rather than guessed at.
 
 ## Git integration
 
@@ -196,7 +197,7 @@ both-sides-added conflict and must not be filled in by "the first empty panel".
 | --- | --- |
 | <kbd>⌘O</kbd> | open a file in the shown panel |
 | <kbd>⌘W</kbd> | close the window, with an unsaved-content guard |
-| <kbd>⌘⏎</kbd> | re-render now (re-reads files from disk first) |
+| <kbd>⌘Enter</kbd> | re-render now (re-reads files from disk first) |
 | <kbd>⌘F</kbd> · <kbd>⌘G</kbd> · <kbd>⌘⇧G</kbd> | find in the diff · next match · previous match |
 | <kbd>⌘⌥↓</kbd> · <kbd>⌘⌥↑</kbd> | next difference · previous difference |
 | <kbd>⌘N</kbd> · <kbd>⌘⇧W</kbd> | add a panel · remove the shown panel |
@@ -204,6 +205,7 @@ both-sides-added conflict and must not be filled in by "the first empty panel".
 | <kbd>⌘R</kbd> · <kbd>⌘⇧R</kbd> | make the shown panel the baseline · swap the two sides |
 | <kbd>⌘1</kbd>…<kbd>⌘6</kbd> | show that panel's diff |
 | <kbd>⌘S</kbd> · <kbd>⌘⇧S</kbd> | save the result · save it as a new file |
+| <kbd>⌘⇧Enter</kbd> | take the current difference into the result |
 | <kbd>⌘Z</kbd> · <kbd>⌘⇧Z</kbd> | undo · redo the last take (only outside a text field) |
 | <kbd>⌘⌥S</kbd> · <kbd>⌘L</kbd> · <kbd>⌘\\</kbd> | side by side · line numbers · wrap |
 | <kbd>⌘,</kbd> · <kbd>⌘/</kbd> | settings · show this list |
@@ -239,7 +241,7 @@ directory — `GIT_CONFIG_GLOBAL` does not work, delta ignores it.
 result. The `/dev/fd/N` operands name private in-memory panel snapshots, so the display is
 explanatory rather than a directly runnable shell command.
 
-Preferences are remembered; panel contents never are.
+Preferences and window geometry are remembered; panel contents never are.
 
 ## Development
 

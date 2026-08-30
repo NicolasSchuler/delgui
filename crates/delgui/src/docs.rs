@@ -105,7 +105,12 @@ fn describe_action(action: Action) -> &'static str {
         Action::SaveResult => {
             "Write the result to its file. With `--mergetool` this is what writes MERGED and answers Git."
         }
-        Action::SaveResultAs => "Write the result to a new file, chosen in a dialog.",
+        Action::SaveResultAs => {
+            "Write the result to a file chosen in a dialog. In mergetool mode, choosing a destination other than Git's MERGED target exports a copy without retargeting later saves or marking the conflict resolved; explicitly choosing MERGED writes and resolves it."
+        }
+        Action::TakeCurrentDifference => {
+            "While building a result, take the currently selected difference from the shown candidate into the result."
+        }
         Action::UndoTake => {
             "Undo the last take. Ignored while a text field has focus, where it is that field's own undo."
         }
@@ -820,7 +825,7 @@ pub fn reference() -> String {
         bytes(PROCESS_LIMITS.stderr_bytes)
     );
     d.push('\n');
-    d.push_str("Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Panel contents reach delta as `/dev/fd/N` pipes — no temporary file is ever written, and the only thing in the app that writes a file is an explicit Save.\n\n");
+    d.push_str("Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.\n\n");
 
     // ---- Colophon ----------------------------------------------------------
     let _ = write!(

@@ -10,7 +10,7 @@ use delgui_core::ansi::{self, Color, Line, Style};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Color32, Context, CursorIcon, Event, EventFilter, FontId, Galley, Id, Key, Modifiers, OpenUrl,
-    Rect, Response, Sense, Stroke, Ui, Vec2, Widget, WidgetInfo, WidgetType,
+    Rect, Response, Sense, Stroke, Ui, UiBuilder, Vec2, Widget, WidgetInfo, WidgetType,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -267,6 +267,21 @@ pub fn diff_region(ui: &mut Ui) -> Response {
     );
     response
         .widget_info(|| WidgetInfo::labeled(WidgetType::Other, ui.is_enabled(), DIFF_SCROLL_LABEL));
+    // `WidgetType::Other` is the right egui event metadata for this custom
+    // focus target, but egui maps it to AccessKit's `Role::Unknown`. Keep the
+    // metadata and explicitly publish the semantic role screen readers need.
+    // `show_viewport` makes this the parent of the virtualized chunk nodes after
+    // they have registered, while retaining the stable enclosing region above.
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::ScrollView);
+        node.set_label(DIFF_SCROLL_LABEL);
+        node.set_bounds(egui::accesskit::Rect {
+            x0: f64::from(response.rect.left()),
+            y0: f64::from(response.rect.top()),
+            x1: f64::from(response.rect.right()),
+            y1: f64::from(response.rect.bottom()),
+        });
+    });
 
     if response.has_focus() {
         // Without the lock a bare arrow key hands focus to a neighbouring
@@ -559,18 +574,21 @@ impl PreparedLayout {
         } else {
             Mount::Culled
         };
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let mut response: Option<Response> = None;
-            for chunk in &self.chunks {
-                let chunk_response = ui.add(chunk.label(self.columns, column_width, mount));
-                response = Some(match response {
-                    Some(current) => current.union(chunk_response),
-                    None => chunk_response,
-                });
-            }
-            response.unwrap_or_else(|| ui.allocate_response(Vec2::ZERO, Sense::hover()))
-        })
+        ui.scope_builder(
+            UiBuilder::new().accessibility_parent(diff_region_id()),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let mut response: Option<Response> = None;
+                for chunk in &self.chunks {
+                    let chunk_response = ui.add(chunk.label(self.columns, column_width, mount));
+                    response = Some(match response {
+                        Some(current) => current.union(chunk_response),
+                        None => chunk_response,
+                    });
+                }
+                response.unwrap_or_else(|| ui.allocate_response(Vec2::ZERO, Sense::hover()))
+            },
+        )
         .inner
     }
 
@@ -692,15 +710,18 @@ impl PreparedLayout {
         }
 
         if accesskit_active {
-            // `diff_region` is the keyboard target and the first child. Chunk
-            // builders created above were added automatically, but replacing
-            // the list here both removes duplicates and retains unchanged
-            // off-screen nodes that were deliberately absent from this update.
-            let children = std::iter::once(diff_region_id().accesskit_id())
-                .chain((0..self.chunks.len()).map(|index| chunk_id(ui, index).accesskit_id()))
+            // Chunk builders created above initially attach to the enclosing Ui.
+            // Re-parent them under the semantic scroll view, then leave that
+            // scroll view as the region's only child. Explicit child lists also
+            // retain unchanged off-screen nodes that were deliberately absent
+            // from this incremental update.
+            let chunks = (0..self.chunks.len())
+                .map(|index| chunk_id(ui, index).accesskit_id())
                 .collect::<Vec<_>>();
+            ui.ctx()
+                .accesskit_node_builder(diff_region_id(), |node| node.set_children(chunks));
             ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                node.set_children(children);
+                node.set_children(vec![diff_region_id().accesskit_id()]);
             });
             ui.data_mut(|data| {
                 data.insert_temp(
@@ -1444,6 +1465,7 @@ mod tests {
     #[test]
     fn the_diff_is_one_tab_stop_however_many_chunks_it_has() {
         let ctx = Context::default();
+        ctx.enable_accesskit();
         let rows = numbered_rows(PREPARED_CHUNK_ROWS * 8);
         let mut sentinel = None;
         let pass = |input: RawInput, sentinel: &mut Option<Id>| {
@@ -1455,20 +1477,29 @@ mod tests {
                 *sentinel = Some(ui.button("after").id);
             });
             output.textures_delta.clear();
+            output.platform_output.accesskit_update
         };
 
-        pass(small_screen(), &mut sentinel);
-        pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
+        let initial = pass(small_screen(), &mut sentinel).expect("AccessKit tree update");
+        let scroll_target = initial
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(DIFF_SCROLL_LABEL))
+            .expect("named diff scroll target");
+        assert_eq!(scroll_target.1.role(), accesskit::Role::ScrollView);
+
+        let _ = pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
         assert_eq!(ctx.memory(|m| m.focused()), Some(diff_region_id()));
         // The sentinel is what pins *exactly one* tab stop: were the chunks
         // still focusable, this Tab would land on chunk 0 instead.
-        pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
+        let _ = pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
         assert_eq!(ctx.memory(|m| m.focused()), sentinel);
     }
 
     #[test]
     fn the_diff_is_one_tab_stop_in_merge_mode_too() {
         let ctx = Context::default();
+        ctx.enable_accesskit();
         let hunks = (0..4)
             .map(|hunk| numbered_rows(6 + hunk))
             .collect::<Vec<_>>();
@@ -1485,12 +1516,41 @@ mod tests {
                 *sentinel = Some(ui.button("after").id);
             });
             output.textures_delta.clear();
+            output.platform_output.accesskit_update
         };
 
-        pass(small_screen(), &mut sentinel);
-        pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
+        let initial = pass(small_screen(), &mut sentinel).expect("AccessKit tree update");
+        let scroll = initial
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(DIFF_SCROLL_LABEL))
+            .expect("the merge diff scroll view");
+        let owned = scroll
+            .1
+            .children()
+            .iter()
+            .filter_map(|id| initial.nodes.iter().find(|(node_id, _)| node_id == id))
+            .flat_map(|(_, node)| node.children())
+            .copied()
+            .collect::<Vec<_>>();
+        let row_chunks = initial
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == accesskit::Role::Label
+                    && node.value().is_some_and(|value| value.starts_with("row "))
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(row_chunks.len(), hunks.len());
+        assert!(
+            row_chunks.iter().all(|id| owned.contains(id)),
+            "merge-mode chunk labels are outside the diff scroll view",
+        );
+
+        let _ = pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
         assert_eq!(ctx.memory(|m| m.focused()), Some(diff_region_id()));
-        pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
+        let _ = pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
         assert_eq!(ctx.memory(|m| m.focused()), sentinel);
     }
 
@@ -1747,7 +1807,14 @@ mod tests {
             .iter()
             .find(|(_, node)| node.label() == Some(RENDERED_DIFF_LABEL))
             .expect("the region node");
-        let text = region
+        let scroll = region
+            .1
+            .children()
+            .iter()
+            .find_map(|id| update.nodes.iter().find(|(node_id, _)| node_id == id))
+            .filter(|(_, node)| node.role() == accesskit::Role::ScrollView)
+            .expect("the region's scroll view");
+        let text = scroll
             .1
             .children()
             .iter()
@@ -1915,7 +1982,12 @@ mod tests {
         };
         let region = named(RENDERED_DIFF_LABEL);
         assert_eq!(region.len(), 1, "the region is named exactly once");
-        assert_eq!(named(DIFF_SCROLL_LABEL).len(), 1);
+        let scroll = named(DIFF_SCROLL_LABEL);
+        assert_eq!(scroll.len(), 1);
+        assert_eq!(scroll[0].1.role(), accesskit::Role::ScrollView);
+        let bounds = scroll[0].1.bounds().expect("scroll view bounds");
+        assert_eq!((bounds.x0, bounds.y0), (0.0, 0.0));
+        assert_eq!((bounds.x1, bounds.y1), (800.0, 400.0));
         assert!(
             update
                 .nodes
@@ -1931,9 +2003,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1.value(), Some(secret));
+        assert_eq!(region[0].1.children(), &[scroll[0].0]);
         assert!(
-            region[0].1.children().contains(&chunks[0].0),
-            "the chunks hang off the region, not off the root window"
+            scroll[0].1.children().contains(&chunks[0].0),
+            "the semantic scroll view does not own its rendered chunks"
         );
     }
 
@@ -1991,10 +2064,16 @@ mod tests {
             .iter()
             .find(|(_, node)| node.label() == Some(RENDERED_DIFF_LABEL))
             .expect("the retained diff region");
+        let scroll = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(DIFF_SCROLL_LABEL))
+            .expect("the retained diff scroll view");
+        assert_eq!(region.1.children(), &[scroll.0]);
         assert_eq!(
-            region.1.children().len(),
-            prepared.chunk_count() + 1,
-            "off-screen chunks stopped being children of the diff region",
+            scroll.1.children().len(),
+            prepared.chunk_count(),
+            "off-screen chunks stopped being children of the diff scroll view",
         );
     }
 
