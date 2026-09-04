@@ -275,7 +275,7 @@ Chords are written the way each platform writes them.
 
 | macOS | elsewhere | | |
 | --- | --- | --- | --- |
-| `⌘O` | `Ctrl+O` | open a file in the shown panel | File picker for the panel whose diff is on screen. |
+| `⌘O` | `Ctrl+O` | open a file in the shown input panel | File picker for the input panel whose diff is on screen. If the result is selected, choose an input panel first; opening a file never replaces the result. |
 | `⌘W` | `Ctrl+W` | close the window | Close the window. Unsaved panel or result text is confirmed first. |
 | `⌘Q` | `Ctrl+Q` | quit | Quit, confirming unsaved panel or result text first — the same guarded path as closing the window. On macOS the application menu's Quit item claims this chord; delgui repoints that item from `terminate:`, which tears the process down without asking any window to close, at the window itself, so that both routes reach the confirmation. |
 
@@ -355,7 +355,7 @@ Applied to both children of every render.
 | --- | --- | --- |
 | Panels | 6 | delta is two-way; more panels means more pairs against one baseline, and past a handful the columns are too narrow to read. |
 | Panel size | 4 MB | Beyond this delta is the bottleneck: about 0.8 s at 2 MB, and it produces roughly seven times its input in ANSI. Refused rather than hung. |
-| Auto-render ceiling | 1 MB | Above this, editing stops re-rendering by itself and waits to be asked. |
+| Auto-render ceiling | 1 MB | Above this combined input size, initial comparison and edits wait for Compare. |
 | Typing debounce | 300 ms | |
 | Resize debounce | 120 ms | |
 | Watch debounce | 180 ms | A save is rarely one filesystem event, and a file mid-write reads as truncated. |

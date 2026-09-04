@@ -223,20 +223,39 @@ pub fn banner(ui: &mut Ui, t: &Tokens, tone: Tone, text: &str) -> bool {
         Tone::Warning => (t.surface_raised, t.warning, t.warning),
     };
     let mut dismissed = false;
+    // A path and an OS error can be much taller than a tiled window's diff.
+    // Keep that explanation scrollable and leave room for the comparison.
+    let message_height = (ui.available_height() * 0.5 - 16.0)
+        .max(ui.text_style_height(&TextStyle::Body))
+        .min(ui.text_style_height(&TextStyle::Body) * 3.0);
     let response = Frame::new()
         .fill(fill)
         .stroke(Stroke::new(1.0, edge))
         .corner_radius(radius::CONTROL)
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.add(egui::Label::new(RichText::new(text).color(fg)).wrap());
-                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+            egui::containers::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("message-details")
+                        .min_scrolled_height(0.0)
+                        .max_height(message_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                                node.set_role(egui::accesskit::Role::ScrollView);
+                                node.set_label("Message details");
+                            });
+                            ui.add(egui::Label::new(RichText::new(text).color(fg)).wrap());
+                        });
+                },
+                |ui| {
                     dismissed = icon(ui, "×", "Dismiss message", Some(fg))
                         .on_hover_text("Dismiss message")
                         .clicked();
-                });
-            });
+                },
+            );
         })
         .response;
     response.ctx.accesskit_node_builder(response.id, |node| {
@@ -605,6 +624,38 @@ mod tests {
         ctx.set_fonts(crate::fonts::definitions(None, None, None));
         crate::theme::install(&ctx, ui_pt, 12.5);
         ctx
+    }
+
+    #[test]
+    fn long_error_keeps_dismiss_and_the_comparison_inside_a_short_view() {
+        for ui_pt in [13.0, 20.0] {
+            let ctx = test_ctx(ui_pt);
+            ctx.enable_accesskit();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(688.0, 120.0));
+            let message = format!(
+                "Panel A could not reload: Could not read /tmp/{}: No such file. The previous snapshot is still shown; retry Reload from disk when the file is available.",
+                "long-directory-name/".repeat(18),
+            );
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                }, |ui| {
+                    banner(ui, &Tokens::light(), Tone::Error, &message);
+                    let diff = ui.label("Comparison remains reachable");
+                    assert!(screen.contains_rect(diff.rect), "comparison clipped: {:?}", diff.rect);
+                    assert!(diff.rect.top() <= 72.0, "message exceeded its half-view budget: {:?}", diff.rect);
+                });
+                let update = output.platform_output.accesskit_update.as_ref().unwrap();
+                let dismiss = update.nodes.iter().find(|(_, n)| n.label() == Some("Dismiss message"))
+                    .expect("dismiss action").1.bounds().unwrap();
+                assert!(dismiss.x0 >= 0.0 && dismiss.x1 <= 688.0);
+                assert!(dismiss.y0 >= 0.0 && dismiss.y1 <= 120.0);
+                assert!(update.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::ScrollView
+                    && n.label() == Some("Message details")));
+                output.textures_delta.clear();
+            }
+        }
     }
 
     #[test]

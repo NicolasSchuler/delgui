@@ -91,7 +91,7 @@ change rather than a packaging one.
 
 ```sh
 delgui                      # two empty panels, ready to paste into
-delgui a.rs b.rs            # prefilled, compares immediately
+delgui a.rs b.rs            # prefilled; small pairs compare immediately
 delgui --paste file.rs      # clipboard into panel A, file into panel B
 delgui --watch a.rs b.rs    # follow both files as they change on disk
 delgui --combine a.rs b.rs  # start a result you can take differences into
@@ -106,6 +106,8 @@ cargo run --release -- examples/config_before.rs examples/config_after.rs
 
 Files can also be dragged onto any panel — drop several at once and they fill consecutive
 panels, each outlined while you hover.
+Explicit file pairs compare immediately even when one or both files are empty, up to
+1 MB of combined input. Larger pairs wait for **Compare** or <kbd>⌘Enter</kbd>.
 
 ## Panels
 
@@ -140,6 +142,8 @@ The result is the baseline while you build it, so every diff on screen reads *my
 a candidate*, and each difference carries one button that writes the candidate's version into
 it. Switch candidate with the tabs, take from as many as you like, and type into the result for
 anything no panel supplies. Then **Copy**, or **Save** it to a new file.
+Open and drop target input panels; the result remains protected even when you select it
+for an ordinary comparison after **Stop building**.
 
 The result sits along the bottom by default, which costs the diff no width — delta lays out
 against a column count, and side by side is the widest thing in the window. Its ⋯ menu moves it
@@ -195,7 +199,7 @@ both-sides-added conflict and must not be filled in by "the first empty panel".
 
 | | |
 | --- | --- |
-| <kbd>⌘O</kbd> | open a file in the shown panel |
+| <kbd>⌘O</kbd> | open a file in the shown input panel |
 | <kbd>⌘W</kbd> | close the window, with an unsaved-content guard |
 | <kbd>⌘Enter</kbd> | re-render now (re-reads files from disk first) |
 | <kbd>⌘F</kbd> · <kbd>⌘G</kbd> · <kbd>⌘⇧G</kbd> | find in the diff · next match · previous match |

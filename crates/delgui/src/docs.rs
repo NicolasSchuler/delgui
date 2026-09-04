@@ -66,7 +66,7 @@ fn describe_flag(flag: &str) -> Option<(&'static str, &'static str)> {
 /// compiles.
 fn describe_action(action: Action) -> &'static str {
     match action {
-        Action::OpenFile => "File picker for the panel whose diff is on screen.",
+        Action::OpenFile => "File picker for the input panel whose diff is on screen. If the result is selected, choose an input panel first; opening a file never replaces the result.",
         Action::CloseWindow => "Close the window. Unsaved panel or result text is confirmed first.",
         Action::Quit => {
             "Quit, confirming unsaved panel or result text first — the same guarded path as closing the window. On macOS the application menu's Quit item claims this chord; delgui repoints that item from `terminate:`, which tears the process down without asking any window to close, at the window itself, so that both routes reach the confirmation."
@@ -785,7 +785,7 @@ pub fn reference() -> String {
     );
     let _ = writeln!(
         d,
-        "| Auto-render ceiling | {} | Above this, editing stops re-rendering by itself and waits to be asked. |",
+        "| Auto-render ceiling | {} | Above this combined input size, initial comparison and edits wait for Compare. |",
         bytes(app::AUTO_RENDER_BYTES)
     );
     let _ = writeln!(

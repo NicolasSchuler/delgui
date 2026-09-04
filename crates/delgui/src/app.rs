@@ -852,7 +852,9 @@ impl App {
         for p in panels.iter_mut() {
             p.resniff();
         }
-        let compared = panels.iter().take(2).all(|p| !p.text.is_empty());
+        // An explicitly opened empty file is still an input. Only untouched
+        // paste slots wait for the first comparison request.
+        let compared = panels.iter().take(2).all(|p| !p.is_empty());
         let themes = delta.syntax_themes();
         let syntax_theme_reset = settings.sanitise_syntax_theme(&themes);
         let gitconfig = config::discover(None);
@@ -1994,7 +1996,21 @@ impl App {
 
     // ---- files -----------------------------------------------------------
 
+    fn can_open_in_panel(&mut self, i: usize) -> bool {
+        if self.panels[i].result {
+            self.notice = Some(
+                "Open files in an input panel. Select an input's comparison tab, or add a panel, then open the file."
+                    .into(),
+            );
+            return false;
+        }
+        true
+    }
+
     fn open_into(&mut self, i: usize, path: PathBuf) {
+        if !self.can_open_in_panel(i) {
+            return;
+        }
         match self.panels[i].bind(path) {
             Ok(()) => {
                 self.cache.remove(&i);
@@ -2008,6 +2024,9 @@ impl App {
     }
 
     fn choose_file_for_panel(&mut self, i: usize) {
+        if !self.can_open_in_panel(i) {
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.request_destructive(DestructiveAction::LoadFiles(vec![(i, path)]));
         }
@@ -2206,16 +2225,33 @@ impl App {
         }
     }
 
-    fn handle_keys(&mut self, ctx: &egui::Context) {
+    fn capture_keys(&self, ctx: &egui::Context) -> Vec<Action> {
         if self.modal_active() {
-            return;
+            return Vec::new();
         }
         // egui's own undo fires only for the field that has focus, so ⌘Z over
         // the diff does nothing at all -- which is exactly where it gets pressed
         // after a take. Claiming it there and nowhere else is what keeps the two
         // undo histories from fighting over one buffer.
         let typing = ctx.text_edit_focused();
-        for action in ctx.input(keys::pressed) {
+        let actions: Vec<_> = ctx.input(keys::pressed).into_iter().filter(|action| {
+            !(typing && matches!(action, Action::UndoTake | Action::RedoTake))
+        }).collect();
+        for &action in &actions {
+            ctx.input_mut(|input| keys::consume(input, action));
+        }
+        // Held Take is intentionally absent from actions, but its repeated
+        // Enter must not activate the focused widget either.
+        ctx.input_mut(|input| keys::consume(input, Action::TakeCurrentDifference));
+        actions
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
+        if self.modal_active() {
+            return;
+        }
+        let typing = ctx.text_edit_focused();
+        for action in actions {
             match action {
                 Action::OpenFile => self.choose_file_for_panel(self.shown),
                 // One window, so quitting and closing it are the same request.
@@ -2469,7 +2505,7 @@ impl App {
         let t = ui::tokens(ui);
         let ready = {
             let (a, b) = self.pair();
-            !self.panels[a].text.is_empty() || !self.panels[b].text.is_empty()
+            !self.panels[a].is_empty() || !self.panels[b].is_empty()
         };
         let busy = self.in_flight.is_some();
         let label = if busy { "Rendering…" } else { "Compare" };
@@ -2483,9 +2519,10 @@ impl App {
             .spacing()
             .interact_size
             .y
-            // The segmented rail adds a two-point frame margin on both sides
-            // around buttons whose own height is body text plus padding.
-            .max(ui.text_style_height(&TextStyle::Body) + 16.0);
+            .max(ui.text_style_height(&TextStyle::Body) + 2.0 * ui.spacing().button_padding.y)
+            // The mode rail adds two points of margin and one of border on
+            // each side. Reserve it before laying out any toolbar control.
+            + 6.0;
 
         // The fixed utilities are laid out first and reserve their width. The
         // modes own the remaining width and scroll only if a large interface
@@ -2499,7 +2536,9 @@ impl App {
             .show(
                 ui,
                 |ui| {
-                    ui.horizontal(|ui| {
+                    // Ordinary horizontal starts at interact_size.y and cannot
+                    // recenter earlier widgets when a later frame is taller.
+                    ui.horizontal_centered(|ui| {
                         compare = ui::primary(
                             ui,
                             &t,
@@ -2516,6 +2555,7 @@ impl App {
                                     node.set_role(egui::accesskit::Role::ScrollView);
                                     node.set_label("View modes");
                                 });
+                                ui.spacing_mut().interact_size.y = strip_height - 6.0;
                                 view_changed = ui::segmented(
                                     ui,
                                     &t,
@@ -2592,11 +2632,15 @@ impl App {
         let reveal_target = self.reveal_panel.filter(|target| inputs.contains(target));
         let mut panel_revealed = self.reveal_panel.is_some() && reveal_target.is_none();
         let card_width = panel_card_width(ui.available_width(), inputs.len());
-        let row_height = ui.available_height();
         egui::ScrollArea::horizontal()
             .id_salt("input-panels")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // The horizontal scrollbar reserves height, even while
+                // floating. Measuring outside the scroll area made each card
+                // six points too tall and grew the remembered source split
+                // by another six points on every frame with many panels.
+                let row_height = ui.available_height();
                 ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
                     node.set_role(egui::accesskit::Role::ScrollView);
                     node.set_label("Input panels");
@@ -2680,30 +2724,52 @@ impl App {
                                         None => {}
                                     }
                                     self.language_chip(ui, i, &t);
-                                    if let Some(detail) = detail {
-                                        ui.label(ui::small(detail).color(t.text_muted));
-                                    }
-                                    if disk_stale {
-                                        ui.label(ui::micro("reload failed").color(t.danger))
-                                            .on_hover_text(
-                                                "The file could not be reloaded. The previous snapshot is still here; Reload from disk retries it.",
-                                            );
-                                    }
-                                    if follow_paused {
-                                        ui.label(ui::micro("follow paused").color(t.warning))
-                                            .on_hover_text(
-                                                "Following is paused while this panel has edits, so a disk change cannot overwrite them.",
-                                            );
+                                    let mut metadata = Vec::new();
+                                    if is_ref {
+                                        metadata.push((ui::micro("baseline").color(t.accent), ""));
                                     }
                                     if edited {
-                                        ui.label(ui::micro("edited").color(t.warning))
-                                            .on_hover_text(
-                                                "The text here no longer matches the file. \
-                                                 What you see is what gets compared.",
-                                            );
+                                        metadata.push((ui::micro("edited").color(t.warning),
+                                            "The text here no longer matches the file. What you see is what gets compared."));
                                     }
-                                    if is_ref {
-                                        ui.label(ui::micro("baseline").color(t.accent));
+                                    if follow_paused {
+                                        metadata.push((ui::micro("follow paused").color(t.warning),
+                                            "Following is paused while this panel has edits, so a disk change cannot overwrite them."));
+                                    }
+                                    if disk_stale {
+                                        metadata.push((ui::micro("reload failed").color(t.danger),
+                                            "The file could not be reloaded. The previous snapshot is still here; Reload from disk retries it."));
+                                    }
+                                    if let Some(detail) = detail {
+                                        metadata.push((ui::small(detail).color(t.text_muted), ""));
+                                    }
+                                    if !metadata.is_empty() {
+                                        let metadata: Vec<_> = metadata.into_iter().map(|(text, hint)| {
+                                            (egui::WidgetText::from(text).into_galley(
+                                                ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, TextStyle::Body,
+                                            ), hint)
+                                        }).collect();
+                                        let natural_width = metadata.iter().map(|(text, _)| text.size().x).sum::<f32>()
+                                            + ui.spacing().item_spacing.x * (metadata.len() - 1) as f32;
+                                        let width = natural_width.min(ui.available_width()).max(1.0);
+                                        ui.allocate_ui_with_layout(Vec2::new(width, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                                            // Keep the panel letter and menu fixed even when
+                                            // failure/edited/follow states need more width.
+                                            egui::ScrollArea::horizontal()
+                                                .id_salt(("panel-metadata", i))
+                                                .max_width(width)
+                                                .auto_shrink([true, true])
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        for (text, hint) in metadata {
+                                                            let response = ui.add(egui::Label::new(text).extend());
+                                                            if !hint.is_empty() {
+                                                                response.on_hover_text(hint);
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                        });
                                     }
 
                                     // The nested left-to-right box keeps the
@@ -3415,6 +3481,8 @@ impl App {
         // pending move so a chord and a button click go through one path.
         let mut move_hunk = std::mem::take(&mut self.pending_hunk_move);
         let mut move_find = std::mem::take(&mut self.pending_find_move);
+        let mut find_row = None;
+        let mut find_offset = None;
         let mut take = None;
         let mut boxes = Vec::new();
         // Whether the diff owns the keyboard, learned inside the scroll area --
@@ -3428,7 +3496,6 @@ impl App {
             // From the cache, not from `prepared`: the per-hunk layouts exist
             // only while merging, and the count is what every render knows.
             let hunk_count = self.cache.get(&self.shown).map_or(0, |c| c.hunks.len());
-            let find_lines = prepared.whole.matching_rows(&self.find_query);
             let mut close_find = false;
             let mut copy = false;
             let hunk_cursor = self.hunk_cursor;
@@ -3549,6 +3616,10 @@ impl App {
                         self.find_cursor = 0;
                         self.find_jump = true;
                     }
+                    // TextEdit has now applied this frame's input. Searching
+                    // earlier jumped to the previous query's first match and
+                    // consumed the request before the new matches existed.
+                    let find_lines = prepared.whole.matching_rows(&self.find_query);
                     if ui::ghost(ui, "Previous").clicked() {
                         move_find = -1;
                     }
@@ -3556,6 +3627,14 @@ impl App {
                         || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
                     {
                         move_find = 1;
+                    }
+                    if self.find_jump && !find_lines.is_empty() {
+                        self.find_cursor = 0;
+                        find_row = Some(find_lines[0]);
+                        self.find_jump = false;
+                    } else if move_find != 0 && !find_lines.is_empty() {
+                        self.find_cursor = moved_cursor(self.find_cursor, find_lines.len(), move_find);
+                        find_row = Some(find_lines[self.find_cursor]);
                     }
                     if find_lines.is_empty() {
                         ui.label(
@@ -3589,14 +3668,6 @@ impl App {
                 if let Some((top, _)) = self.hunk_boxes.get(self.hunk_cursor) {
                     self.restore_offset = Some(*top);
                 }
-            }
-            if self.find_jump && !find_lines.is_empty() {
-                self.find_cursor = 0;
-                self.restore_offset = Some(find_lines[0] as f32 * line_height);
-                self.find_jump = false;
-            } else if move_find != 0 && !find_lines.is_empty() {
-                self.find_cursor = moved_cursor(self.find_cursor, find_lines.len(), move_find);
-                self.restore_offset = Some(find_lines[self.find_cursor] as f32 * line_height);
             }
             if close_find {
                 self.show_find = false;
@@ -3641,6 +3712,7 @@ impl App {
                             focused = render::diff_region(ui).has_focus();
                             if !merging || c.hunks.is_empty() {
                                 prepared.whole.show_viewport(ui, viewport, glyph);
+                                find_offset = find_row.map(|row| row as f32 * line_height);
                                 // One rendered line is one laid-out row --
                                 // delta does the wrapping, and `Extend` stops
                                 // egui redoing it -- so where a hunk was drawn
@@ -3664,13 +3736,23 @@ impl App {
                                     // adjacent labels, so the diff stays copyable whole.
                                     ui.spacing_mut().item_spacing.y = 0.0;
                                     let origin = ui.cursor().top();
-                                    for (n, (hunk, _span)) in c.hunks.iter().enumerate() {
+                                    for (n, (hunk, span)) in c.hunks.iter().enumerate() {
                                         let (control, clicked) =
                                             self.hunk_control(ui, &t, hunk, !stale);
                                         if clicked {
                                             take = Some(n);
                                         }
                                         let body = prepared.hunks[n].show(ui, glyph);
+                                        if let Some(row) = find_row.filter(|row| span.contains(row)) {
+                                            // Merge controls add height between rendered
+                                            // rows. Use this frame's body position so
+                                            // finds also land correctly after resizing
+                                            // or changing fonts.
+                                            find_offset = Some(
+                                                body.rect.top() - origin
+                                                    + (row - span.start) as f32 * line_height,
+                                            );
+                                        }
                                         boxes.push((
                                             control.top() - origin,
                                             body.rect.bottom() - control.top(),
@@ -3707,6 +3789,9 @@ impl App {
 
         self.hunk_boxes = boxes;
         self.diff_offset = offset;
+        if find_offset.is_some() {
+            self.restore_offset = find_offset;
+        }
         if let Some(n) = take {
             self.take_hunk(n, ctx);
         }
@@ -4061,26 +4146,36 @@ impl App {
         } else {
             format!("Out of date — {} to re-render", keys::compare_label())
         };
-        let anchor = ui.min_rect().right_top() + egui::vec2(-8.0, 8.0);
-        egui::Area::new(ui.id().with("stale"))
-            .fixed_pos(anchor - egui::vec2(160.0, 0.0))
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                Frame::new()
-                    .fill(t.surface_overlay)
-                    .stroke(Stroke::new(1.0, t.border_strong))
-                    .corner_radius(radius::CHIP)
-                    .inner_margin(Margin::symmetric(10, 5))
-                    .show(ui, |ui| {
-                        ui.label(ui::small(text).color(t.text_secondary));
-                    });
+        let bounds = ui.min_rect().intersect(ui.clip_rect()).shrink(8.0);
+        if bounds.height() < ui.text_style_height(&TextStyle::Small) + 12.0
+            || bounds.width() < 40.0
+        {
+            return;
+        }
+        // This overlays the diff without advancing its layout. A foreground
+        // Area escaped the diff's clip when a failure banner left little room,
+        // drawing the stale state over the result editor below it.
+        let mut overlay = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("stale")
+                .max_rect(bounds)
+                .layout(Layout::right_to_left(Align::Min)),
+        );
+        overlay.set_clip_rect(bounds);
+        Frame::new()
+            .fill(t.surface_overlay)
+            .stroke(Stroke::new(1.0, t.border_strong))
+            .corner_radius(radius::CHIP)
+            .inner_margin(Margin::symmetric(10, 5))
+            .show(&mut overlay, |ui| {
+                ui.add(egui::Label::new(ui::small(text).color(t.text_secondary)).truncate());
             });
     }
 
     fn no_difference(&self, ui: &mut egui::Ui, t: &Tokens) {
         let (a, b) = self.pair();
         let lines = self.panels[b].text.lines().count();
-        if self.panels[a].text.is_empty() && self.panels[b].text.is_empty() {
+        if self.panels[a].is_empty() && self.panels[b].is_empty() {
             ui::empty_state(
                 ui,
                 t,
@@ -4133,6 +4228,20 @@ impl App {
     }
 
     fn nothing_yet(&self, ui: &mut egui::Ui, t: &Tokens) {
+        let (a, b) = self.pair();
+        if !self.panels[a].is_empty() || !self.panels[b].is_empty() {
+            if self.in_flight.is_some() {
+                ui::empty_state(ui, t, "Comparing…", "Preparing the differences between these panels.", &[]);
+            } else {
+                let body = if self.auto_renders() {
+                    "Choose Compare to see the differences between these panels."
+                } else {
+                    "Automatic comparison is paused for large inputs. Choose Compare to see the differences."
+                };
+                ui::empty_state(ui, t, "Ready to compare", body, &[(keys::compare_label(), "compare")]);
+            }
+            return;
+        }
         ui::empty_state(
             ui,
             t,
@@ -5266,6 +5375,10 @@ impl eframe::App for App {
         self.poll_catalog();
         self.poll_watches();
         self.poll_hotkey(ctx);
+        // Consume shortcuts before widgets see Enter, then dispatch after the
+        // editors have applied this frame's text. Save must include an edit
+        // arriving in the same frame, and TextEdit keeps its own undo/redo.
+        let actions = self.capture_keys(ctx);
         self.publish_resolution();
         if !self.quit_menu_guarded {
             self.quit_menu_guarded = crate::menu::guard_quit();
@@ -5415,7 +5528,7 @@ impl eframe::App for App {
             }))
             .show(ui, |ui| self.diff_area(ui, ctx, glyph));
 
-        self.handle_keys(ctx);
+        self.handle_keys(ctx, actions);
         self.quit_guard(ctx);
         if !self.quit_guard {
             self.destructive_modal(ctx);
@@ -6423,6 +6536,102 @@ mod tests {
         assert_eq!(moved_cursor(99, 2, 1), 0);
     }
 
+    fn find_test_pass(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+        let mut input = screen_input(screen);
+        input.events = events;
+        let mut output = ctx.run_ui(input, |ui| app.diff_area(ui, ctx, 8.0));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn refining_find_targets_the_current_query_and_keeps_navigation_working() {
+        let mut app = test_app();
+        let text = (0..160)
+            .map(|i| match i {
+                0 => "a\n".to_string(),
+                80 | 120 => "ab\n".to_string(),
+                _ => format!("row {i}\n"),
+            })
+            .collect::<String>();
+        app.cache.insert(app.shown, Cached {
+            key: app.current_key(),
+            lines: ansi::parse(text.as_bytes()),
+            columns: app.columns,
+            hunks: Vec::new(),
+            problem: None,
+        });
+        app.show_find = true;
+        app.find_query = "a".into();
+        app.focus_find = true;
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        for _ in 0..3 {
+            find_test_pass(&mut app, &ctx, Vec::new());
+        }
+
+        // Exercise TextEdit's mutation in the same frame as searching. Setting
+        // find_query before the frame would miss the original ordering defect.
+        find_test_pass(&mut app, &ctx, vec![egui::Event::Text("b".into())]);
+        assert_eq!(app.find_query, "ab");
+        let row_height = app.settings.mono_pt * 1.36;
+        assert_eq!(app.restore_offset, Some(80.0 * row_height));
+        for _ in 0..3 {
+            find_test_pass(&mut app, &ctx, Vec::new());
+        }
+        assert_eq!(app.diff_offset, 80.0 * row_height);
+
+        app.pending_find_move = -1;
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.find_cursor, 1);
+        assert_eq!(app.restore_offset, Some(120.0 * row_height));
+        app.pending_find_move = 1;
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.find_cursor, 0);
+        assert_eq!(app.restore_offset, Some(80.0 * row_height));
+    }
+
+    #[test]
+    fn find_in_a_result_uses_the_drawn_body_after_hunk_controls() {
+        for (ui_pt, mono_pt) in [(13.0, 12.5), (20.0, 24.0)] {
+            let hunks = (0..60)
+                .map(|i| (hunk(i..i + 1, i..i + 1), 2 * i..2 * i + 2))
+                .collect();
+            let mut app = merging_app("base\n", "candidate\n", hunks);
+            app.settings.mono_pt = mono_pt;
+            let text = (0..60)
+                .map(|i| {
+                    if i == 40 {
+                        "-TARGET\n+new\n".to_string()
+                    } else {
+                        format!("-old {i}\n+new {i}\n")
+                    }
+                })
+                .collect::<String>();
+            app.cache.get_mut(&1).unwrap().lines = ansi::parse(text.as_bytes());
+            app.show_find = true;
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::fonts::definitions(None, None, None));
+            crate::theme::install(&ctx, ui_pt, mono_pt);
+            for _ in 0..3 {
+                find_test_pass(&mut app, &ctx, Vec::new());
+            }
+
+            app.find_query = "TARGET".into();
+            app.find_jump = true;
+            find_test_pass(&mut app, &ctx, Vec::new());
+            let (top, total) = app.hunk_boxes[40];
+            let body_height = 2.0 * mono_pt * 1.36;
+            let expected = top + total - body_height;
+            assert!((app.restore_offset.unwrap() - expected).abs() < 1.0);
+            for _ in 0..3 {
+                find_test_pass(&mut app, &ctx, Vec::new());
+            }
+            assert!((app.diff_offset - expected).abs() < 1.0);
+        }
+    }
+
     fn temp_path(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6437,6 +6646,484 @@ mod tests {
         p.path = Some(PathBuf::from("/tmp/thing.rs"));
         p.resniff();
         p
+    }
+
+    #[test]
+    fn opening_a_selected_result_preserves_contents_and_save_identity() {
+        let dir = temp_path("open-selected-result");
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = dir.join("new-input.txt");
+        std::fs::write(&opened, "replacement input\n").unwrap();
+
+        for mergetool in [false, true] {
+            for dirty in [false, true] {
+                let saved = dir.join(format!("result-{mergetool}-{dirty}.txt"));
+                let resolved = Arc::new(AtomicBool::new(false));
+                let mut app = test_app();
+                app.panels[0].text = "seed\n".into();
+                app.panels[1].text = "candidate\n".into();
+                app.start_result(Some(0));
+                let result = app.result_panel().unwrap();
+                if mergetool {
+                    app.mergetool = Some(MergeTool {
+                        merged: saved.clone(),
+                        resolved: resolved.clone(),
+                    });
+                }
+                assert!(app.save_result_to(result, saved.clone(), true));
+                if dirty {
+                    app.panels[result].text.push_str("manual edit\n");
+                    app.result_edited(result);
+                }
+                app.stop_building();
+                app.set_reference(0);
+                app.shown = result;
+                app.publish_resolution();
+                let before = (
+                    app.panels[result].text.clone(),
+                    app.panels[result].saved_snapshot.clone(),
+                    app.panels[result].saved_stamp,
+                    app.panels[result].revision,
+                    app.result_identity_view(result).state,
+                );
+
+                // This is the native Open shortcut route. The result guard
+                // must return before a file dialog is created.
+                let ctx = egui::Context::default();
+                let mut input = egui::RawInput::default();
+                input.events.push(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+                input.events.push(egui::Event::Key {
+                    key: Key::O,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                });
+                let mut output = ctx.run_ui(input, |_ui| {
+                    let actions = app.capture_keys(&ctx);
+                    app.handle_keys(&ctx, actions);
+                });
+                output.textures_delta.clear();
+                assert!(app.notice.as_deref().is_some_and(|text| text.contains("input panel")));
+                assert!(app.destructive.is_none());
+
+                // A caller bypassing the dialog still cannot bind a result to
+                // an input path or leave unrelated text claiming to be saved.
+                app.open_into(result, opened.clone());
+                app.publish_resolution();
+                assert_eq!(app.panels[result].text, before.0);
+                assert_eq!(app.panels[result].saved_snapshot, before.1);
+                assert!(app.panels[result].saved_stamp == before.2);
+                assert_eq!(app.panels[result].revision, before.3);
+                assert_eq!(app.result_identity_view(result).state, before.4);
+                assert_eq!(app.panels[result].saved_to.as_ref(), Some(&saved));
+                assert_eq!(app.result_save_target(result).as_ref(), Some(&saved));
+                assert!(app.panels[result].path.is_none());
+                assert!(app.panels[result].result);
+                assert_eq!(app.panels[result].dirty, dirty);
+                assert_eq!(app.panel_has_unsaved_content(result), dirty);
+                assert_eq!(resolved.load(Ordering::Relaxed), mergetool && !dirty);
+                assert_eq!(std::fs::read_to_string(&saved).unwrap(), "seed\n");
+            }
+        }
+
+        let mut app = test_app();
+        app.open_into(1, opened.clone());
+        assert_eq!(app.panels[1].text, "replacement input\n");
+        assert_eq!(app.panels[1].path.as_ref(), Some(&opened));
+        assert_eq!(app.focus_panel, Some(1));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn explicit_file_pairs_compare_even_when_one_or_both_files_are_empty() {
+        let dir = temp_path("empty-file-comparison");
+        std::fs::create_dir_all(&dir).unwrap();
+        let left = dir.join("left.txt");
+        let right = dir.join("right.txt");
+        let delta = Delta::discover().expect("the test suite needs delta");
+        for (a, b) in [("", "added\n"), ("deleted\n", ""), ("", "")] {
+            std::fs::write(&left, a).unwrap();
+            std::fs::write(&right, b).unwrap();
+            let mut app = App::new(
+                delta.clone(),
+                Settings { inherit_gitconfig: false, ..Settings::default() },
+                Launch { files: vec![left.clone(), right.clone()], ..Launch::default() },
+            );
+            assert!(app.compared, "explicit file pair {a:?} / {b:?} waits for Compare");
+            assert_eq!(app.panels[0].path.as_ref(), Some(&left));
+            assert_eq!(app.panels[1].path.as_ref(), Some(&right));
+            let cached = render_job(
+                &delta,
+                &app.panels[0].to_input(true),
+                &app.panels[1].to_input(true),
+                &app.effective_options(),
+                app.current_key(),
+                app.columns,
+                false,
+            ).unwrap();
+            assert_eq!(render::is_empty(&cached.lines), a == b);
+            if a != b {
+                let change = &cached.hunks[0].0;
+                assert_eq!(change.old.len(), usize::from(!a.is_empty()));
+                assert_eq!(change.new.len(), usize::from(!b.is_empty()));
+            }
+
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut output = ctx.run_ui(Default::default(), |ui| app.toolbar(ui, &ctx));
+            output.textures_delta.clear();
+            let update = output.platform_output.accesskit_update.unwrap();
+            let compare = update.nodes.iter().find(|(_, node)| {
+                node.label().is_some_and(|label| label.starts_with("Compare"))
+            }).expect("Compare action");
+            assert!(!compare.1.is_disabled(), "empty files must remain retryable");
+        }
+
+        let startup = |files, preload| App::new(
+            delta.clone(), Settings::default(),
+            Launch { files, preload, ..Launch::default() },
+        );
+        assert!(!startup(Vec::new(), None).compared);
+        assert!(!startup(vec![left], None).compared);
+        assert!(!startup(Vec::new(), Some("clipboard only".into())).compared);
+        assert!(startup(vec![right], Some("clipboard content".into())).compared);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn toolbar_controls_share_a_center_at_normal_and_large_font_sizes() {
+        for width in [1_240.0, 720.0] {
+            for ui_pt in [13.0, 20.0] {
+                for state in ["empty", "ready", "rendering"] {
+                    let mut app = test_app();
+                    if state != "empty" {
+                        app.panels[0].text = "left".into();
+                        app.panels[1].text = "right".into();
+                    }
+                    if state == "rendering" {
+                        app.in_flight = Some(app.current_key());
+                    }
+                    let ctx = egui::Context::default();
+                    ctx.set_fonts(crate::fonts::definitions(None, None, None));
+                    crate::theme::install(&ctx, ui_pt, 12.5);
+                    ctx.enable_accesskit();
+                    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 480.0));
+                    let mut output = ctx.run_ui(screen_input(screen), |ui| app.toolbar(ui, &ctx));
+                    output.textures_delta.clear();
+                    let update = output.platform_output.accesskit_update.unwrap();
+                    let bounds = |name: &str| {
+                        update.nodes.iter().find_map(|(_, node)| {
+                            node.label().filter(|label| label.starts_with(name))
+                                .and_then(|_| node.bounds())
+                        }).unwrap_or_else(|| panic!("missing toolbar action {name}"))
+                    };
+                    let compare = bounds(if state == "rendering" { "Rendering…" } else { "Compare" });
+                    let center = (compare.y0 + compare.y1) / 2.0;
+                    for name in ["Side by side", "Numbers", "Wrap", "Settings", "+ Panel", "Help"] {
+                        let other = bounds(name);
+                        let difference = ((other.y0 + other.y1) / 2.0 - center).abs();
+                        assert!(
+                            difference <= 1.0,
+                            "{width}pt / {ui_pt}pt / {state}: {name} is {difference}pt off Compare's center",
+                        );
+                    }
+                    assert_inside_screen(screen, compare, "Compare");
+                    for name in ["Settings", "+ Panel", "Help"] {
+                        assert_inside_screen(screen, bounds(name), name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enter_shortcuts_do_not_activate_a_focused_toolbar_button() {
+        for focused in ["Help", "Compare"] {
+            for taking in [false, true] {
+                let mut app = merging_app("a\n", "b\n", vec![(hunk(0..1, 0..1), 0..2)]);
+                app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n");
+                let ctx = egui::Context::default();
+                ctx.set_fonts(crate::fonts::definitions(None, None, None));
+                crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+                ctx.enable_accesskit();
+                // Let real panel sizing establish columns before making this
+                // fixture fresh. No test subprocess is needed during warmup.
+                app.in_flight = Some(app.current_key());
+                for _ in 0..3 {
+                    app_ui_test_pass(&mut app, &ctx, Vec::new());
+                }
+                app.in_flight = None;
+                let key = app.current_key();
+                app.cache.get_mut(&app.shown).unwrap().key = key;
+                let initial = app_ui_test_pass(&mut app, &ctx, Vec::new());
+                let target = initial.nodes.iter().find(|(_, node)| {
+                    node.label().is_some_and(|label| label.starts_with(focused))
+                }).unwrap().0;
+                app_ui_test_pass(&mut app, &ctx, vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: target,
+                    data: None,
+                })]);
+                let modifiers = if taking {
+                    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT)
+                } else {
+                    egui::Modifiers::COMMAND
+                };
+                app_ui_test_pass(&mut app, &ctx, vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::Key {
+                        key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers,
+                    },
+                ]);
+                assert_eq!(app.panels[app.reference].text, if taking { "b\n" } else { "a\n" });
+                assert!(!app.show_help, "Enter shortcut also activated {focused}");
+                assert!(!ctx.input(|input| input.key_pressed(Key::Enter)));
+                if taking {
+                    // No release: egui derives repeat=true for a held chord.
+                    app_ui_test_pass(&mut app, &ctx, vec![
+                        egui::Event::ModifiersChanged(modifiers),
+                        egui::Event::Key {
+                            key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers,
+                        },
+                    ]);
+                    assert!(!app.show_help, "held Take activated {focused}");
+                    assert!(!ctx.input(|input| input.key_pressed(Key::Enter)));
+                }
+            }
+        }
+    }
+
+    fn app_ui_test_pass(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::accesskit::TreeUpdate {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_240.0, 860.0));
+        let mut input = screen_input(screen);
+        input.events = events;
+        // Separate TextEdit undo snapshots without sleeps.
+        input.time = Some(ctx.cumulative_frame_nr() as f64 * 1.1);
+        let mut frame = eframe::Frame::_new_kittest();
+        app.quit_menu_guarded = true;
+        let mut output = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));
+        output.textures_delta.clear();
+        output.platform_output.accesskit_update.unwrap()
+    }
+
+    #[test]
+    fn full_shortcut_chords_undo_and_redo_takes_from_the_diff() {
+        let mut app = merging_app("a\n", "b\n", vec![(hunk(0..1, 0..1), 0..2)]);
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n");
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        ctx.enable_accesskit();
+        app.in_flight = Some(app.current_key());
+        for _ in 0..3 {
+            app_ui_test_pass(&mut app, &ctx, Vec::new());
+        }
+        app.take_hunk(0, &ctx);
+        let result = app.result_panel().unwrap();
+        assert_eq!(app.panels[result].text, "b\n");
+        ctx.memory_mut(|memory| memory.request_focus(render::diff_region_id()));
+        for (shift, expected) in [(false, "a\n"), (true, "b\n")] {
+            let modifiers = egui::Modifiers { shift, ..egui::Modifiers::COMMAND };
+            app_ui_test_pass(&mut app, &ctx, vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers },
+                egui::Event::Key { key: Key::Z, physical_key: None, pressed: false, repeat: false, modifiers },
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            ]);
+            assert!(!ctx.text_edit_focused());
+            assert_eq!(app.panels[result].text, expected, "take history shortcut was lost after modifier release");
+            assert!(!ctx.input(|input| input.key_pressed(Key::Z)));
+        }
+    }
+
+    #[test]
+    fn loaded_large_inputs_explain_compare_without_starting_an_automatic_render() {
+        let dir = temp_path("large-ready-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let left = dir.join("left.txt");
+        let right = dir.join("right.txt");
+        let line = "a line of text to compare\n";
+        let content = line.repeat(AUTO_RENDER_BYTES / (2 * line.len()) + 1);
+        std::fs::write(&left, &content).unwrap();
+        std::fs::write(&right, &content).unwrap();
+        let large = App::new(
+            Delta {
+                path: PathBuf::from("delgui-test-delta-does-not-exist"),
+                version: (0, 19, 0), version_string: "delta test".into(),
+            },
+            Settings::default(),
+            Launch { files: vec![left, right], ..Launch::default() },
+        );
+        assert!(large.compared);
+        assert!(large.pair_bytes() > AUTO_RENDER_BYTES);
+        let mut paste = test_app();
+        paste.panels[0].text = "left\n".into();
+        paste.panels[1].text = "right\n".into();
+        let mut rendering = test_app();
+        rendering.panels[0].text = "left\n".into();
+        rendering.in_flight = Some(rendering.current_key());
+        for (mut app, title, explanation, pending) in [
+            (test_app(), "Nothing to compare yet", "Put text in two panels", false),
+            (paste, "Ready to compare", "Choose Compare", false),
+            (large, "Ready to compare", "Automatic comparison is paused for large inputs", false),
+            (rendering, "Comparing…", "Preparing the differences", true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::fonts::definitions(None, None, None));
+            crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+            ctx.enable_accesskit();
+            for _ in 0..2 {
+                let tree = app_ui_test_pass(&mut app, &ctx, Vec::new());
+                let contains = |expected: &str| tree.nodes.iter().any(|(_, node)| {
+                    node.label().or(node.value()).is_some_and(|text| text.contains(expected))
+                });
+                assert!(contains(title), "missing state: {title}");
+                assert!(contains(explanation), "missing next step: {explanation}");
+                if title == "Ready to compare" {
+                    assert!(contains(keys::compare_label()));
+                    assert!(!contains("Nothing to compare yet"));
+                }
+                assert_eq!(app.in_flight.is_some(), pending, "empty-state copy changed rendering policy");
+                assert!(!app.requested);
+            }
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn editor_shortcuts_keep_newlines_undo_and_same_frame_save_correct() {
+        let dir = temp_path("editor-shortcuts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("result.txt");
+        let mut app = merging_app("result\n", "candidate\n", vec![(hunk(0..1, 0..1), 0..2)]);
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-result\n+candidate\n");
+        app.panels[0].text = "source\n".into();
+        let result = app.result_panel().unwrap();
+        assert!(app.save_result_to(result, saved.clone(), true));
+        app.in_flight = Some(app.current_key());
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        ctx.enable_accesskit();
+        for _ in 0..3 {
+            app_ui_test_pass(&mut app, &ctx, Vec::new());
+        }
+        let focus = |app: &mut App, prefix: &str| {
+            let tree = app_ui_test_pass(app, &ctx, Vec::new());
+            let target = tree.nodes.iter().find(|(_, node)| {
+                node.label().is_some_and(|label| label.starts_with(prefix))
+            }).unwrap().0;
+            app_ui_test_pass(app, &ctx, vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: target,
+                data: None,
+            })]);
+        };
+        let chord = |key, shift| {
+            let modifiers = egui::Modifiers { shift, ..egui::Modifiers::COMMAND };
+            vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers },
+                egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers },
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            ]
+        };
+
+        for (label, panel) in [("Panel A editor", 0), ("Result editor", result)] {
+            focus(&mut app, label);
+            let before = app.panels[panel].text.clone();
+            app_ui_test_pass(&mut app, &ctx, chord(Key::Enter, false));
+            assert_eq!(app.panels[panel].text, before, "Compare inserted a newline in {label}");
+        }
+
+        focus(&mut app, "Result editor");
+        app_ui_test_pass(&mut app, &ctx, vec![egui::Event::Text("typed".into())]);
+        let before_save = app.panels[result].text.clone();
+        let mut edit_and_save = vec![egui::Event::Text(" and saved".into())];
+        edit_and_save.extend(chord(Key::S, false));
+        app_ui_test_pass(&mut app, &ctx, edit_and_save);
+        let after_save = app.panels[result].text.clone();
+        assert_ne!(after_save, before_save);
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), after_save);
+        assert!(!app.panels[result].dirty);
+
+        app_ui_test_pass(&mut app, &ctx, chord(Key::Z, false));
+        assert_eq!(app.panels[result].text, before_save, "TextEdit lost its undo chord");
+        app_ui_test_pass(&mut app, &ctx, Vec::new());
+        app_ui_test_pass(&mut app, &ctx, chord(Key::Z, true));
+        assert_eq!(app.panels[result].text, after_save, "TextEdit lost its redo chord");
+
+        // Take while the result editor retains focus; it must not also insert
+        // Enter before deciding whether the cached hunk is still applicable.
+        app.panels[result].text = "result\n".into();
+        let key = app.current_key();
+        app.cache.get_mut(&app.shown).unwrap().key = key;
+        app_ui_test_pass(&mut app, &ctx, chord(Key::Enter, true));
+        assert_eq!(app.panels[result].text, "candidate\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn source_panel_height_stays_bounded_across_frames_and_candidate_changes() {
+        let mut app = test_app();
+        while app.panels.len() < 6 {
+            app.add_panel();
+        }
+        for (i, panel) in app.panels.iter_mut().enumerate() {
+            panel.text = format!("panel {i}\n").repeat(20);
+            panel.resniff();
+        }
+        app.in_flight = Some(app.current_key());
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        ctx.enable_accesskit();
+        for frame in 0..12 {
+            if frame == 5 {
+                app.shown = 5;
+                app.reveal_panel = Some(5);
+            }
+            app_ui_test_pass(&mut app, &ctx, Vec::new());
+            let height = app.panel_rects.iter().map(|rect| rect.height()).fold(0.0, f32::max);
+            assert!(height <= 270.0, "frame {frame}: source card grew to {height}pt");
+        }
+    }
+
+    #[test]
+    fn stale_status_stays_inside_even_a_short_diff_region() {
+        for height in [20.0, 50.0, 120.0] {
+            let app = test_app();
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::fonts::definitions(None, None, None));
+            crate::theme::install(&ctx, 20.0, 24.0);
+            ctx.enable_accesskit();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, height));
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(screen_input(screen), |ui| {
+                    ui.set_min_size(screen.size());
+                    app.stale_pill(ui, &ui::tokens(ui));
+                });
+                output.textures_delta.clear();
+                let update = output.platform_output.accesskit_update.unwrap();
+                for (_, node) in update.nodes.iter().filter(|(_, node)| {
+                    node.value().is_some_and(|text| text.starts_with("Out of date"))
+                }) {
+                    assert_inside_screen(screen, node.bounds().unwrap(), "stale diff status");
+                }
+                if height >= 50.0 {
+                    assert!(update.nodes.iter().any(|(_, node)| {
+                        node.value().is_some_and(|text| text.starts_with("Out of date"))
+                    }), "stale state should remain visible when it fits");
+                }
+            }
+        }
     }
 
     /// The panel is an editor, so what it shows has to be what gets compared.

@@ -123,7 +123,7 @@ pub fn bindings() -> Vec<Binding> {
         Binding {
             mac: "⌘O",
             other: "Ctrl+O",
-            describe: "open a file in the shown panel",
+            describe: "open a file in the shown input panel",
             group: "file",
             action: Action::OpenFile,
             key: Key::O,
@@ -378,25 +378,37 @@ pub fn pressed(input: &egui::InputState) -> Vec<Action> {
     bindings()
         .into_iter()
         .filter(|b| {
-            if b.action == Action::TakeCurrentDifference {
-                input.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if *key == b.key && modifiers.matches_exact(b.mods)
-                    )
-                })
-            } else {
-                input.key_pressed(b.key) && input.modifiers.matches_exact(b.mods)
-            }
+            // The modifier can be released again before this frame is drawn.
+            // Each key event retains the chord that was actually pressed.
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat,
+                        modifiers,
+                        ..
+                    } if *key == b.key && modifiers.matches_exact(b.mods)
+                        && (b.action != Action::TakeCurrentDifference || !repeat)
+                )
+            })
         })
         .map(|b| b.action)
         .collect()
+}
+
+/// Keep an app shortcut from also reaching the focused widget. In particular,
+/// egui activates a focused button on Enter even when modifiers are held.
+pub fn consume(input: &mut egui::InputState, action: Action) {
+    if let Some(binding) = bindings().into_iter().find(|binding| binding.action == action)
+    {
+        input.events.retain(|event| !matches!(
+            event,
+            egui::Event::Key { key, pressed: true, modifiers, .. }
+                if *key == binding.key && modifiers.matches_exact(binding.mods)
+        ));
+    }
 }
 
 pub struct HelpRow {
@@ -557,6 +569,39 @@ mod tests {
                 .all(|binding| binding.key != Key::S || !unsupported.matches_exact(binding.mods)),
             "Command+Option+Shift+S must not fall through to another S binding"
         );
+    }
+
+    #[test]
+    fn full_shortcut_chords_keep_the_modifiers_from_the_key_event() {
+        for binding in bindings() {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::ModifiersChanged(binding.mods));
+            for pressed in [true, false] {
+                input.events.push(egui::Event::Key {
+                    key: binding.key, physical_key: None, pressed, repeat: false,
+                    modifiers: binding.mods,
+                });
+            }
+            input.events.push(egui::Event::ModifiersChanged(Modifiers::NONE));
+            ctx.begin_pass(input);
+            assert_eq!(ctx.input(|input| input.modifiers), Modifiers::NONE);
+            assert_eq!(ctx.input(pressed), vec![binding.action], "{} was released in the same frame", binding.describe);
+            ctx.input_mut(|input| consume(input, binding.action));
+            assert!(!ctx.input(|input| input.key_pressed(binding.key)), "{} leaked to the focused widget", binding.describe);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+
+            let mut release = egui::RawInput::default();
+            release.events.push(egui::Event::Key {
+                key: binding.key, physical_key: None, pressed: false, repeat: false,
+                modifiers: binding.mods,
+            });
+            ctx.begin_pass(release);
+            assert!(ctx.input(pressed).is_empty(), "a key release dispatched {}", binding.describe);
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+        }
     }
 
     /// Every action must be reachable, and every chord must be documented.
