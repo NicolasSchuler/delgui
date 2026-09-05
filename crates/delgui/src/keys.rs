@@ -49,6 +49,18 @@ impl Binding {
     pub fn label(&self) -> &'static str {
         chord(self.mac, self.other)
     }
+
+    fn matches_modifiers(&self, modifiers: Modifiers) -> bool {
+        // Slash and backslash need Shift or Alt on some keyboard layouts. The
+        // logical key already identifies the symbol, and neither has a second
+        // binding that uses those modifiers. Keep every other chord exact so
+        // Save As, for example, cannot also dispatch Save.
+        if matches!(self.key, Key::Slash | Key::Backslash) {
+            modifiers.matches_logically(self.mods)
+        } else {
+            modifiers.matches_exact(self.mods)
+        }
+    }
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -275,9 +287,21 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD,
         },
         Binding {
+            // On macOS, winit discards Option's character transformation
+            // under Command, so QWERTZ's Option+Shift+7 becomes Slash instead
+            // of Backslash. Give Wrap a primary chord independent of that path.
+            mac: "⌘⇧L",
+            other: "Ctrl+Shift+L",
+            describe: "wrap long lines",
+            group: "view",
+            action: Action::ToggleWrap,
+            key: Key::L,
+            mods: CMD_SHIFT,
+        },
+        Binding {
             mac: "⌘\\",
             other: "Ctrl+\\",
-            describe: "wrap long lines",
+            describe: "wrap long lines (alternate)",
             group: "view",
             action: Action::ToggleWrap,
             key: Key::Backslash,
@@ -389,24 +413,30 @@ pub fn pressed(input: &egui::InputState) -> Vec<Action> {
                         repeat,
                         modifiers,
                         ..
-                    } if *key == b.key && modifiers.matches_exact(b.mods)
+                    } if *key == b.key && b.matches_modifiers(*modifiers)
                         && (b.action != Action::TakeCurrentDifference || !repeat)
                 )
             })
         })
         .map(|b| b.action)
-        .collect()
+        .fold(Vec::new(), |mut actions, action| {
+            // Aliases retain the same once-per-frame behavior as repeated
+            // presses of one chord, instead of toggling the setting twice.
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+            actions
+        })
 }
 
 /// Keep an app shortcut from also reaching the focused widget. In particular,
 /// egui activates a focused button on Enter even when modifiers are held.
 pub fn consume(input: &mut egui::InputState, action: Action) {
-    if let Some(binding) = bindings().into_iter().find(|binding| binding.action == action)
-    {
+    for binding in bindings().into_iter().filter(|binding| binding.action == action) {
         input.events.retain(|event| !matches!(
             event,
             egui::Event::Key { key, pressed: true, modifiers, .. }
-                if *key == binding.key && modifiers.matches_exact(binding.mods)
+                if *key == binding.key && binding.matches_modifiers(*modifiers)
         ));
     }
 }
@@ -500,9 +530,9 @@ mod tests {
         }
     }
 
-    /// Every combination of the logical modifiers either selects the one exact
-    /// binding for a key or selects nothing. In particular, Shift/Alt variants
-    /// must never fall through to the plain Command action on the same key.
+    /// Every combination of the logical modifiers selects at most one binding.
+    /// Only the two symbol keys tolerate Shift/Alt used to type that symbol;
+    /// other variants must not fall through to the plain Command action.
     #[test]
     fn modifier_combinations_match_exactly_without_overlap() {
         let all = bindings();
@@ -525,7 +555,13 @@ mod tests {
                         let actual = dispatch(key, pressed);
                         let expected: Vec<Action> = all
                             .iter()
-                            .filter(|binding| binding.key == key && binding.mods == pressed)
+                            .filter(|binding| {
+                                binding.key == key && if matches!(key, Key::Slash | Key::Backslash) {
+                                    command
+                                } else {
+                                    binding.mods == pressed
+                                }
+                            })
                             .map(|binding| binding.action)
                             .collect();
 
@@ -544,6 +580,38 @@ mod tests {
     }
 
     #[test]
+    fn symbol_shortcuts_accept_layout_modifiers_and_consume_the_event() {
+        for (key, action) in [(Key::Slash, Action::ToggleHelp), (Key::Backslash, Action::ToggleWrap)] {
+            // Backends set `command` together with the platform's real modifier.
+            for platform in [Modifiers::MAC_CMD, Modifiers::CTRL] {
+                for shift in [false, true] {
+                    for alt in [false, true] {
+                        let modifiers = Modifiers { shift, alt, ..CMD.plus(platform) };
+                        let ctx = egui::Context::default();
+                        let mut input = egui::RawInput::default();
+                        input.events.push(egui::Event::Key {
+                            key, physical_key: Some(Key::Num7), pressed: true,
+                            repeat: false, modifiers,
+                        });
+                        // A complete shortcut may be released before the next
+                        // frame; matching must use the event's modifiers.
+                        input.events.push(egui::Event::ModifiersChanged(Modifiers::NONE));
+                        ctx.begin_pass(input);
+                        assert_eq!(ctx.input(pressed), vec![action], "{key:?} {modifiers:?}");
+                        ctx.input_mut(|input| consume(input, action));
+                        assert!(!ctx.input(|input| input.key_pressed(key)), "shortcut leaked to the focused widget");
+                        let mut output = ctx.end_pass();
+                        output.textures_delta.clear();
+
+                        assert!(dispatch(key, Modifiers { shift, alt, ..Modifiers::NONE }).is_empty(),
+                            "typing {key:?} must not dispatch a shortcut");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn standard_shortcut_variants_dispatch_only_the_intended_action() {
         let cases = [
             (Key::O, CMD, Action::OpenFile),
@@ -554,6 +622,9 @@ mod tests {
             (Key::S, CMD_SHIFT, Action::SaveResultAs),
             (Key::Enter, CMD_SHIFT, Action::TakeCurrentDifference),
             (Key::S, CMD_ALT, Action::ToggleSideBySide),
+            (Key::L, CMD, Action::ToggleLineNumbers),
+            (Key::L, CMD_SHIFT, Action::ToggleWrap),
+            (Key::Backslash, CMD, Action::ToggleWrap),
             (Key::Z, CMD, Action::UndoTake),
             (Key::Z, CMD_SHIFT, Action::RedoTake),
         ];
@@ -569,6 +640,27 @@ mod tests {
                 .all(|binding| binding.key != Key::S || !unsupported.matches_exact(binding.mods)),
             "Command+Option+Shift+S must not fall through to another S binding"
         );
+    }
+
+    #[test]
+    fn wrap_aliases_dispatch_once_and_are_all_consumed() {
+        for platform in [Modifiers::MAC_CMD, Modifiers::CTRL] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            for (key, modifiers) in [(Key::L, CMD_SHIFT), (Key::Backslash, CMD)] {
+                input.events.push(egui::Event::Key {
+                    key, physical_key: None, pressed: true, repeat: false,
+                    modifiers: modifiers.plus(platform),
+                });
+            }
+            ctx.begin_pass(input);
+            assert_eq!(ctx.input(pressed), vec![Action::ToggleWrap]);
+            ctx.input_mut(|input| consume(input, Action::ToggleWrap));
+            assert!(!ctx.input(|input| input.key_pressed(Key::L)));
+            assert!(!ctx.input(|input| input.key_pressed(Key::Backslash)));
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+        }
     }
 
     #[test]

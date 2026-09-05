@@ -273,7 +273,7 @@ pub fn diff_region(ui: &mut Ui) -> Response {
     // `show_viewport` makes this the parent of the virtualized chunk nodes after
     // they have registered, while retaining the stable enclosing region above.
     ui.ctx().accesskit_node_builder(response.id, |node| {
-        node.set_role(egui::accesskit::Role::ScrollView);
+        node.set_role(crate::ui::scroll_region_role());
         node.set_label(DIFF_SCROLL_LABEL);
         node.set_bounds(egui::accesskit::Rect {
             x0: f64::from(response.rect.left()),
@@ -1486,7 +1486,7 @@ mod tests {
             .iter()
             .find(|(_, node)| node.label() == Some(DIFF_SCROLL_LABEL))
             .expect("named diff scroll target");
-        assert_eq!(scroll_target.1.role(), accesskit::Role::ScrollView);
+        assert_eq!(scroll_target.1.role(), crate::ui::scroll_region_role());
 
         let _ = pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
         assert_eq!(ctx.memory(|m| m.focused()), Some(diff_region_id()));
@@ -1812,7 +1812,7 @@ mod tests {
             .children()
             .iter()
             .find_map(|id| update.nodes.iter().find(|(node_id, _)| node_id == id))
-            .filter(|(_, node)| node.role() == accesskit::Role::ScrollView)
+            .filter(|(_, node)| node.role() == crate::ui::scroll_region_role())
             .expect("the region's scroll view");
         let text = scroll
             .1
@@ -1984,7 +1984,7 @@ mod tests {
         assert_eq!(region.len(), 1, "the region is named exactly once");
         let scroll = named(DIFF_SCROLL_LABEL);
         assert_eq!(scroll.len(), 1);
-        assert_eq!(scroll[0].1.role(), accesskit::Role::ScrollView);
+        assert_eq!(scroll[0].1.role(), crate::ui::scroll_region_role());
         let bounds = scroll[0].1.bounds().expect("scroll view bounds");
         assert_eq!((bounds.x0, bounds.y0), (0.0, 0.0));
         assert_eq!((bounds.x1, bounds.y1), (800.0, 400.0));

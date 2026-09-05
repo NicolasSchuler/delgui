@@ -41,7 +41,7 @@ delgui [OPTIONS] [FILE]...
 | flag | takes | what it does |
 | --- | --- | --- |
 | `--paste` |  | Load the clipboard into the first panel at startup. Nothing happens if the clipboard holds no text. |
-| `--combine` |  | Start with a result panel, seeded from the first file, ready to take differences into. |
+| `--combine` |  | Start with a result panel, seeded from the first input panel, ready to take differences into. Non-empty clipboard text loaded with --paste takes that panel before files do. |
 | `--watch` |  | Follow every file given on the command line, re-reading and re-diffing when it changes on disk. |
 | `--hotkey` |  | Register a system-wide hotkey that focuses the window and pastes into a fresh panel. Failure to register is reported and the app continues without it. |
 | `--mergetool` | `BASE LOCAL REMOTE MERGED` | Resolve a merge conflict for Git. Exactly four paths, bound by position. |
@@ -65,7 +65,7 @@ git config --global mergetool.delgui.trustExitCode true
 
 `--mergetool` takes exactly four paths and binds them **by position**, because an empty ancestor is an ordinary both-sides-added conflict and must not be filled in by "the first empty panel". BASE, LOCAL and REMOTE become panels; MERGED is the write target and never a panel.
 
-The result is seeded from the ancestor, not from Git's half-merged file — seeding from that would mean diffing against its conflict markers — so each side arrives as differences to take.
+The result is seeded from the ancestor, not from Git's half-merged file — seeding from that would mean diffing against its conflict markers — so each side arrives as differences to take. Before the first save to MERGED, an unchanged starting result with no take history requires an explicit **Save unchanged result** confirmation. Cancel preserves Git's conflict file. Exporting a copy elsewhere does not resolve Git.
 
 The exit status is the answer Git acts on under `trustExitCode`:
 
@@ -161,7 +161,7 @@ Highlight granularity in full:
 
 It is a delta flag and it colours part of a changed line, rather than deciding which lines are changed — which is why it is here and not under *differences*, and why it is left exactly as set while a result is being built. The two flags behind it are independent in delta: `--max-line-distance` decides whether a removed/added pair is refined at all, `--word-diff-regex` what a token is. Each choice states only the one that defines it, so a `max-line-distance` set in your own gitconfig keeps working.
 
-Turning off gitconfig inheritance is the only way to get output that does not depend on your gitconfig or working directory: delta ignores `GIT_CONFIG_GLOBAL`. Flipping any of the three view toggles in the toolbar also turns it off, and says so — the toolbar cannot honestly claim to control a view that config is overriding.
+Turning off gitconfig inheritance is the only way to get output that does not depend on your gitconfig or working directory: delta ignores `GIT_CONFIG_GLOBAL`. The toolbar preserves inheritance unless switching off a mode requires negating an inherited setting that delta cannot override: side-by-side, or line numbers in unified view. It announces that exception. Numbers off in side-by-side and Wrap off have explicit overrides; Wrap on overrides a configured zero wrapping limit while retaining positive limits.
 
 ## Toolbar
 
@@ -269,7 +269,7 @@ Two repairs happen on load, each announced: a saved syntax theme the installed d
 
 ## Keyboard
 
-Chords are written the way each platform writes them.
+Chords are written the way each platform writes them. Extra Shift or Alt modifiers are accepted for `/` and `\`. On macOS layouts requiring Option for `\`, use the primary Wrap shortcut, `⌘⇧L`.
 
 ### file
 
@@ -305,7 +305,7 @@ Chords are written the way each platform writes them.
 
 | macOS | elsewhere | | |
 | --- | --- | --- | --- |
-| `⌘S` | `Ctrl+S` | save the result to a file | Write the result to its file. With `--mergetool` this is what writes MERGED and answers Git. |
+| `⌘S` | `Ctrl+S` | save the result to a file | Write the result to its file. With `--mergetool` this writes MERGED and answers Git. Saving an unchanged starting result first asks for confirmation. |
 | `⌘⇧S` | `Ctrl+Shift+S` | save the result as a new file | Write the result to a file chosen in a dialog. In mergetool mode, choosing a destination other than Git's MERGED target exports a copy without retargeting later saves or marking the conflict resolved; explicitly choosing MERGED writes and resolves it. |
 | `⌘⇧Enter` | `Ctrl+Shift+Enter` | take the current difference into the result | While building a result, take the currently selected difference from the shown candidate into the result. |
 | `⌘Z` | `Ctrl+Z` | undo the last take | Undo the last take. Ignored while a text field has focus, where it is that field's own undo. |
@@ -317,7 +317,8 @@ Chords are written the way each platform writes them.
 | --- | --- | --- | --- |
 | `⌘⌥S` | `Ctrl+Alt+S` | side by side | Toggle delta's two-column layout. |
 | `⌘L` | `Ctrl+L` | line numbers | Toggle line numbers. |
-| `⌘\` | `Ctrl+\` | wrap long lines | Toggle wrapping of long lines. |
+| `⌘⇧L` | `Ctrl+Shift+L` | wrap long lines | Toggle wrapping of long lines. |
+| `⌘\` | `Ctrl+\` | wrap long lines (alternate) | Toggle wrapping of long lines. |
 | `⌘,` | `Ctrl+,` | settings | Open or close the settings drawer. |
 | `⌘/` | `Ctrl+/` | this list | Open or close the keyboard overlay. |
 

@@ -41,7 +41,7 @@ fn describe_flag(flag: &str) -> Option<(&'static str, &'static str)> {
         ),
         "--combine" => (
             "",
-            "Start with a result panel, seeded from the first file, ready to take differences into.",
+            "Start with a result panel, seeded from the first input panel, ready to take differences into. Non-empty clipboard text loaded with --paste takes that panel before files do.",
         ),
         "--watch" => (
             "",
@@ -103,7 +103,7 @@ fn describe_action(action: Action) -> &'static str {
         Action::ToggleSettings => "Open or close the settings drawer.",
         Action::ToggleHelp => "Open or close the keyboard overlay.",
         Action::SaveResult => {
-            "Write the result to its file. With `--mergetool` this is what writes MERGED and answers Git."
+            "Write the result to its file. With `--mergetool` this writes MERGED and answers Git. Saving an unchanged starting result first asks for confirmation."
         }
         Action::SaveResultAs => {
             "Write the result to a file chosen in a dialog. In mergetool mode, choosing a destination other than Git's MERGED target exports a copy without retargeting later saves or marking the conflict resolved; explicitly choosing MERGED writes and resolves it."
@@ -388,7 +388,9 @@ pub fn reference() -> String {
          target and never a panel.\n\n\
          The result is seeded from the ancestor, not from Git's half-merged file — seeding from \
          that would mean diffing against its conflict markers — so each side arrives as \
-         differences to take.\n\n\
+         differences to take. Before the first save to MERGED, an unchanged starting result \
+         with no take history requires an explicit **Save unchanged result** confirmation. \
+         Cancel preserves Git's conflict file. Exporting a copy elsewhere does not resolve Git.\n\n\
          The exit status is the answer Git acts on under `trustExitCode`:\n\n\
          | status | meaning |\n| --- | --- |\n\
          | 0 | MERGED holds the merge. Git stages the file. |\n\
@@ -590,7 +592,7 @@ pub fn reference() -> String {
          refined at all, `--word-diff-regex` what a token is. Each choice states only the one \
          that defines it, so a `max-line-distance` set in your own gitconfig keeps working.\n\n",
     );
-    d.push_str("Turning off gitconfig inheritance is the only way to get output that does not depend on your gitconfig or working directory: delta ignores `GIT_CONFIG_GLOBAL`. Flipping any of the three view toggles in the toolbar also turns it off, and says so — the toolbar cannot honestly claim to control a view that config is overriding.\n\n");
+    d.push_str("Turning off gitconfig inheritance is the only way to get output that does not depend on your gitconfig or working directory: delta ignores `GIT_CONFIG_GLOBAL`. The toolbar preserves inheritance unless switching off a mode requires negating an inherited setting that delta cannot override: side-by-side, or line numbers in unified view. It announces that exception. Numbers off in side-by-side and Wrap off have explicit overrides; Wrap on overrides a configured zero wrapping limit while retaining positive limits.\n\n");
 
     // ---- Toolbar ----------------------------------------------------------
     d.push_str("## Toolbar\n\n| control | default | maps to |\n| --- | --- | --- |\n");
@@ -726,7 +728,7 @@ pub fn reference() -> String {
 
     // ---- Keys --------------------------------------------------------------
     d.push_str("## Keyboard\n\n");
-    d.push_str("Chords are written the way each platform writes them.\n\n");
+    d.push_str("Chords are written the way each platform writes them. Extra Shift or Alt modifiers are accepted for `/` and `\\`. On macOS layouts requiring Option for `\\`, use the primary Wrap shortcut, `⌘⇧L`.\n\n");
     for group in ["file", "compare", "panels", "result", "view"] {
         let _ = writeln!(d, "### {group}\n");
         d.push_str("| macOS | elsewhere | | |\n| --- | --- | --- | --- |\n");

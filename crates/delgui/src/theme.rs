@@ -43,6 +43,8 @@ pub struct Tokens {
     pub accent_solid: Color32,
     pub accent_quiet: Color32,
     pub on_accent: Color32,
+    pub diff_selection: Color32,
+    pub modal_backdrop: Color32,
     pub success: Color32,
     pub danger: Color32,
     pub danger_quiet: Color32,
@@ -79,6 +81,8 @@ impl Tokens {
             accent_solid: rgb(0x36, 0x70, 0xce),
             accent_quiet: rgb(0x1b, 0x27, 0x40),
             on_accent: rgb(0xff, 0xff, 0xff),
+            diff_selection: rgb(0x3a, 0x4a, 0x63),
+            modal_backdrop: Color32::from_black_alpha(160),
             success: rgb(0x6f, 0xbf, 0x77),
             danger: rgb(0xe0, 0x65, 0x5f),
             danger_quiet: rgb(0x2a, 0x14, 0x14),
@@ -128,6 +132,8 @@ impl Tokens {
             accent_solid: rgb(0x25, 0x63, 0xc7),
             accent_quiet: rgb(0xe8, 0xef, 0xfc),
             on_accent: rgb(0xff, 0xff, 0xff),
+            diff_selection: rgb(0xcd, 0xdd, 0xf5),
+            modal_backdrop: Color32::from_black_alpha(60),
             success: rgb(0x1f, 0x7a, 0x34),
             danger: rgb(0xc0, 0x39, 0x2b),
             danger_quiet: rgb(0xfd, 0xec, 0xea),
@@ -369,6 +375,14 @@ mod tests {
                 let ratio = contrast(tokens.text_muted, background);
                 assert!(ratio >= 4.5, "{name} muted text contrast was {ratio:.3}:1");
             }
+        }
+    }
+
+    #[test]
+    fn primary_text_clears_normal_text_contrast() {
+        for (name, tokens) in [("dark", Tokens::dark()), ("light", Tokens::light())] {
+            let ratio = contrast(tokens.on_accent, tokens.accent_solid);
+            assert!(ratio >= 4.5, "{name} primary text contrast was {ratio:.3}:1");
         }
     }
 

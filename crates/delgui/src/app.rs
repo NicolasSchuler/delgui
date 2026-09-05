@@ -717,6 +717,12 @@ pub struct App {
     /// whether the result is currently the writable baseline with take controls.
     building_result: bool,
     result_generation: u64,
+    /// Compare with the seed only when text changes, never on every repaint.
+    result_seed: Option<String>,
+    result_matches_seed: bool,
+    /// A save of the untouched Git seed needs an explicit decision first.
+    seed_save: Option<(PathBuf, bool)>,
+    quit_after_seed_save: bool,
     undo: VecDeque<ResultUndo>,
     redo: Vec<ResultUndo>,
     undo_bytes: usize,
@@ -961,6 +967,10 @@ impl App {
             requested: false,
             building_result: false,
             result_generation: 0,
+            result_seed: None,
+            result_matches_seed: false,
+            seed_save: None,
+            quit_after_seed_save: false,
             undo: VecDeque::new(),
             redo: Vec::new(),
             undo_bytes: 0,
@@ -1002,8 +1012,7 @@ impl App {
         }
         if let Some(tool) = &app.mergetool {
             app.notice = Some(format!(
-                "Resolving {} for git. {} writes the merge back and closes the question; \
-                 quitting without it tells git the conflict is unresolved.",
+                "Resolving {} for git. The result starts with the ancestor; take changes or edit it before saving. {} writes the result to Git’s target; quitting without saving leaves the conflict unresolved.",
                 tool.merged.display(),
                 keys::save_label(),
             ));
@@ -1060,10 +1069,19 @@ impl App {
 
     fn effective_options(&self) -> Options {
         let merging = self.merging();
+        let mut extra_args = self.opts.extra_args.clone();
+        // Wrap off already has an explicit zero limit. On needs an override
+        // only when config disables it; retain any positive configured limit.
+        if self.opts.wrap && self.opts.inherit_gitconfig
+            && !self.gitconfig.inherited_view_modes(self.features.iter().map(String::as_str)).wrap
+        {
+            extra_args.push("--wrap-max-lines=2".into());
+        }
         Options {
             width: self.columns as u16,
             default_language: self.resolve_language(),
             features: self.features.iter().cloned().collect(),
+            extra_args,
             // Forced here rather than on `self.opts`, which `save` persists
             // verbatim: building a result once would otherwise rewrite the
             // user's own toolbar defaults for good.
@@ -1126,6 +1144,9 @@ impl App {
     fn touch_panel(&mut self, i: usize) {
         if let Some(panel) = self.panels.get_mut(i) {
             panel.revision = panel.revision.wrapping_add(1);
+            if panel.result {
+                self.result_matches_seed = self.result_seed.as_deref() == Some(panel.text.as_str());
+            }
         }
         self.failed = None;
     }
@@ -1149,6 +1170,13 @@ impl App {
     fn schedule(&mut self, ctx: &egui::Context) {
         self.normalize();
         if !self.compared || self.in_flight.is_some() {
+            return;
+        }
+        // A render of the preserved snapshot cannot recover a failed reload.
+        // It also must not clear that failure's actionable banner.
+        let (reference, shown) = self.pair();
+        if self.panels[reference].disk_stale || self.panels[shown].disk_stale {
+            self.requested = false;
             return;
         }
         let key = self.current_key();
@@ -1405,7 +1433,7 @@ impl App {
     }
 
     fn modal_active(&self) -> bool {
-        self.show_help || self.quit_guard || self.destructive.is_some()
+        self.show_help || self.quit_guard || self.destructive.is_some() || self.seed_save.is_some()
     }
 
     fn enter_modal_focus(
@@ -1495,7 +1523,7 @@ impl App {
         bounds: Option<egui::Rect>,
     ) {
         ctx.accesskit_node_builder(id, |node| {
-            node.set_role(egui::accesskit::Role::ScrollView);
+            node.set_role(ui::scroll_region_role());
             node.set_label(label);
             if let Some(bounds) = bounds {
                 node.set_bounds(egui::accesskit::Rect {
@@ -1659,6 +1687,7 @@ impl App {
         // A newly created or explicitly re-seeded result is a new lifecycle.
         // Old take snapshots must never be able to write into it.
         self.begin_result_generation();
+        self.result_seed = self.mergetool.as_ref().map(|_| text.clone());
         let panel = &mut self.panels[slot];
         panel.clear();
         panel.result = true;
@@ -1846,7 +1875,14 @@ impl App {
             .or_else(|| self.panels[i].saved_to.clone())
     }
 
-    /// Write the result to a file. The only thing in delgui that writes one.
+    fn seed_save_needs_confirmation(&self, i: usize) -> bool {
+        self.mergetool.is_some()
+            && self.panels[i].saved_to.is_none()
+            && self.undo.is_empty()
+            && self.result_seed.as_deref() == Some(self.panels[i].text.as_str())
+    }
+
+    /// Choose a destination, then guard it before writing the result.
     fn save_result(&mut self, ask: bool) -> bool {
         let Some(i) = self.result_panel() else {
             self.notice = Some(
@@ -1900,6 +1936,16 @@ impl App {
         path: PathBuf,
         explicit_destination: bool,
     ) -> bool {
+        if self.seed_save_needs_confirmation(i)
+            && self.mergetool.as_ref().is_some_and(|tool| paths_refer_to_same_file(&path, &tool.merged))
+        {
+            self.seed_save = Some((path, explicit_destination));
+            return false;
+        }
+        self.write_result_to(i, path, explicit_destination)
+    }
+
+    fn write_result_to(&mut self, i: usize, path: PathBuf, explicit_destination: bool) -> bool {
         let export_only = self.mergetool.as_ref().is_some_and(|tool| {
             explicit_destination && !paths_refer_to_same_file(&path, &tool.merged)
         });
@@ -2214,8 +2260,15 @@ impl App {
 
     // ---- input -----------------------------------------------------------
 
-    fn take_view_control(&mut self) {
-        if self.opts.inherit_gitconfig {
+    fn take_view_control(&mut self, before: (bool, bool, bool)) {
+        let inherited = self.gitconfig.inherited_view_modes(self.features.iter().map(String::as_str));
+        // Turning side-by-side off also removes our empty number-column
+        // override, so a Numbers-off choice must remain effective in unified.
+        let disables_inherited_mode =
+            (before.0 && !self.opts.side_by_side && inherited.side_by_side)
+            || ((before.0 || before.1) && !self.opts.line_numbers
+                && !self.opts.side_by_side && inherited.line_numbers);
+        if self.opts.inherit_gitconfig && disables_inherited_mode {
             self.opts.inherit_gitconfig = false;
             self.features.clear();
             self.notice = Some(
@@ -2280,16 +2333,19 @@ impl App {
                 }
                 Action::SwapSides => self.swap_sides(),
                 Action::ToggleSideBySide => {
+                    let before = (self.opts.side_by_side, self.opts.line_numbers, self.opts.wrap);
                     self.opts.side_by_side = !self.opts.side_by_side;
-                    self.take_view_control();
+                    self.take_view_control(before);
                 }
                 Action::ToggleLineNumbers => {
+                    let before = (self.opts.side_by_side, self.opts.line_numbers, self.opts.wrap);
                     self.opts.line_numbers = !self.opts.line_numbers;
-                    self.take_view_control();
+                    self.take_view_control(before);
                 }
                 Action::ToggleWrap => {
+                    let before = (self.opts.side_by_side, self.opts.line_numbers, self.opts.wrap);
                     self.opts.wrap = !self.opts.wrap;
-                    self.take_view_control();
+                    self.take_view_control(before);
                 }
                 Action::ToggleSettings => self.show_settings = !self.show_settings,
                 Action::ToggleHelp => self.show_help = !self.show_help,
@@ -2529,6 +2585,7 @@ impl App {
         // font makes their indivisible segmented control wider than that lane.
         // A wrapped row with a nested right-to-left group let both runs paint in
         // the same pixels at the supported 720 px / 20 pt combination.
+        let before = (self.opts.side_by_side, self.opts.line_numbers, self.opts.wrap);
         let opts = &mut self.opts;
         egui::containers::Sides::new()
             .shrink_left()
@@ -2552,7 +2609,7 @@ impl App {
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                                    node.set_role(egui::accesskit::Role::ScrollView);
+                                    node.set_role(ui::scroll_region_role());
                                     node.set_label("View modes");
                                 });
                                 ui.spacing_mut().interact_size.y = strip_height - 6.0;
@@ -2578,15 +2635,13 @@ impl App {
                     {
                         toggle_help = true;
                     }
-                    let gear = ui.add(
-                        egui::Button::selectable(self.show_settings, "Settings")
-                            .corner_radius(radius::CONTROL)
-                            .min_size(Vec2::new(0.0, 26.0)),
-                    );
+                    let gear = ui::disclosure(ui, "Settings", self.show_settings);
                     if gear.on_hover_text(keys::settings_hint()).clicked() {
                         toggle_settings = true;
                     }
-                    if can_add_panel && ui::ghost(ui, "+ Panel").clicked() {
+                    if ui::ghost_enabled(ui, "+ Panel", can_add_panel)
+                        .on_disabled_hover_text("All six panels are in use")
+                        .clicked() {
                         add_panel = true;
                     }
                 },
@@ -2598,7 +2653,7 @@ impl App {
         if view_changed {
             // An inherited option can turn a mode back on after its button was
             // switched off. The toolbar is an explicit user command.
-            self.take_view_control();
+            self.take_view_control(before);
         }
         if add_panel {
             self.add_panel();
@@ -2642,10 +2697,10 @@ impl App {
                 // by another six points on every frame with many panels.
                 let row_height = ui.available_height();
                 ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                    node.set_role(egui::accesskit::Role::ScrollView);
+                    node.set_role(ui::scroll_region_role());
                     node.set_label("Input panels");
                 });
-                ui.horizontal(|ui| {
+                ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
                     for i in inputs {
                         let mut editor_gained_focus = false;
                         ui.allocate_ui_with_layout(
@@ -2688,14 +2743,7 @@ impl App {
                             // widgets first, then give the name exactly the
                             // remaining width so it is the only flexible item.
                             ui.horizontal(|ui| {
-                                let chip = ui.add(
-                                    egui::Button::selectable(
-                                        is_ref,
-                                        ui::strong(title(i).to_string()),
-                                    )
-                                    .corner_radius(radius::CHIP)
-                                    .min_size(Vec2::new(24.0, 22.0)),
-                                );
+                                let chip = ui::baseline_chip(ui, &title(i).to_string(), is_ref);
                                 if chip
                                     .on_hover_text(if is_ref {
                                         "This panel is the baseline. Everything else is compared against it."
@@ -2805,6 +2853,9 @@ impl App {
                         egui::ScrollArea::both()
                             .id_salt(i)
                             .auto_shrink([false, false])
+                            // egui's 64 pt default minimum otherwise overrules
+                            // this compact viewport and pushes the card below its row.
+                            .min_scrolled_height(0.0)
                             .max_height(whole_rows(ui, EDITOR_PAD))
                             .show(ui, |ui| {
                                 let editor_name = format!(
@@ -3285,14 +3336,7 @@ impl App {
                     {
                         stop = true;
                     }
-                    if ui
-                        .add_enabled(
-                            can_undo,
-                            egui::Button::new("Undo")
-                                .frame_when_inactive(false)
-                                .corner_radius(radius::CONTROL)
-                                .min_size(Vec2::new(0.0, 26.0)),
-                        )
+                    if ui::ghost_enabled(ui, "Undo", can_undo)
                         .on_hover_text("Put the result back as it was before the last take")
                         .on_disabled_hover_text("Nothing taken yet")
                         .clicked()
@@ -3519,7 +3563,7 @@ impl App {
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                                    node.set_role(egui::accesskit::Role::ScrollView);
+                                    node.set_role(ui::scroll_region_role());
                                     node.set_label("Difference navigation");
                                 });
                                 ui.horizontal(|ui| {
@@ -3698,11 +3742,7 @@ impl App {
                             // delta's colours are reproduced exactly; the only
                             // thing that may be tinted is the selection over
                             // them, whose default washes out on a diff ground.
-                            ui.visuals_mut().selection.bg_fill = if t.dark {
-                                Color32::from_rgb(0x3a, 0x4a, 0x63)
-                            } else {
-                                Color32::from_rgb(0xcd, 0xdd, 0xf5)
-                            };
+                            ui.visuals_mut().selection.bg_fill = t.diff_selection;
                             // Above the merge/plain branch, and inside the
                             // viewport closure: that is what makes merge mode
                             // one tab stop too, puts the region's accessibility
@@ -3810,9 +3850,11 @@ impl App {
         live: bool,
     ) -> (egui::Rect, bool) {
         let mut clicked = false;
+        let rule_width = ui.available_width();
         let rect = Frame::new()
             .inner_margin(Margin::symmetric(0, 4))
             .show(ui, |ui| {
+                ui.set_min_width(rule_width);
                 ui.horizontal(|ui| {
                     let button = egui::Button::new(ui::small(format!(
                         "Use {}'s version",
@@ -3856,9 +3898,11 @@ impl App {
             .then(|| self.panel_label(i));
         let (state, state_is_success) = if let Some(tool) = &self.mergetool {
             if self.result_is_saved_to(i, &tool.merged) {
-                ("Git target saved".to_owned(), true)
+                ("saved".to_owned(), true)
+            } else if self.panels[i].saved_to.is_none() && self.result_matches_seed && self.undo.is_empty() {
+                ("Nothing taken yet · not saved".to_owned(), false)
             } else {
-                ("Git target not saved".to_owned(), false)
+                ("not saved".to_owned(), false)
             }
         } else {
             match (
@@ -3866,7 +3910,7 @@ impl App {
                 self.panels[i].dirty,
                 self.result_last_save_is_current(i),
             ) {
-                (None, _, _) => ("not saved yet".to_owned(), false),
+                (None, _, _) => ("not saved".to_owned(), false),
                 (Some(_), true, _) => ("unsaved changes".to_owned(), false),
                 (Some(_), false, true) => ("saved".to_owned(), true),
                 (Some(_), false, false) => ("saved file missing or changed".to_owned(), false),
@@ -3960,14 +4004,7 @@ impl App {
         ) {
             act.save = Some(first_save);
         }
-        if ui
-            .add_enabled(
-                has_text,
-                egui::Button::new("Copy")
-                    .frame_when_inactive(false)
-                    .corner_radius(radius::CONTROL)
-                    .min_size(Vec2::new(0.0, 26.0)),
-            )
+        if ui::ghost_enabled(ui, "Copy", has_text)
             .on_hover_text("Copy the whole result to the clipboard")
             .clicked()
         {
@@ -4005,7 +4042,7 @@ impl App {
                     ui.close();
                 }
             }
-            if ui.button("nothing").clicked() {
+            if ui.button("Start empty").clicked() {
                 act.seed = Some(None);
                 ui.close();
             }
@@ -4082,6 +4119,7 @@ impl App {
         egui::ScrollArea::both()
             .id_salt("result-band")
             .auto_shrink([false, false])
+            .min_scrolled_height(0.0)
             .max_height(whole_rows(ui, EDITOR_PAD))
             .show(ui, |ui| {
                 let editor_name = format!("Result editor, {}", self.panel_label(i));
@@ -4139,7 +4177,12 @@ impl App {
     }
 
     fn stale_pill(&self, ui: &mut egui::Ui, t: &Tokens) {
-        let text = if self.in_flight.is_some() {
+        let (reference, shown) = self.pair();
+        let text = if self.panels[reference].disk_stale || self.panels[shown].disk_stale {
+            format!("Reload failed — {} to retry", keys::compare_label())
+        } else if self.failed.as_ref() == Some(&self.current_key()) {
+            format!("Render failed — {} to retry", keys::compare_label())
+        } else if self.in_flight.is_some() {
             "Re-rendering…".to_string()
         } else if self.auto_renders() {
             "Out of date".to_string()
@@ -4701,6 +4744,66 @@ impl App {
             });
     }
 
+    /// Saving the starting text can be intentional, but must not silently
+    /// resolve Git's conflict before the user has made that choice.
+    fn seed_save_modal(&mut self, ctx: &egui::Context) {
+        let Some((path, explicit_destination)) = self.seed_save.clone() else { return };
+        // This modal takes the quit guard's drawing slot. Native window/menu
+        // closes still need cancelling while the save decision is pending.
+        if ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let t = Tokens::of(ctx.theme());
+        let modal_id = egui::Id::new("save-unchanged-result");
+        let (width, height) = Self::modal_dimensions(ctx);
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut safe_control = None;
+        let response = egui::Modal::new(modal_id)
+            .frame(Frame::new().fill(t.surface_overlay)
+                .stroke(Stroke::new(1.0, t.border_strong))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(Margin::same(24)))
+            .backdrop_color(t.modal_backdrop)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.label(RichText::new("Save unchanged result?").text_style(TextStyle::Heading));
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("seed-save-details")
+                    .max_height((height - 168.0).max(72.0))
+                    .show(ui, |ui| {
+                        Self::mark_scroll_view(ctx, ui.unique_id(), "Unchanged result details", None);
+                        ui.label("Nothing has been taken yet, and the result still matches its starting text. Saving to Git's target replaces the conflict with this unchanged text and marks it resolved.");
+                    });
+                ui.add_space(16.0);
+                ui.horizontal_wrapped(|ui| {
+                    confirm = ui::ghost(ui, "Save unchanged result").clicked();
+                    safe_control = Some(ui.next_auto_id());
+                    cancel = ui::primary(ui, &t, "Cancel", "Esc", true);
+                });
+            });
+        Self::mark_modal(ctx, &response.response, egui::accesskit::Role::AlertDialog,
+            "Save unchanged result?");
+        if let Some(safe_control) = safe_control {
+            self.enter_modal_focus(ctx, modal_id, safe_control, None);
+        }
+        if confirm || cancel || response.should_close() {
+            self.seed_save = None;
+            self.leave_modal_focus(ctx, modal_id);
+            if confirm && self.result_panel().is_some_and(|i| self.write_result_to(i, path, explicit_destination)) {
+                if self.quit_after_seed_save {
+                    self.closing = true;
+                    self.quit_guard = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else if let Some(action) = self.destructive.take() {
+                    self.apply_destructive(action);
+                }
+            }
+            self.quit_after_seed_save = false;
+        }
+    }
+
     fn destructive_modal(&mut self, ctx: &egui::Context) {
         let Some(action) = self.destructive.as_ref() else {
             self.restore_pending_modal_focus(ctx);
@@ -4762,7 +4865,7 @@ impl App {
                     .corner_radius(egui::CornerRadius::same(12))
                     .inner_margin(Margin::same(24)),
             )
-            .backdrop_color(Color32::from_black_alpha(if t.dark { 160 } else { 60 }))
+            .backdrop_color(t.modal_backdrop)
             .show(ctx, |ui| {
                 ui.set_width(modal_width);
                 ui.set_max_height(modal_height);
@@ -4889,7 +4992,7 @@ impl App {
                     .corner_radius(egui::CornerRadius::same(12))
                     .inner_margin(Margin::same(24)),
             )
-            .backdrop_color(Color32::from_black_alpha(if t.dark { 160 } else { 60 }))
+            .backdrop_color(t.modal_backdrop)
             .show(ctx, |ui| {
                 ui.set_width(modal_width);
                 ui.set_max_height(modal_height);
@@ -4946,6 +5049,13 @@ impl App {
                                 ))
                                 .color(t.text_secondary),
                             );
+                        }
+                        ui.add_space(6.0);
+                        let names = unsaved.iter()
+                            .map(|&i| format!("{} · {}", title(i), self.panel_label(i)))
+                            .collect::<Vec<_>>().join(", ");
+                        if !names.is_empty() {
+                            ui.label(RichText::new(names).color(t.warning));
                         }
                         scroll_id
                     });
@@ -5020,9 +5130,7 @@ impl App {
             self.enter_modal_focus(ctx, modal_id, safe_control, None);
         }
         if save_shortcut {
-            if has_result
-                && ((merge_unresolved && !other_unsaved)
-                    || (result.is_some() && !other_unsaved))
+            if has_result && !other_unsaved && (merge_unresolved || result.is_some())
             {
                 save_and_quit = true;
             } else if has_result && (merge_unresolved || result.is_some()) {
@@ -5032,10 +5140,14 @@ impl App {
         if save_result {
             let _ = self.save_result(false);
         }
-        if save_and_quit && self.save_result(false) {
-            self.closing = true;
-            self.quit_guard = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if save_and_quit {
+            if self.save_result(false) {
+                self.closing = true;
+                self.quit_guard = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if self.seed_save.is_some() {
+                self.quit_after_seed_save = true;
+            }
         }
         if discard {
             self.closing = true;
@@ -5074,7 +5186,7 @@ impl App {
                     .corner_radius(egui::CornerRadius::same(12))
                     .inner_margin(Margin::same(24)),
             )
-            .backdrop_color(Color32::from_black_alpha(if t.dark { 160 } else { 60 }))
+            .backdrop_color(t.modal_backdrop)
             .show(ctx, |ui| {
                 ui.set_width(modal_width);
                 ui.set_max_height(modal_height);
@@ -5086,7 +5198,7 @@ impl App {
                     .max_height((modal_height - 92.0).max(100.0))
                     .show(ui, |ui| {
                         ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                            node.set_role(egui::accesskit::Role::ScrollView);
+                            node.set_role(ui::scroll_region_role());
                             node.set_label("Keyboard shortcuts");
                         });
                         let mut group = "";
@@ -5205,6 +5317,9 @@ impl App {
                         title(i),
                     ));
                 }
+                // Reloads happen after drawing. A failed reload starts no
+                // render job, so nothing else would repaint its new warning.
+                ctx.request_repaint();
             } else {
                 ctx.request_repaint_after(WATCH_DEBOUNCE);
             }
@@ -5275,7 +5390,10 @@ const EDITOR_PAD: f32 = 6.0;
 /// below -- which is a bad thing for a diff tool to look like. The leftover
 /// becomes padding inside the card, where it is invisible.
 fn whole_rows(ui: &egui::Ui, pad: f32) -> f32 {
-    let row = ui.text_style_height(&TextStyle::Monospace);
+    // epaint rounds each laid-out row to a physical pixel; the raw font
+    // metrics can be fractional (14.53 pt at the default 12.5 pt font).
+    let scale = ui.ctx().pixels_per_point();
+    let row = (ui.text_style_height(&TextStyle::Monospace) * scale).round() / scale;
     let rows = ((ui.available_height() - pad) / row).floor().max(1.0);
     pad + rows * row
 }
@@ -5529,13 +5647,16 @@ impl eframe::App for App {
             .show(ui, |ui| self.diff_area(ui, ctx, glyph));
 
         self.handle_keys(ctx, actions);
-        self.quit_guard(ctx);
-        if !self.quit_guard {
-            self.destructive_modal(ctx);
+        if self.seed_save.is_none() {
+            self.quit_guard(ctx);
+            if !self.quit_guard {
+                self.destructive_modal(ctx);
+            }
+            if !self.quit_guard && self.destructive.is_none() && self.seed_save.is_none() {
+                self.help_modal(ctx);
+            }
         }
-        if !self.quit_guard && self.destructive.is_none() {
-            self.help_modal(ctx);
-        }
+        self.seed_save_modal(ctx);
         self.accept_drops(ctx);
         self.sync_watches(ctx);
         self.draw_drop_hint(ctx, ui);
@@ -5779,7 +5900,7 @@ mod tests {
             update
                 .nodes
                 .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::ScrollView),
+                .any(|(_, node)| node.role() == ui::scroll_region_role()),
             "long help contents have no accessible scroll region",
         );
         let safe = app.modal_focus.expect("help established a focus contract").2;
@@ -5853,7 +5974,7 @@ mod tests {
             .nodes
             .iter()
             .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::ScrollView
+                node.role() == ui::scroll_region_role()
                     && node.label() == Some("Destructive action details")
             })
             .expect("accessible destructive details");
@@ -5931,7 +6052,7 @@ mod tests {
             .nodes
             .iter()
             .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::ScrollView
+                node.role() == ui::scroll_region_role()
                     && node.label() == Some("Unsaved work details")
             })
             .expect("accessible unsaved-work details");
@@ -6149,6 +6270,141 @@ mod tests {
         assert!(!resolved.load(Ordering::Relaxed));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn untouched_mergetool_save_requires_an_explicit_choice() {
+        for seed in ["", "ancestor\n"] {
+            let dir = temp_path("mergetool-seed-save");
+            std::fs::create_dir_all(&dir).unwrap();
+            let base = dir.join("base");
+            let local = dir.join("local");
+            let remote = dir.join("remote");
+            let merged = dir.join("MERGED");
+            std::fs::write(&base, seed).unwrap();
+            std::fs::write(&local, "ours\n").unwrap();
+            std::fs::write(&remote, "theirs\n").unwrap();
+            std::fs::write(&merged, "conflict markers\n").unwrap();
+            let (mut app, resolved) = test_mergetool_app(&[base, local, remote], merged.clone());
+            let result = app.result_panel().unwrap();
+            assert!(app.result_identity_view(result).state.contains("Nothing taken yet"));
+            assert!(app.save_result_to(result, dir.join("export.txt"), true));
+            assert!(app.seed_save.is_none());
+            assert!(!resolved.load(Ordering::Relaxed));
+            assert!(!app.save_result(false));
+            assert!(!resolved.load(Ordering::Relaxed));
+            assert_eq!(std::fs::read_to_string(&merged).unwrap(), "conflict markers\n");
+            let (ctx, screen) = modal_test_context();
+            let mut output = ctx.run_ui(screen_input(screen), |_ui| app.seed_save_modal(&ctx));
+            let update = output.platform_output.accesskit_update.take().unwrap();
+            output.textures_delta.clear();
+            let safe = app.modal_focus.unwrap().2;
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(safe));
+            let dialog = update.nodes.iter().find(|(_, node)| node.label() == Some("Save unchanged result?")).unwrap();
+            assert_inside_screen(screen, dialog.1.bounds().unwrap(), "seed save confirmation");
+            let mut cancel = screen_input(screen);
+            cancel.events.push(egui::Event::Key { key: Key::Escape, physical_key: None,
+                pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+            ctx.run_ui(cancel, |_ui| app.seed_save_modal(&ctx)).textures_delta.clear();
+            assert!(app.seed_save.is_none());
+            assert_eq!(std::fs::read_to_string(&merged).unwrap(), "conflict markers\n");
+            assert!(!resolved.load(Ordering::Relaxed));
+
+            assert!(!app.save_result(false));
+            let mut output = ctx.run_ui(screen_input(screen), |_ui| app.seed_save_modal(&ctx));
+            let update = output.platform_output.accesskit_update.take().unwrap();
+            output.textures_delta.clear();
+            let save_id = update.nodes.iter().find(|(_, node)| node.label() == Some("Save unchanged result")).unwrap().0;
+            app.quit_guard = true;
+            app.quit_after_seed_save = true;
+            let mut confirm = screen_input(screen);
+            confirm.events.push(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click, target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: save_id, data: None,
+            }));
+            let mut saved = ctx.run_ui(confirm, |_ui| app.seed_save_modal(&ctx));
+            assert!(saved.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close));
+            saved.textures_delta.clear();
+            assert!(app.closing);
+            assert!(!app.quit_guard);
+            assert_eq!(std::fs::read_to_string(&merged).unwrap(), seed);
+            assert!(resolved.load(Ordering::Relaxed));
+            assert!(app.seed_save.is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_native_close_during_seed_confirmation_keeps_unsaved_panels_open() {
+        let mut app = test_app();
+        app.panels[0].text = "unsaved source text\n".into();
+        app.seed_save = Some((temp_path("seed-confirmation-close"), false));
+        let (ctx, screen) = modal_test_context();
+        let mut input = screen_input(screen);
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap()
+            .events.push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut eframe::Frame::_new_kittest()));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].commands
+            .contains(&egui::ViewportCommand::CancelClose));
+        assert!(!app.closing);
+        assert_eq!(app.panels[0].text, "unsaved source text\n");
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn view_toggles_preserve_unrelated_gitconfig_settings() {
+        let ctx = egui::Context::default();
+        for action in [Action::ToggleSideBySide, Action::ToggleLineNumbers, Action::ToggleWrap] {
+            let mut app = test_app();
+            app.gitconfig = DeltaConfig::default();
+            app.gitconfig.settings.insert("syntax-theme".into(), "GitHub".into());
+            app.features.insert("decorations".into());
+            app.handle_keys(&ctx, vec![action]);
+            assert!(app.opts.inherit_gitconfig, "{action:?} dropped unrelated settings");
+            assert!(app.features.contains("decorations"));
+        }
+        let mut app = test_app();
+        app.gitconfig = DeltaConfig::default();
+        app.gitconfig.settings.insert("side-by-side".into(), "true".into());
+        app.opts.side_by_side = true;
+        app.handle_keys(&ctx, vec![Action::ToggleSideBySide]);
+        assert!(!app.opts.inherit_gitconfig, "delta cannot negate inherited side-by-side");
+
+        let mut app = test_app();
+        app.gitconfig = DeltaConfig::default();
+        app.gitconfig.settings.insert("line-numbers".into(), "true".into());
+        app.opts.line_numbers = true;
+        app.opts.side_by_side = true;
+        app.handle_keys(&ctx, vec![Action::ToggleLineNumbers]);
+        assert!(app.opts.inherit_gitconfig, "empty side-by-side number formats suffice");
+        app.opts.side_by_side = false;
+        app.opts.line_numbers = true;
+        app.handle_keys(&ctx, vec![Action::ToggleLineNumbers]);
+        assert!(!app.opts.inherit_gitconfig, "unified numbers have no negative flag");
+
+        let mut app = test_app();
+        app.gitconfig = DeltaConfig::default();
+        app.gitconfig.settings.insert("line-numbers".into(), "true".into());
+        app.opts.side_by_side = true;
+        app.opts.line_numbers = false;
+        app.handle_keys(&ctx, vec![Action::ToggleSideBySide]);
+        assert!(!app.opts.inherit_gitconfig, "unified mode must preserve Numbers off");
+
+        let mut app = test_app();
+        app.gitconfig = DeltaConfig::default();
+        app.gitconfig.settings.insert("wrap-max-lines".into(), "0".into());
+        app.opts.wrap = false;
+        let off = app.effective_options().fingerprint();
+        app.handle_keys(&ctx, vec![Action::ToggleWrap]);
+        assert!(app.opts.inherit_gitconfig);
+        assert!(app.effective_options().to_args().contains(&"--wrap-max-lines=2".into()));
+        assert_ne!(app.effective_options().fingerprint(), off);
+        app.handle_keys(&ctx, vec![Action::ToggleWrap]);
+        assert_eq!(app.effective_options().fingerprint(), off);
+        app.gitconfig.settings.insert("wrap-max-lines".into(), "5".into());
+        app.handle_keys(&ctx, vec![Action::ToggleWrap]);
+        assert!(!app.effective_options().to_args().iter().any(|arg| arg.starts_with("--wrap-max-lines=")),
+            "positive configured wrap limits remain inherited");
     }
 
     /// Git's destination is already the primary Save target on the first frame,
@@ -7529,7 +7785,7 @@ mod tests {
             .iter()
             .find(|(_, node)| node.label() == Some("Diff scroll region"))
             .expect("diff ScrollView");
-        assert_eq!(scroll.role(), egui::accesskit::Role::ScrollView);
+        assert_eq!(scroll.role(), ui::scroll_region_role());
         let mut pending = scroll.children().to_vec();
         let mut found = false;
         while let Some(id) = pending.pop() {
@@ -8032,41 +8288,56 @@ mod tests {
         );
     }
 
-    /// A text viewport must end where a row ends.
-    ///
-    /// The arithmetic is one line and it has been wrong twice: `pad` is the
-    /// `TextEdit` frame's *top* margin only, because that is what offsets row
-    /// zero. Counting both margins leaves the bottom of the viewport showing
-    /// the top few pixels of the row after the last one -- the same sliced
-    /// glyphs, one row further down.
+    /// Test against actual TextEdit galleys, including physical-pixel rounding.
     #[test]
     fn an_editor_viewport_ends_on_a_row_boundary() {
-        let ctx = egui::Context::default();
-        ctx.set_fonts(crate::fonts::definitions(None, None, None));
-        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, 12.5);
-        let mut out = ctx.run_ui(Default::default(), |ui| {
-            let row = ui.text_style_height(&TextStyle::Monospace);
-            for slack in [0.0, 1.0, 7.0, row - 0.1] {
-                ui.scope(|ui| {
-                    ui.set_max_height(EDITOR_PAD + 11.0 * row + slack);
+        for size in [10.0, 12.5, 16.0, 24.0] {
+            for scale in [1.0, 1.5, 2.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                ctx.set_fonts(crate::fonts::definitions(None, None, None));
+                crate::theme::install(&ctx, 13.0, size);
+                let mut text = "a row\n".repeat(40);
+                let mut output = ctx.run_ui(Default::default(), |ui| {
+                    ui.set_max_height(203.0);
                     let height = whole_rows(ui, EDITOR_PAD);
+                    let edit = egui::TextEdit::multiline(&mut text)
+                        .font(TextStyle::Monospace).show(ui);
+                    let row = edit.galley.rows[1].pos.y - edit.galley.rows[0].pos.y;
                     let rows = (height - EDITOR_PAD) / row;
-                    assert!(
-                        (rows - rows.round()).abs() < 0.001,
-                        "{height} is {rows} rows, not a whole number",
-                    );
-                    assert!(height <= ui.available_height() + 0.001);
-                    assert!(height > ui.available_height() - row);
+                    assert!((rows - rows.round()).abs() < 0.001,
+                        "{size} pt at {scale}x: {height} clips row {rows} (pitch {row})");
                 });
+                output.textures_delta.clear();
             }
-            // Never zero rows, however little is left: an empty viewport shows
-            // nothing at all, which is worse than a cramped one.
-            ui.scope(|ui| {
-                ui.set_max_height(4.0);
-                assert!(whole_rows(ui, EDITOR_PAD) > EDITOR_PAD);
+        }
+    }
+
+    #[test]
+    fn compact_source_cards_share_a_top_and_fit_their_row() {
+        for (ui_pt, mono_pt) in [(13.0, 12.5), (20.0, 24.0)] {
+            let mut app = test_app();
+            for (i, panel) in app.panels.iter_mut().enumerate() {
+                panel.text = "line of content\n".repeat(40);
+                panel.path = Some(PathBuf::from(format!("input-{i}.rs")));
+                panel.resniff();
+            }
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::fonts::definitions(None, None, None));
+            crate::theme::install(&ctx, ui_pt, mono_pt);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(720.0, 480.0));
+            let mut bounds = egui::Rect::NOTHING;
+            let mut output = ctx.run_ui(screen_input(screen), |ui| {
+                ui.set_max_height(106.0);
+                bounds = ui.available_rect_before_wrap();
+                app.panel_row(ui, &ctx);
             });
-        });
-        out.textures_delta.clear();
+            output.textures_delta.clear();
+            let [a, b] = app.panel_rects.as_slice() else { panic!("two cards") };
+            assert!((a.top() - b.top()).abs() < 0.1, "cards are staggered: {a:?}, {b:?}");
+            assert!(a.bottom() <= bounds.bottom() + 0.1, "first card clips: {a:?}, {bounds:?}");
+            assert!(b.bottom() <= bounds.bottom() + 0.1, "second card clips: {b:?}, {bounds:?}");
+        }
     }
 
     #[test]
@@ -8555,7 +8826,16 @@ mod tests {
 
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
         app.pending_reload = Some(Instant::now() - WATCH_DEBOUNCE);
-        app.tick(&egui::Context::default());
+        let ctx = egui::Context::default();
+        // Retire startup repaints so only the reload can request this frame.
+        for _ in 0..3 {
+            ctx.run_ui(Default::default(), |_ui| {}).textures_delta.clear();
+        }
+        ctx.run_ui(Default::default(), |_ui| {
+            assert!(!ctx.has_requested_repaint());
+            app.tick(&ctx);
+            assert!(ctx.has_requested_repaint(), "the failure banner needs a new frame");
+        }).textures_delta.clear();
 
         assert_eq!(app.panels[1].text, "before\n");
         assert!(app.panels[1].disk_stale);
@@ -8567,6 +8847,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("Could not read"))
         );
+
+        let error = app.error.clone();
+        app.touch_panel(0);
+        app.tick(&egui::Context::default());
+        assert_eq!(app.error, error, "an unrelated change cleared the reload failure");
+        assert!(app.in_flight.is_none(), "stale disk input cannot be repaired by rendering");
 
         std::fs::write(&path, "after\n").unwrap();
         app.reload_panel(1);

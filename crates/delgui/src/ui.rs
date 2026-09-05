@@ -55,12 +55,51 @@ pub fn card(t: &Tokens, fill: Color32, outlined: bool) -> Frame {
 /// The one action the app is for. Filled, so nothing else on screen competes.
 pub fn primary(ui: &mut Ui, t: &Tokens, label: &str, shortcut: &str, enabled: bool) -> bool {
     let button = Button::new(RichText::new(label).color(t.on_accent))
-        .shortcut_text(RichText::new(shortcut).color(t.on_accent.gamma_multiply(0.65)))
+        .shortcut_text(RichText::new(shortcut).color(t.on_accent))
         .fill(t.accent_solid)
         .stroke(Stroke::NONE)
         .corner_radius(radius::CONTROL)
         .min_size(Vec2::new(0.0, 28.0));
     ui.add_enabled(enabled, button).clicked()
+}
+
+/// A button that opens a drawer, with expanded state rather than a checkbox.
+pub fn disclosure(ui: &mut Ui, label: &str, expanded: bool) -> egui::Response {
+    let response = ui.add(
+        Button::selectable(expanded, label)
+            .corner_radius(radius::CONTROL)
+            .min_size(Vec2::new(0.0, 26.0)),
+    );
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.clear_toggled();
+        node.set_expanded(expanded);
+    });
+    response
+}
+
+/// The mutually exclusive baseline choice, visually identified by its letter.
+pub fn baseline_chip(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let response = ui.add(
+        Button::selectable(selected, strong(label))
+            .corner_radius(radius::CHIP)
+            .min_size(Vec2::new(24.0, 22.0)),
+    );
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::RadioButton);
+        node.set_label(format!("Use panel {label} as baseline"));
+    });
+    response
+}
+
+/// AccessKit's macOS adapter maps ScrollView to AXUnknown. A named Group keeps
+/// these regions discoverable there without changing their scrolling or focus.
+pub fn scroll_region_role() -> egui::accesskit::Role {
+    if cfg!(target_os = "macos") {
+        egui::accesskit::Role::Group
+    } else {
+        egui::accesskit::Role::ScrollView
+    }
 }
 
 /// Quiet by default, outlined on hover. Everything that is not the primary
@@ -244,7 +283,7 @@ pub fn banner(ui: &mut Ui, t: &Tokens, tone: Tone, text: &str) -> bool {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                                node.set_role(egui::accesskit::Role::ScrollView);
+                                node.set_role(scroll_region_role());
                                 node.set_label("Message details");
                             });
                             ui.add(egui::Label::new(RichText::new(text).color(fg)).wrap());
@@ -307,7 +346,7 @@ fn empty_state_scroll(
         .show(ui, |ui| {
             let accessibility = ui.unique_id();
             ui.ctx().accesskit_node_builder(accessibility, |node| {
-                node.set_role(egui::accesskit::Role::ScrollView);
+                node.set_role(scroll_region_role());
                 node.set_label("Getting started");
             });
             // A scroll area's content width follows its children. Hold it open
@@ -627,6 +666,67 @@ mod tests {
     }
 
     #[test]
+    fn primary_shortcut_keeps_the_labels_full_contrast() {
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let ctx = test_ctx(13.0);
+            ctx.set_theme(theme);
+            let t = Tokens::of(theme);
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                primary(ui, &t, "Compare", "Ctrl+Enter", true);
+            });
+            let mut texts = Vec::new();
+            fn collect<'a>(shape: &'a egui::epaint::Shape, texts: &mut Vec<&'a egui::epaint::TextShape>) {
+                match shape {
+                    egui::epaint::Shape::Text(text) => texts.push(text),
+                    egui::epaint::Shape::Vec(shapes) => {
+                        for shape in shapes { collect(shape, texts); }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in &output.shapes { collect(&shape.shape, &mut texts); }
+            for label in ["Compare", "Ctrl+Enter"] {
+                let text = texts.iter().find(|text| text.galley.text() == label)
+                    .expect("button label is painted");
+                assert_eq!(text.opacity_factor, 1.0);
+                for section in &text.galley.job.sections {
+                    assert_eq!(section.format.color, t.on_accent, "{label} in {theme:?}");
+                }
+            }
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn disclosure_and_baseline_controls_publish_their_actual_semantics() {
+        for expanded in [false, true] {
+            let ctx = test_ctx(13.0);
+            ctx.enable_accesskit();
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                disclosure(ui, "Settings", expanded);
+                baseline_chip(ui, "A", true);
+                baseline_chip(ui, "B", false);
+            });
+            let update = output.platform_output.accesskit_update.as_ref().unwrap();
+            let node = |label| &update.nodes.iter().find(|(_, node)| node.label() == Some(label))
+                .expect("named control").1;
+            let settings = node("Settings");
+            assert_eq!(settings.role(), egui::accesskit::Role::Button);
+            assert_eq!(settings.is_expanded(), Some(expanded));
+            assert_eq!(settings.toggled(), None);
+            for (label, state) in [
+                ("Use panel A as baseline", egui::accesskit::Toggled::True),
+                ("Use panel B as baseline", egui::accesskit::Toggled::False),
+            ] {
+                let baseline = node(label);
+                assert_eq!(baseline.role(), egui::accesskit::Role::RadioButton);
+                assert_eq!(baseline.toggled(), Some(state));
+            }
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
     fn long_error_keeps_dismiss_and_the_comparison_inside_a_short_view() {
         for ui_pt in [13.0, 20.0] {
             let ctx = test_ctx(ui_pt);
@@ -651,7 +751,7 @@ mod tests {
                     .expect("dismiss action").1.bounds().unwrap();
                 assert!(dismiss.x0 >= 0.0 && dismiss.x1 <= 688.0);
                 assert!(dismiss.y0 >= 0.0 && dismiss.y1 <= 120.0);
-                assert!(update.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::ScrollView
+                assert!(update.nodes.iter().any(|(_, n)| n.role() == scroll_region_role()
                     && n.label() == Some("Message details")));
                 output.textures_delta.clear();
             }
@@ -730,7 +830,7 @@ mod tests {
             .nodes
             .iter()
             .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::ScrollView
+                node.role() == scroll_region_role()
                     && node.label() == Some("Getting started")
             })
             .expect("named empty-state scroll view");

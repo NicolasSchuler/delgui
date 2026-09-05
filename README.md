@@ -211,7 +211,7 @@ both-sides-added conflict and must not be filled in by "the first empty panel".
 | <kbd>⌘S</kbd> · <kbd>⌘⇧S</kbd> | save the result · save it as a new file |
 | <kbd>⌘⇧Enter</kbd> | take the current difference into the result |
 | <kbd>⌘Z</kbd> · <kbd>⌘⇧Z</kbd> | undo · redo the last take (only outside a text field) |
-| <kbd>⌘⌥S</kbd> · <kbd>⌘L</kbd> · <kbd>⌘\\</kbd> | side by side · line numbers · wrap |
+| <kbd>⌘⌥S</kbd> · <kbd>⌘L</kbd> · <kbd>⌘⇧L</kbd> | side by side · line numbers · wrap |
 | <kbd>⌘,</kbd> · <kbd>⌘/</kbd> | settings · show this list |
 
 Off macOS these are the same chords with <kbd>Ctrl</kbd>. Everything else lives in each panel's

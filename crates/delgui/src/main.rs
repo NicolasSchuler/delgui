@@ -25,7 +25,7 @@ delgui — a paste-first GUI frontend for delta
   delgui [OPTIONS] [FILE]...
 
   --paste       load the clipboard into the first panel
-  --combine     start a result panel, seeded from the first file
+  --combine     start a result panel, seeded from the first input panel
   --watch       re-diff when a file given here changes on disk
   --hotkey      register a system-wide hotkey that pastes into a fresh panel
   --mergetool   resolve a conflict for git: BASE LOCAL REMOTE MERGED
