@@ -213,6 +213,7 @@ pub fn segmented(ui: &mut Ui, t: &Tokens, items: &mut [(&str, &mut bool)]) -> bo
 pub fn choice<T: PartialEq + Copy>(
     ui: &mut Ui,
     t: &Tokens,
+    group: &str,
     current: &mut T,
     options: &[(T, &str)],
 ) -> bool {
@@ -236,7 +237,12 @@ pub fn choice<T: PartialEq + Copy>(
                     let button = Button::selectable(*current == *value, *label)
                         .corner_radius(CornerRadius::same(5))
                         .min_size(Vec2::new(0.0, 24.0));
-                    if ui.add(button).clicked() && *current != *value {
+                    let response = ui.add(button);
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_role(egui::accesskit::Role::RadioButton);
+                        node.set_label(format!("{group}: {label}"));
+                    });
+                    if response.clicked() && *current != *value {
                         *current = *value;
                         changed = true;
                     }
@@ -317,8 +323,21 @@ pub fn empty_state(ui: &mut Ui, t: &Tokens, title: &str, body: &str, rows: &[(&s
     let _ = empty_state_scroll(ui, t, title, body, rows);
 }
 
-const EMPTY_STATE_COMPACT_HEIGHT: f32 = 320.0;
-const EMPTY_STATE_COMPACT_TOP: f32 = 12.0;
+const GUIDANCE_COMPACT_HEIGHT: f32 = 320.0;
+const GUIDANCE_COMPACT_TOP: f32 = 12.0;
+
+fn guidance_top_space(viewport_height: f32) -> f32 {
+    if viewport_height < GUIDANCE_COMPACT_HEIGHT {
+        let progress = ((viewport_height - 120.0) / (GUIDANCE_COMPACT_HEIGHT - 120.0))
+            .clamp(0.0, 1.0);
+        egui::lerp(
+            GUIDANCE_COMPACT_TOP..=GUIDANCE_COMPACT_HEIGHT * 0.22,
+            progress,
+        )
+    } else {
+        viewport_height * 0.22
+    }
+}
 
 fn empty_state_scroll(
     ui: &mut Ui,
@@ -328,17 +347,7 @@ fn empty_state_scroll(
     rows: &[(&str, &str)],
 ) -> egui::scroll_area::ScrollAreaOutput<(egui::Rect, egui::Rect)> {
     let viewport_height = ui.available_height();
-    let top_space = if viewport_height < EMPTY_STATE_COMPACT_HEIGHT {
-        let progress = ((viewport_height - 120.0)
-            / (EMPTY_STATE_COMPACT_HEIGHT - 120.0))
-            .clamp(0.0, 1.0);
-        egui::lerp(
-            EMPTY_STATE_COMPACT_TOP..=EMPTY_STATE_COMPACT_HEIGHT * 0.22,
-            progress,
-        )
-    } else {
-        viewport_height * 0.22
-    };
+    let top_space = guidance_top_space(viewport_height);
     let content_width = ui.available_width();
     egui::ScrollArea::vertical()
         .id_salt("empty-state-scroll")
@@ -412,16 +421,58 @@ fn empty_state_scroll(
 /// The two inputs matched. Deliberately not styled as an error or as emptiness:
 /// "these are the same" is a real answer and often the one being looked for.
 pub fn identical(ui: &mut Ui, t: &Tokens, body: &str) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.22);
-        ui.label(
-            RichText::new("No differences")
-                .text_style(TextStyle::Heading)
-                .color(t.success),
-        );
-        ui.add_space(6.0);
-        ui.label(RichText::new(body).color(t.text_secondary));
-    });
+    let _ = identical_scroll(ui, t, body);
+}
+
+fn identical_scroll(
+    ui: &mut Ui,
+    t: &Tokens,
+    body: &str,
+) -> egui::scroll_area::ScrollAreaOutput<(egui::Rect, egui::Rect)> {
+    let top_space = guidance_top_space(ui.available_height());
+    let content_width = ui.available_width();
+    egui::ScrollArea::vertical()
+        .id_salt("identical-scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let accessibility = ui.unique_id();
+            ui.ctx().accesskit_node_builder(accessibility, |node| {
+                node.set_role(scroll_region_role());
+                node.set_label("Comparison status");
+            });
+            // Keep the centred text within the viewport even when the body
+            // contains long filenames or ignore-rule descriptions.
+            ui.set_min_width(content_width);
+            let contents = ui.vertical_centered(|ui| {
+                ui.add_space(top_space);
+                let title = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new("No differences")
+                                .text_style(TextStyle::Heading)
+                                .color(t.success),
+                        )
+                        .wrap(),
+                    )
+                    .rect;
+                ui.add_space(6.0);
+                let body = ui
+                    .add(egui::Label::new(RichText::new(body).color(t.text_secondary)).wrap())
+                    .rect;
+                (title, body)
+            })
+            .inner;
+            let bounds = ui.clip_rect().intersect(ui.min_rect());
+            ui.ctx().accesskit_node_builder(accessibility, |node| {
+                node.set_bounds(egui::accesskit::Rect {
+                    x0: f64::from(bounds.left()),
+                    y0: f64::from(bounds.top()),
+                    x1: f64::from(bounds.right()),
+                    y1: f64::from(bounds.bottom()),
+                });
+            });
+            contents
+        })
 }
 
 /// A floor, not the column: the column grows to the widest label it was given,
@@ -842,6 +893,73 @@ mod tests {
     }
 
     #[test]
+    fn identical_state_wraps_long_details_and_scrolls_in_compact_views() {
+        for (ui_pt, width, height) in [(13.0, 420.0, 120.0), (20.0, 208.0, 120.0)] {
+            let ctx = test_ctx(ui_pt);
+            ctx.enable_accesskit();
+            let body = format!(
+                "{} and {} are identical — 1 line — ignoring lines matching {}.",
+                "long-file-name/".repeat(8),
+                "another-long-file-name/".repeat(8),
+                "ignore-pattern".repeat(8),
+            );
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let scroll = ui
+                    .allocate_ui(Vec2::new(width, height), |ui| {
+                        identical_scroll(ui, &Tokens::dark(), &body)
+                    })
+                    .inner;
+                assert!(
+                    scroll.content_size.y > scroll.inner_rect.height(),
+                    "long details need a scroll path at {width}x{height} and {ui_pt} pt",
+                );
+                let (title, details) = scroll.inner;
+                assert!(
+                    scroll.inner_rect.contains_rect(title),
+                    "heading clipped: {title:?}"
+                );
+                assert!(
+                    details.left() >= scroll.inner_rect.left()
+                        && details.right() <= scroll.inner_rect.right(),
+                    "details overflow the viewport: {details:?} vs {:?}",
+                    scroll.inner_rect,
+                );
+            });
+            let update = output.platform_output.accesskit_update.as_ref().unwrap();
+            let scroll = update.nodes.iter().find(|(_, node)| {
+                node.role() == scroll_region_role()
+                    && node.label() == Some("Comparison status")
+            });
+            let bounds = scroll
+                .expect("comparison scroll region is unnamed")
+                .1
+                .bounds()
+                .expect("comparison scroll bounds");
+            assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+            assert!(bounds.x1 - bounds.x0 <= f64::from(width));
+            assert!(bounds.y1 - bounds.y0 <= f64::from(height));
+            output.textures_delta.clear();
+        }
+
+        let ctx = test_ctx(13.0);
+        ctx.run_ui(Default::default(), |ui| {
+            let scroll = ui
+                .allocate_ui(Vec2::new(420.0, 400.0), |ui| {
+                    identical_scroll(ui, &Tokens::dark(), "The files are identical.")
+                })
+                .inner;
+            let (title, _) = scroll.inner;
+            assert!(
+                (title.top() - scroll.inner_rect.top() - 400.0 * 0.22).abs() <= 1.0,
+                "normal-height spacing changed: {title:?} in {:?}",
+                scroll.inner_rect,
+            );
+        })
+        .textures_delta
+        .clear();
+    }
+
+    #[test]
     fn settings_fields_align_when_both_columns_fit() {
         egui::__run_test_ui(|ui| {
             // Derived from the measurement rather than hardcoded, so the test
@@ -1033,7 +1151,7 @@ mod tests {
             // the wrapped frame below has exactly as much of.
             let one = ui
                 .scope(|ui| {
-                    choice(ui, &t, &mut current, &[(0usize, "A")]);
+                    choice(ui, &t, "Choice", &mut current, &[(0usize, "A")]);
                 })
                 .response
                 .rect;
@@ -1043,7 +1161,7 @@ mod tests {
             let wrapped = ui
                 .scope(|ui| {
                     ui.set_max_width(two_wide);
-                    choice(ui, &t, &mut current, &[(0usize, "A"), (1, "A"), (2, "A")]);
+                    choice(ui, &t, "Choice", &mut current, &[(0usize, "A"), (1, "A"), (2, "A")]);
                 })
                 .response
                 .rect;

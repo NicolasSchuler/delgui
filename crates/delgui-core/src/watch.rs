@@ -9,6 +9,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 type TargetKey = (PathBuf, OsString);
+type EventTargets = HashMap<TargetKey, Vec<TargetKey>>;
+
+struct WatchedTarget {
+    path: PathBuf,
+    event_keys: Vec<TargetKey>,
+}
 
 /// Only one repaint signal needs to be outstanding. The changed targets live in
 /// [`Pending`], so filling this channel coalesces more events instead of growing
@@ -19,6 +25,7 @@ const ERROR_CAPACITY: usize = 8;
 #[derive(Default)]
 struct Pending {
     changed: Vec<TargetKey>,
+    event_keys: Vec<TargetKey>,
     errors: VecDeque<notify::Error>,
 }
 
@@ -43,6 +50,82 @@ fn key_for(path: &Path) -> Option<TargetKey> {
     Some((dir, path.file_name()?.to_os_string()))
 }
 
+/// A file symlink can point outside its own directory. Keep the link's key as
+/// well, so replacing the link itself still requests a reload.
+fn event_keys_for(path: &Path, source_key: &TargetKey) -> Vec<TargetKey> {
+    let mut keys = vec![source_key.clone()];
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && let Some((target, intermediate_links)) = symlink_chain(path)
+    {
+        for watched_path in intermediate_links.iter().chain(std::iter::once(&target)) {
+            if watched_path.parent().is_some_and(Path::is_dir)
+                && let Some(target_key) = key_for(watched_path)
+                && !keys.contains(&target_key)
+            {
+                keys.push(target_key);
+            }
+            // A directory watch is tied to that directory's inode. Watch its
+            // entry in the nearest existing parent so removal and recreation
+            // can rebind the watch even when no file event survives deletion.
+            let mut directory = watched_path.parent();
+            while let Some(dir) = directory {
+                if dir.parent().is_some_and(Path::is_dir) {
+                    if let Some(recovery_key) = key_for(dir)
+                        && !keys.contains(&recovery_key)
+                    {
+                        keys.push(recovery_key);
+                    }
+                    break;
+                }
+                directory = dir.parent();
+            }
+        }
+    }
+    keys
+}
+
+/// Keep each file symlink in the chain so retargeting an intermediate link
+/// refreshes the final target. Also works when the final file is absent.
+fn symlink_chain(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let mut target = path.to_path_buf();
+    let mut intermediate_links = Vec::new();
+    for _ in 0..40 {
+        let destination = std::fs::read_link(&target).ok()?;
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        target = if destination.is_absolute() {
+            destination
+        } else {
+            parent.join(destination)
+        };
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                intermediate_links.push(target.clone());
+            }
+            Ok(_) => {
+                return Some((target.canonicalize().unwrap_or(target), intermediate_links));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Some((target, intermediate_links));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn directories_for(keys: &[TargetKey]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for (dir, _) in keys {
+        if !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    dirs
+}
+
 fn signal(tx: &SyncSender<()>, wake: &impl Fn()) {
     if tx.try_send(()).is_ok() {
         wake();
@@ -51,30 +134,38 @@ fn signal(tx: &SyncSender<()>, wake: &impl Fn()) {
 
 fn queue_paths(
     paths: impl IntoIterator<Item = PathBuf>,
-    targets: &Mutex<HashSet<TargetKey>>,
+    targets: &Mutex<EventTargets>,
     pending: &Mutex<Pending>,
     tx: &SyncSender<()>,
     wake: &impl Fn(),
 ) {
     let targets = lock(targets);
-    let relevant: Vec<TargetKey> = paths
-        .into_iter()
-        .filter_map(|path| key_for(&path))
-        .filter(|key| targets.contains(key))
-        .collect();
+    let mut relevant = Vec::new();
+    for path in paths {
+        if let Some(event_key) = key_for(&path)
+            && let Some(watched) = targets.get(&event_key)
+        {
+            relevant.push((event_key, watched.clone()));
+        }
+    }
     drop(targets);
     if relevant.is_empty() {
         return;
     }
 
     let mut pending = lock(pending);
-    let before = pending.changed.len();
-    for key in relevant {
-        if !pending.changed.contains(&key) {
-            pending.changed.push(key);
+    let before = (pending.changed.len(), pending.event_keys.len());
+    for (event_key, watched) in relevant {
+        if !pending.event_keys.contains(&event_key) {
+            pending.event_keys.push(event_key);
+        }
+        for key in watched {
+            if !pending.changed.contains(&key) {
+                pending.changed.push(key);
+            }
         }
     }
-    let added = pending.changed.len() != before;
+    let added = (pending.changed.len(), pending.event_keys.len()) != before;
     drop(pending);
     if added {
         signal(tx, wake);
@@ -91,7 +182,8 @@ fn push_error(pending: &Mutex<Pending>, error: notify::Error) {
 
 /// Watches a small set of individual files and reports which ones changed.
 ///
-/// It watches each file's **parent directory**, not the file. Editors and
+/// It watches each file's **parent directory**, plus the resolved target's
+/// parent and that directory's entry when the file is a symlink. Editors and
 /// formatters overwhelmingly save by writing a temporary file and renaming it
 /// over the target, which swaps the inode out from under a file-level watch --
 /// so the first save would be seen and every one after it silently missed.
@@ -99,11 +191,15 @@ pub struct FileWatcher {
     inner: RecommendedWatcher,
     rx: Receiver<()>,
     pending: Arc<Mutex<Pending>>,
-    target_keys: Arc<Mutex<HashSet<TargetKey>>>,
-    /// Canonical parent directory -> how many watched files live in it.
+    event_targets: Arc<Mutex<EventTargets>>,
+    /// Canonical parent directory -> how many watched paths require it.
     dirs: HashMap<PathBuf, usize>,
-    /// (canonical parent, file name) -> the path as the caller gave it.
-    targets: HashMap<TargetKey, PathBuf>,
+    /// Registered logically, but the backend watch could not be rebound.
+    failed_dirs: HashSet<PathBuf>,
+    /// A changed symlink target could not register its new directory yet.
+    failed_targets: HashSet<TargetKey>,
+    /// (canonical parent, file name) -> the caller path and keys that report it.
+    targets: HashMap<TargetKey, WatchedTarget>,
 }
 
 impl FileWatcher {
@@ -112,9 +208,9 @@ impl FileWatcher {
     pub fn new(wake: impl Fn() + Send + 'static) -> notify::Result<Self> {
         let (tx, rx) = sync_channel(SIGNAL_CAPACITY);
         let pending = Arc::new(Mutex::new(Pending::default()));
-        let target_keys = Arc::new(Mutex::new(HashSet::new()));
+        let event_targets = Arc::new(Mutex::new(HashMap::new()));
         let callback_pending = Arc::clone(&pending);
-        let callback_targets = Arc::clone(&target_keys);
+        let callback_targets = Arc::clone(&event_targets);
         let callback_tx = tx.clone();
         let inner =
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
@@ -142,8 +238,10 @@ impl FileWatcher {
             inner,
             rx,
             pending,
-            target_keys,
+            event_targets,
             dirs: HashMap::new(),
+            failed_dirs: HashSet::new(),
+            failed_targets: HashSet::new(),
             targets: HashMap::new(),
         })
     }
@@ -152,20 +250,150 @@ impl FileWatcher {
         let Some(key) = key_for(path) else {
             return Ok(());
         };
-        if self.targets.contains_key(&key) {
-            return Ok(()); // already watched
+        if self.failed_targets.contains(&key) {
+            self.refresh_target(&key, &[])?;
+            self.failed_targets.remove(&key);
         }
-        // Register before recording. The other order books the file as watched
-        // even when the directory could not be registered -- and since callers
-        // skip anything `is_watching` already claims, that state never retries:
-        // the checkbox stays ticked over a watch that does not exist.
-        let first_in_dir = !self.dirs.contains_key(&key.0);
-        if first_in_dir {
-            self.inner.watch(&key.0, RecursiveMode::NonRecursive)?;
+        if let Some(target) = self.targets.get(&key) {
+            return self.rebind_failed_dirs(&directories_for(&target.event_keys));
         }
-        *self.dirs.entry(key.0.clone()).or_insert(0) += 1;
-        self.targets.insert(key.clone(), path.to_path_buf());
-        lock(&self.target_keys).insert(key);
+        // Register all directories before recording the target. A failed
+        // later registration must not leave earlier ones active.
+        let event_keys = event_keys_for(path, &key);
+        self.register_dirs(&directories_for(&event_keys))?;
+        let mut event_targets = lock(&self.event_targets);
+        for event_key in &event_keys {
+            event_targets
+                .entry(event_key.clone())
+                .or_default()
+                .push(key.clone());
+        }
+        drop(event_targets);
+        self.targets.insert(
+            key,
+            WatchedTarget {
+                path: path.to_path_buf(),
+                event_keys,
+            },
+        );
+        Ok(())
+    }
+
+    fn register_dirs(&mut self, dirs: &[PathBuf]) -> notify::Result<()> {
+        self.rebind_failed_dirs(dirs)?;
+        let mut registered: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            if !self.dirs.contains_key(dir) {
+                if let Err(error) = self.inner.watch(dir, RecursiveMode::NonRecursive) {
+                    for registered_dir in registered {
+                        if let Err(rollback_error) = self.inner.unwatch(&registered_dir) {
+                            push_error(&self.pending, rollback_error);
+                        }
+                    }
+                    return Err(error);
+                }
+                registered.push(dir.clone());
+            }
+        }
+        for dir in dirs {
+            *self.dirs.entry(dir.clone()).or_insert(0) += 1;
+        }
+        Ok(())
+    }
+
+    fn rebind_failed_dirs(&mut self, dirs: &[PathBuf]) -> notify::Result<()> {
+        for dir in dirs {
+            if self.failed_dirs.contains(dir) {
+                self.inner.watch(dir, RecursiveMode::NonRecursive)?;
+                self.failed_dirs.remove(dir);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_dirs(&mut self, dirs: &[PathBuf]) {
+        for dir in dirs {
+            if let Some(count) = self.dirs.get_mut(dir) {
+                *count -= 1;
+                if *count == 0 {
+                    self.dirs.remove(dir);
+                    self.failed_dirs.remove(dir);
+                    if let Err(error) = self.inner.unwatch(dir) {
+                        push_error(&self.pending, error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_target(
+        &mut self,
+        key: &TargetKey,
+        received_events: &[TargetKey],
+    ) -> notify::Result<()> {
+        let Some(target) = self.targets.get(key) else {
+            return Ok(());
+        };
+        let old_event_keys = target.event_keys.clone();
+        let event_keys = event_keys_for(&target.path, key);
+        if event_keys == old_event_keys {
+            for dir in directories_for(&event_keys) {
+                // A directory can be replaced between UI polls. Its keys then
+                // look unchanged, but the OS watch still belongs to the old
+                // inode. Only a matching directory-entry event needs a rebind.
+                if let Some(entry_key) = key_for(&dir)
+                    && event_keys.contains(&entry_key)
+                    && received_events.contains(&entry_key)
+                    && dir.is_dir()
+                {
+                    let _ = self.inner.unwatch(&dir);
+                    if let Err(error) = self.inner.watch(&dir, RecursiveMode::NonRecursive) {
+                        self.failed_dirs.insert(dir);
+                        push_error(&self.pending, error);
+                    } else {
+                        self.failed_dirs.remove(&dir);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let old_dirs = directories_for(&old_event_keys);
+        let new_dirs = directories_for(&event_keys);
+        let to_add: Vec<_> = new_dirs
+            .iter()
+            .filter(|dir| !old_dirs.contains(dir))
+            .cloned()
+            .collect();
+        self.register_dirs(&to_add)?;
+
+        let mut event_targets = lock(&self.event_targets);
+        for old_key in &old_event_keys {
+            if !event_keys.contains(old_key)
+                && let Some(watched) = event_targets.get_mut(old_key)
+            {
+                watched.retain(|watched_key| watched_key != key);
+                if watched.is_empty() {
+                    event_targets.remove(old_key);
+                }
+            }
+        }
+        for new_key in &event_keys {
+            if !old_event_keys.contains(new_key) {
+                event_targets
+                    .entry(new_key.clone())
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+        drop(event_targets);
+
+        self.targets.get_mut(key).expect("watched above").event_keys = event_keys;
+        let to_remove: Vec<_> = old_dirs
+            .iter()
+            .filter(|dir| !new_dirs.contains(dir))
+            .cloned()
+            .collect();
+        self.release_dirs(&to_remove);
         Ok(())
     }
 
@@ -173,20 +401,21 @@ impl FileWatcher {
         let Some(key) = key_for(path) else {
             return;
         };
-        if !self.targets.contains_key(&key) {
+        let Some(target) = self.targets.remove(&key) else {
             return;
-        }
-        lock(&self.target_keys).remove(&key);
-        self.targets.remove(&key);
-        if let Some(count) = self.dirs.get_mut(&key.0) {
-            *count -= 1;
-            if *count == 0 {
-                self.dirs.remove(&key.0);
-                if let Err(error) = self.inner.unwatch(&key.0) {
-                    push_error(&self.pending, error);
+        };
+        self.failed_targets.remove(&key);
+        let mut event_targets = lock(&self.event_targets);
+        for event_key in &target.event_keys {
+            if let Some(watched) = event_targets.get_mut(event_key) {
+                watched.retain(|watched_key| watched_key != &key);
+                if watched.is_empty() {
+                    event_targets.remove(event_key);
                 }
             }
         }
+        drop(event_targets);
+        self.release_dirs(&directories_for(&target.event_keys));
     }
 
     /// Drain pending events, returning the watched paths that changed.
@@ -195,10 +424,24 @@ impl FileWatcher {
     /// filtered back down to the files actually asked for on the callback thread.
     pub fn poll(&mut self) -> Vec<PathBuf> {
         while self.rx.try_recv().is_ok() {}
-        let changed = std::mem::take(&mut lock(&self.pending).changed);
+        let (changed, received_events) = {
+            let mut pending = lock(&self.pending);
+            (
+                std::mem::take(&mut pending.changed),
+                std::mem::take(&mut pending.event_keys),
+            )
+        };
+        for key in &changed {
+            if let Err(error) = self.refresh_target(key, &received_events) {
+                self.failed_targets.insert(key.clone());
+                push_error(&self.pending, error);
+            } else {
+                self.failed_targets.remove(key);
+            }
+        }
         changed
             .into_iter()
-            .filter_map(|key| self.targets.get(&key).cloned())
+            .filter_map(|key| self.targets.get(&key).map(|target| target.path.clone()))
             .collect()
     }
 
@@ -213,7 +456,14 @@ impl FileWatcher {
     }
 
     pub fn is_watching(&self, path: &Path) -> bool {
-        key_for(path).is_some_and(|k| self.targets.contains_key(&k))
+        key_for(path)
+            .filter(|key| !self.failed_targets.contains(key))
+            .and_then(|key| self.targets.get(&key))
+            .is_some_and(|target| {
+                directories_for(&target.event_keys)
+                    .iter()
+                    .all(|dir| !self.failed_dirs.contains(dir))
+            })
     }
 
     /// Everything currently registered, as the caller originally named it.
@@ -223,14 +473,19 @@ impl FileWatcher {
     /// forgotten -- otherwise a directory keeps waking the UI for a file nothing
     /// is looking at any more.
     pub fn watched(&self) -> Vec<PathBuf> {
-        self.targets.values().cloned().collect()
+        self.targets
+            .values()
+            .map(|target| target.path.clone())
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ERROR_CAPACITY, FileWatcher, Pending, key_for, push_error, queue_paths};
-    use std::collections::HashSet;
+    use super::{
+        ERROR_CAPACITY, FileWatcher, Pending, event_keys_for, key_for, push_error, queue_paths,
+    };
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{TryRecvError, sync_channel};
@@ -366,6 +621,345 @@ mod tests {
         w.unwatch(path);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn follows_a_symlink_target_in_another_directory() {
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-link-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let target_dir = root.join("targets");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        std::fs::write(&target, "one").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let mut w = FileWatcher::new(|| {}).unwrap();
+        w.watch(&link).unwrap();
+        assert_eq!(w.dirs.get(&link_dir.canonicalize().unwrap()), Some(&1));
+        assert_eq!(w.dirs.get(&target_dir.canonicalize().unwrap()), Some(&1));
+        settle(&mut w);
+
+        std::fs::write(&target, "two").unwrap();
+        assert!(wait_for(&mut w, &link, 5), "missed a target overwrite");
+        let replacement = target_dir.join("replacement.txt");
+        std::fs::write(&replacement, "three").unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+        assert!(wait_for(&mut w, &link, 5), "missed a target rename save");
+        std::fs::remove_file(&target).unwrap();
+        assert!(wait_for(&mut w, &link, 5), "missed target removal");
+        std::fs::write(&target, "recreated").unwrap();
+        assert!(wait_for(&mut w, &link, 5), "missed target recreation");
+
+        w.watch(&target).unwrap();
+        assert_eq!(w.dirs.get(&target_dir.canonicalize().unwrap()), Some(&2));
+        w.unwatch(&link);
+        assert_eq!(w.dirs.get(&target_dir.canonicalize().unwrap()), Some(&1));
+        assert!(!w.is_watching(&link));
+        w.unwatch(&target);
+        assert!(w.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn follows_a_symlink_after_its_target_directory_is_recreated() {
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-dir-recreate-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let target_dir = root.join("targets");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        std::fs::write(&target, "one").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let mut watcher = FileWatcher::new(|| {}).unwrap();
+        watcher.watch(&link).unwrap();
+        settle(&mut watcher);
+
+        std::fs::remove_dir_all(&target_dir).unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "missed target directory removal"
+        );
+        assert!(
+            watcher.poll_errors().is_empty(),
+            "expected directory removal should not report a watcher failure"
+        );
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::write(&target, "two").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "missed target directory recreation"
+        );
+
+        settle(&mut watcher);
+        std::fs::write(&target, "three").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "missed a later target overwrite"
+        );
+
+        // A remove/create batch can reach poll after the new directory already
+        // exists. The event keys then look unchanged, but the old OS watch is
+        // attached to the removed directory's inode.
+        std::fs::remove_dir_all(&target_dir).unwrap();
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::write(&target, "four").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "missed rapid directory replacement"
+        );
+        settle(&mut watcher);
+        std::fs::write(&target, "five").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "lost the watch after replacement"
+        );
+        watcher.unwatch(&link);
+        assert!(watcher.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_symlink_can_start_watching_before_its_target_directory_exists() {
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-missing-dir-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let target_dir = root.join("targets");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let target = target_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        symlink(&target, &link).unwrap();
+
+        let mut watcher = FileWatcher::new(|| {}).unwrap();
+        watcher.watch(&link).unwrap();
+        assert_eq!(watcher.dirs.get(&root.canonicalize().unwrap()), Some(&1));
+        settle(&mut watcher);
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::write(&target, "one").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "missed the new target directory"
+        );
+        settle(&mut watcher);
+        std::fs::write(&target, "two").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "lost the newly bound watch"
+        );
+        watcher.unwatch(&link);
+        assert!(watcher.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn replacing_a_symlink_follows_its_new_target() {
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-retarget-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        for dir in [&link_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let old_target = old_dir.join("data.txt");
+        let new_target = new_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        std::fs::write(&old_target, "old").unwrap();
+        std::fs::write(&new_target, "new").unwrap();
+        symlink(&old_target, &link).unwrap();
+
+        let mut w = FileWatcher::new(|| {}).unwrap();
+        w.watch(&link).unwrap();
+        settle(&mut w);
+
+        let new_link = link_dir.join("replacement-link");
+        symlink(&new_target, &new_link).unwrap();
+        std::fs::rename(&new_link, &link).unwrap();
+        assert!(wait_for(&mut w, &link, 5), "missed a link replacement");
+        assert!(!w.dirs.contains_key(&old_dir.canonicalize().unwrap()));
+        assert_eq!(w.dirs.get(&new_dir.canonicalize().unwrap()), Some(&1));
+        settle(&mut w);
+
+        std::fs::write(&new_target, "newer").unwrap();
+        assert!(wait_for(&mut w, &link, 5), "missed the new target");
+        w.unwatch(&link);
+        assert!(w.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn replacing_an_intermediate_symlink_follows_its_new_target() {
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-middle-retarget-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let middle_dir = root.join("middle");
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        for dir in [&link_dir, &middle_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let old_target = old_dir.join("data.txt");
+        let new_target = new_dir.join("data.txt");
+        let middle = middle_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        std::fs::write(&old_target, "old").unwrap();
+        std::fs::write(&new_target, "new").unwrap();
+        symlink(&old_target, &middle).unwrap();
+        symlink(&middle, &link).unwrap();
+
+        let mut watcher = FileWatcher::new(|| {}).unwrap();
+        watcher.watch(&link).unwrap();
+        settle(&mut watcher);
+
+        let replacement = middle_dir.join("replacement-link");
+        symlink(&new_target, &replacement).unwrap();
+        std::fs::rename(&replacement, &middle).unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "missed intermediate link replacement"
+        );
+        assert!(!watcher.dirs.contains_key(&old_dir.canonicalize().unwrap()));
+        assert_eq!(watcher.dirs.get(&new_dir.canonicalize().unwrap()), Some(&1));
+        settle(&mut watcher);
+
+        std::fs::write(&new_target, "newer").unwrap();
+        assert!(wait_for(&mut watcher, &link, 5), "missed the new target");
+        watcher.unwatch(&link);
+        assert!(watcher.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn retries_a_target_whose_directory_watch_was_lost() {
+        use notify::Watcher;
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-retry-rebind-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let target_dir = root.join("targets");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        std::fs::write(&target, "one").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let mut watcher = FileWatcher::new(|| {}).unwrap();
+        watcher.watch(&link).unwrap();
+        let target_dir = target_dir.canonicalize().unwrap();
+        watcher.inner.unwatch(&target_dir).unwrap();
+        watcher.failed_dirs.insert(target_dir.clone());
+        assert!(!watcher.is_watching(&link));
+
+        let moved_dir = root.join("temporarily-moved");
+        std::fs::rename(&target_dir, &moved_dir).unwrap();
+        assert!(watcher.watch(&link).is_err());
+        assert!(!watcher.is_watching(&link));
+        std::fs::rename(&moved_dir, &target_dir).unwrap();
+        watcher.watch(&link).unwrap();
+        assert!(watcher.is_watching(&link));
+        settle(&mut watcher);
+        std::fs::write(&target, "two").unwrap();
+        assert!(
+            wait_for(&mut watcher, &link, 5),
+            "failed to rebind target directory"
+        );
+
+        watcher.unwatch(&link);
+        assert!(watcher.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn retries_a_failed_target_registration_against_the_current_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("dpw-retry-target-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        for dir in [&link_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let old_target = old_dir.join("data.txt");
+        let new_target = new_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        std::fs::write(&old_target, "old").unwrap();
+        std::fs::write(&new_target, "new").unwrap();
+        symlink(&old_target, &link).unwrap();
+
+        let mut watcher = FileWatcher::new(|| {}).unwrap();
+        watcher.watch(&link).unwrap();
+        let replacement = link_dir.join("replacement-link");
+        symlink(&new_target, &replacement).unwrap();
+        std::fs::rename(&replacement, &link).unwrap();
+        watcher.failed_targets.insert(key_for(&link).unwrap());
+        assert!(!watcher.is_watching(&link));
+
+        watcher.watch(&link).unwrap();
+        assert!(watcher.is_watching(&link));
+        assert!(!watcher.dirs.contains_key(&old_dir.canonicalize().unwrap()));
+        assert_eq!(watcher.dirs.get(&new_dir.canonicalize().unwrap()), Some(&1));
+        watcher.unwatch(&link);
+        assert!(watcher.dirs.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_dangling_symlink_chain_keeps_the_final_target_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("dpw-chain-{}", std::process::id()));
+        let link_dir = root.join("links");
+        let middle_dir = root.join("middle");
+        let target_dir = root.join("targets");
+        for dir in [&link_dir, &middle_dir, &target_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let target = target_dir.join("data.txt");
+        let middle = middle_dir.join("data.txt");
+        let link = link_dir.join("data.txt");
+        symlink(&target, &middle).unwrap();
+        symlink(&middle, &link).unwrap();
+
+        let source_key = key_for(&link).unwrap();
+        let event_keys = event_keys_for(&link, &source_key);
+        assert_eq!(
+            event_keys,
+            vec![
+                source_key,
+                key_for(&middle).unwrap(),
+                key_for(&middle_dir).unwrap(),
+                key_for(&target).unwrap(),
+                key_for(&target_dir).unwrap(),
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn callback_filters_siblings_and_coalesces_targets_behind_one_signal() {
         let dir = std::env::temp_dir().join(format!("dpw-queue-{}", std::process::id()));
@@ -377,7 +971,10 @@ mod tests {
         );
         let first_key = key_for(&first).unwrap();
         let second_key = key_for(&second).unwrap();
-        let targets = Mutex::new(HashSet::from([first_key.clone(), second_key.clone()]));
+        let targets = Mutex::new(HashMap::from([
+            (first_key.clone(), vec![first_key.clone()]),
+            (second_key.clone(), vec![second_key.clone()]),
+        ]));
         let pending = Mutex::new(Pending::default());
         let (tx, rx) = sync_channel(1);
         let wakes = AtomicUsize::new(0);

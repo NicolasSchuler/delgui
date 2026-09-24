@@ -78,6 +78,35 @@ pub struct MergeTool {
     pub resolved: Arc<AtomicBool>,
 }
 
+/// The bytes Git's output path held when this merge window opened. A first Save
+/// must not replace a newer edit made by another program while the merge was
+/// being assembled.
+enum MergeTargetAtLaunch {
+    Missing,
+    Contents(Vec<u8>),
+    Unreadable(String),
+}
+
+impl MergeTargetAtLaunch {
+    fn read(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => Self::Contents(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(error) => Self::Unreadable(error.to_string()),
+        }
+    }
+
+    fn still_matches(&self, path: &Path) -> Result<bool, String> {
+        match (self, std::fs::read(path)) {
+            (Self::Missing, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            (Self::Contents(expected), Ok(current)) => Ok(*expected == current),
+            (Self::Unreadable(error), _) => Err(error.clone()),
+            (_, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(false),
+        }
+    }
+}
+
 /// What the command line asked for, as distinct from what is remembered.
 ///
 /// One value rather than six parameters because it keeps growing: every launch
@@ -681,6 +710,8 @@ pub struct App {
     /// longer held, which is how *Copy diff* could put the previous pair's diff
     /// on the clipboard after a panel was removed.
     prepared: Option<PreparedDiff>,
+    /// Matches belong to the prepared layout and current query, not to a frame.
+    find_matches: Option<(String, Vec<usize>)>,
     /// The render currently running, if any. A single bool could not say *what*
     /// was running, so results arrived out of order and a failure could not be
     /// attributed -- which turned one failed render into an unbounded respawn
@@ -689,6 +720,7 @@ pub struct App {
     /// The last render that failed, so we do not immediately try it again.
     failed: Option<RenderKey>,
     error: Option<String>,
+    startup_error: Option<String>,
     notice: Option<String>,
 
     columns: usize,
@@ -731,6 +763,8 @@ pub struct App {
     /// Set when git launched the app to resolve a conflict, which changes two
     /// things: where a save goes, and what the process exit means.
     mergetool: Option<MergeTool>,
+    mergetool_load_failed: bool,
+    initial_merge_target: Option<MergeTargetAtLaunch>,
     hunk_boxes: Vec<(f32, f32)>,
     hunk_cursor: usize,
     /// A jump asked for by the keyboard, waiting for the frame that knows how
@@ -777,6 +811,7 @@ pub struct App {
     /// "Saved to …". Not a banner: these answer a button that was just pressed,
     /// and a dismissible strip across the diff is too much furniture for that.
     flash: Option<(String, Instant)>,
+    last_window_title: Option<String>,
     tx: Sender<Job>,
     rx: Receiver<Job>,
 }
@@ -824,11 +859,13 @@ impl App {
         let (tx, rx) = channel();
         let mut panels = vec![Panel::empty(), Panel::empty()];
         let mut error = None;
+        let mut mergetool_load_failed = false;
         if let Some(text) = preload {
             panels[0].text = text;
         }
-        // A preloaded clipboard occupies panel A, so files fill from whichever
-        // panels are still empty, adding panels when more than two arrive.
+        // Reserve each command-line position even when a read fails. Reusing a
+        // failed slot puts a later file under the wrong panel letter.
+        let mut next_file_slot = if panels[0].is_empty() { 0 } else { 1 };
         //
         // Git's three files go in by position instead. An ancestor that is an
         // empty file is an ordinary conflict -- both sides added the file -- and
@@ -841,26 +878,34 @@ impl App {
                 }
                 n
             } else {
-                match panels.iter().position(Panel::is_empty) {
-                    Some(i) => i,
-                    None if panels.len() < MAX_PANELS => {
-                        panels.push(Panel::empty());
-                        panels.len() - 1
-                    }
-                    None => break,
+                let slot = next_file_slot;
+                next_file_slot += 1;
+                if slot >= MAX_PANELS {
+                    error.get_or_insert(format!(
+                        "Only {MAX_PANELS} panels can be opened; remaining files were not loaded."
+                    ));
+                    break;
                 }
+                while panels.len() <= slot {
+                    panels.push(Panel::empty());
+                }
+                slot
             };
             if let Err(e) = panels[slot].bind(f.clone()) {
+                mergetool_load_failed |= mergetool.is_some();
                 error.get_or_insert(e);
             }
             panels[slot].watch = watch;
         }
+        let initial_merge_target = mergetool
+            .as_ref()
+            .map(|tool| MergeTargetAtLaunch::read(&tool.merged));
         for p in panels.iter_mut() {
             p.resniff();
         }
         // An explicitly opened empty file is still an input. Only untouched
         // paste slots wait for the first comparison request.
-        let compared = panels.iter().take(2).all(|p| !p.is_empty());
+        let compared = !mergetool_load_failed && panels.iter().take(2).all(|p| !p.is_empty());
         let themes = delta.syntax_themes();
         let syntax_theme_reset = settings.sanitise_syntax_theme(&themes);
         let gitconfig = config::discover(None);
@@ -951,9 +996,11 @@ impl App {
             show_help: false,
             cache: HashMap::new(),
             prepared: None,
+            find_matches: None,
             in_flight: None,
             failed: None,
-            error,
+            error: None,
+            startup_error: error,
             notice,
             columns: 120,
             pending_resize: None,
@@ -997,11 +1044,19 @@ impl App {
             modal_focus: None,
             pending_modal_focus_restore: None,
             flash: None,
+            last_window_title: None,
             mergetool,
+            mergetool_load_failed,
+            initial_merge_target,
             tx,
             rx,
         };
-        if combine || app.mergetool.is_some() {
+        if app.mergetool_load_failed {
+            let error = app.startup_error.take().unwrap_or_default();
+            app.startup_error = Some(format!(
+                "{error} Git merge cannot continue with an unreadable input. Close this window and retry; the conflict will remain unresolved."
+            ));
+        } else if combine || app.mergetool.is_some() {
             // Seeded from the first panel, which is the one `--combine a.rs b.rs`
             // names first and the likeliest starting point -- and, under
             // `--mergetool`, git's common ancestor. Starting from the ancestor
@@ -1010,7 +1065,7 @@ impl App {
             // conflict markers.
             app.start_result(Some(0));
         }
-        if let Some(tool) = &app.mergetool {
+        if let Some(tool) = &app.mergetool && !app.mergetool_load_failed {
             app.notice = Some(format!(
                 "Resolving {} for git. The result starts with the ancestor; take changes or edit it before saving. {} writes the result to Git’s target; quitting without saving leaves the conflict unresolved.",
                 tool.merged.display(),
@@ -1064,6 +1119,32 @@ impl App {
             format!("{name} — {parent}")
         } else {
             name
+        }
+    }
+
+    fn window_title(&self) -> String {
+        if self.mergetool_load_failed {
+            let target = self.mergetool.as_ref().expect("failed merge has target").merged.display();
+            return format!("Git merge unavailable · {target} · delgui");
+        }
+        let comparison = format!(
+            "{} vs {}",
+            self.panel_label(self.reference),
+            self.panel_label(self.shown)
+        );
+        if let Some(result) = self.result_panel() {
+            let unsaved = if self.panels[result].saved_snapshot.is_none()
+                || self.panel_has_unsaved_content(result)
+            {
+                "Unsaved "
+            } else {
+                ""
+            };
+            format!("{unsaved}Result · {comparison} · delgui")
+        } else if self.panels.iter().any(|panel| !panel.is_empty()) {
+            format!("{comparison} · delgui")
+        } else {
+            "delgui".into()
         }
     }
 
@@ -1248,6 +1329,10 @@ impl App {
     /// Also re-reads the active pair: a file can change on disk without anything
     /// in the app noticing, but an unrelated broken panel must not block A vs B.
     fn compare_now(&mut self, ctx: &egui::Context) {
+        if self.mergetool_load_failed {
+            self.notice = Some("Git merge inputs did not load. Close this window and retry the merge.".into());
+            return;
+        }
         let (reference, shown) = self.pair();
         for i in [reference, shown] {
             if !self.panels[i].edited && self.panels[i].path.is_some() {
@@ -1667,6 +1752,10 @@ impl App {
     /// to one that actually differs -- decided by comparing the text, since
     /// nothing has been rendered against it yet.
     fn start_result(&mut self, seed: Option<usize>) {
+        if self.mergetool_load_failed {
+            self.notice = Some("Git merge inputs did not load. Close this window and retry the merge.".into());
+            return;
+        }
         let (slot, created) = match self.result_panel() {
             Some(existing) => (existing, false),
             None if self.panels.len() < MAX_PANELS => {
@@ -1884,6 +1973,10 @@ impl App {
 
     /// Choose a destination, then guard it before writing the result.
     fn save_result(&mut self, ask: bool) -> bool {
+        if self.mergetool_load_failed {
+            self.error = Some("Git merge inputs did not load. Nothing was saved; close this window and retry the merge.".into());
+            return false;
+        }
         let Some(i) = self.result_panel() else {
             self.notice = Some(
                 "There is no result to save yet. Combine… under the diff starts one from any \
@@ -1946,6 +2039,10 @@ impl App {
     }
 
     fn write_result_to(&mut self, i: usize, path: PathBuf, explicit_destination: bool) -> bool {
+        if self.mergetool_load_failed {
+            self.error = Some("Git merge inputs did not load. Nothing was saved; close this window and retry the merge.".into());
+            return false;
+        }
         let export_only = self.mergetool.as_ref().is_some_and(|tool| {
             explicit_destination && !paths_refer_to_same_file(&path, &tool.merged)
         });
@@ -1954,6 +2051,35 @@ impl App {
         } else {
             "Use Save as… to choose or confirm a destination."
         };
+
+        // Git's target can change while the first merge is being assembled.
+        // There is no last-save snapshot yet, so compare it with what was there
+        // when this window opened before a plain Save replaces anything.
+        if self.mergetool.is_some() && !explicit_destination
+            && self.panels[i].saved_snapshot.is_none()
+        {
+            match self.initial_merge_target.as_ref().map(|initial| initial.still_matches(&path)) {
+                Some(Ok(true)) => {}
+                Some(Ok(false)) => {
+                    self.error = Some(format!(
+                        "{} changed outside delgui after this merge window opened. Nothing was overwritten. {conflict_recovery}",
+                        path.display(),
+                    ));
+                    return false;
+                }
+                Some(Err(error)) => {
+                    self.error = Some(format!(
+                        "Could not verify {} before its first save: {error}. Nothing was overwritten. {conflict_recovery}",
+                        path.display(),
+                    ));
+                    return false;
+                }
+                None => {
+                    self.error = Some("Could not verify Git's merge target before saving. Nothing was overwritten.".into());
+                    return false;
+                }
+            }
+        }
 
         // A native Save As dialog owns overwrite confirmation. A later plain
         // Save does not, so compare the destination with the exact bytes this
@@ -2252,6 +2378,13 @@ impl App {
         let targets = self.drop_targets(ctx, files.len());
         if targets.is_empty() {
             self.notice = Some("Drop files onto a panel to load them.".into());
+            return;
+        }
+        if targets.len() < files.len() {
+            self.notice = Some(format!(
+                "This drop has {} files but only {} available panel slots. Nothing was loaded; drop fewer files or start at an earlier panel.",
+                files.len(), targets.len(),
+            ));
             return;
         }
         let loads = targets.into_iter().zip(files).collect();
@@ -2561,7 +2694,7 @@ impl App {
         let t = ui::tokens(ui);
         let ready = {
             let (a, b) = self.pair();
-            !self.panels[a].is_empty() || !self.panels[b].is_empty()
+            (!self.panels[a].is_empty() || !self.panels[b].is_empty()) && !self.mergetool_load_failed
         };
         let busy = self.in_flight.is_some();
         let label = if busy { "Rendering…" } else { "Compare" };
@@ -2580,72 +2713,82 @@ impl App {
             // each side. Reserve it before laying out any toolbar control.
             + 6.0;
 
-        // The fixed utilities are laid out first and reserve their width. The
-        // modes own the remaining width and scroll only if a large interface
-        // font makes their indivisible segmented control wider than that lane.
-        // A wrapped row with a nested right-to-left group let both runs paint in
-        // the same pixels at the supported 720 px / 20 pt combination.
+        // Build focusable widgets in their visual order. The mode rail gets a
+        // bounded lane so the utility buttons retain room at 720 pt / 20 pt.
         let before = (self.opts.side_by_side, self.opts.line_numbers, self.opts.wrap);
         let opts = &mut self.opts;
-        egui::containers::Sides::new()
-            .shrink_left()
-            .height(strip_height)
-            .show(
-                ui,
-                |ui| {
-                    // Ordinary horizontal starts at interact_size.y and cannot
-                    // recenter earlier widgets when a later frame is taller.
-                    ui.horizontal_centered(|ui| {
-                        compare = ui::primary(
-                            ui,
-                            &t,
-                            label,
-                            keys::compare_label(),
-                            ready && !busy,
-                        );
-                        ui.add_space(8.0);
-                        egui::ScrollArea::horizontal()
-                            .id_salt("toolbar-modes")
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-                                    node.set_role(ui::scroll_region_role());
-                                    node.set_label("View modes");
+        let ui_pt = ui.style().text_styles[&TextStyle::Body].size;
+        let utility_reserve = 215.0 * (ui_pt / 13.0).clamp(1.0, 1.6);
+        let mode_width = (ui.available_width() - utility_reserve - ui.spacing().item_spacing.x)
+            .max(0.0);
+        let compare_reserve = 215.0 * (ui_pt / 20.0).clamp(0.65, 1.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), strip_height),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(mode_width, strip_height),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_max_width(mode_width);
+                        // The mode rail is taller than an ordinary button.
+                        // Center both controls within the reserved strip.
+                        ui.horizontal_centered(|ui| {
+                            compare = ui::primary(
+                                ui,
+                                &t,
+                                label,
+                                keys::compare_label(),
+                                ready && !busy,
+                            );
+                            ui.add_space(8.0);
+                            egui::ScrollArea::horizontal()
+                                .id_salt("toolbar-modes")
+                                .max_width((mode_width - compare_reserve).max(0.0))
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                                        node.set_role(ui::scroll_region_role());
+                                        node.set_label("View modes");
+                                    });
+                                    ui.spacing_mut().interact_size.y = strip_height - 6.0;
+                                    view_changed = ui::segmented(
+                                        ui,
+                                        &t,
+                                        &mut [
+                                            ("Side by side", &mut opts.side_by_side),
+                                            ("Numbers", &mut opts.line_numbers),
+                                            ("Wrap", &mut opts.wrap),
+                                        ],
+                                    );
                                 });
-                                ui.spacing_mut().interact_size.y = strip_height - 6.0;
-                                view_changed = ui::segmented(
-                                    ui,
-                                    &t,
-                                    &mut [
-                                        ("Side by side", &mut opts.side_by_side),
-                                        ("Numbers", &mut opts.line_numbers),
-                                        ("Wrap", &mut opts.wrap),
-                                    ],
-                                );
-                            });
-                    });
-                },
-                |ui| {
-                    // This lane lays out from the right edge. Emit its visual
-                    // last item first so the established left-to-right order
-                    // remains + Panel, Settings, Help.
-                    if ui::icon(ui, "?", "Help", None)
-                        .on_hover_text(keys::help_hint())
-                        .clicked()
-                    {
-                        toggle_help = true;
-                    }
-                    let gear = ui::disclosure(ui, "Settings", self.show_settings);
-                    if gear.on_hover_text(keys::settings_hint()).clicked() {
-                        toggle_settings = true;
-                    }
-                    if ui::ghost_enabled(ui, "+ Panel", can_add_panel)
-                        .on_disabled_hover_text("All six panels are in use")
-                        .clicked() {
-                        add_panel = true;
-                    }
-                },
-            );
+                        });
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(utility_reserve, strip_height),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        if ui::ghost_enabled(ui, "+ Panel", can_add_panel)
+                            .on_disabled_hover_text("All six panels are in use")
+                            .clicked()
+                        {
+                            add_panel = true;
+                        }
+                        let gear = ui::disclosure(ui, "Settings", self.show_settings);
+                        if gear.on_hover_text(keys::settings_hint()).clicked() {
+                            toggle_settings = true;
+                        }
+                        if ui::icon(ui, "?", "Help", None)
+                            .on_hover_text(keys::help_hint())
+                            .clicked()
+                        {
+                            toggle_help = true;
+                        }
+                    },
+                );
+            },
+        );
 
         if compare {
             self.compare_now(ctx);
@@ -2799,7 +2942,11 @@ impl App {
                                         }).collect();
                                         let natural_width = metadata.iter().map(|(text, _)| text.size().x).sum::<f32>()
                                             + ui.spacing().item_spacing.x * (metadata.len() - 1) as f32;
-                                        let width = natural_width.min(ui.available_width()).max(1.0);
+                                        // A crowded status row may scroll, but the file name
+                                        // must retain enough width to identify the panel.
+                                        let available = ui.available_width();
+                                        let name_reserve = available.min(96.0);
+                                        let width = natural_width.min((available - name_reserve).max(1.0));
                                         ui.allocate_ui_with_layout(Vec2::new(width, 22.0), Layout::left_to_right(Align::Center), |ui| {
                                             // Keep the panel letter and menu fixed even when
                                             // failure/edited/follow states need more width.
@@ -3041,14 +3188,15 @@ impl App {
                     );
                 }
                 let mut text = self.panels[i].language.clone().unwrap_or_default();
-                if ui
-                    .add(
+                let language = ui.add(
                         egui::TextEdit::singleline(&mut text)
                             .desired_width(140.0)
                             .hint_text("rs, py, json…"),
-                    )
-                    .changed()
-                {
+                    );
+                ui.ctx().accesskit_node_builder(language.id, |node| {
+                    node.set_label(format!("Panel {} language override", title(i)));
+                });
+                if language.changed() {
                     self.panels[i].language = (!text.trim().is_empty()).then_some(text);
                     self.touch_panel(i);
                 }
@@ -3163,8 +3311,19 @@ impl App {
                                 if merging {
                                     ui.label(ui::micro("building").color(t.accent));
                                     let full = panel_labels[reference].clone();
+                                    let name_width = (egui::WidgetText::from(ui::strong(&full))
+                                        .into_galley(
+                                            ui,
+                                            Some(egui::TextWrapMode::Extend),
+                                            f32::INFINITY,
+                                            TextStyle::Body,
+                                        )
+                                        .size()
+                                        .x
+                                        + 2.0)
+                                        .min(selector_width.min(220.0));
                                     ui.add_sized(
-                                        [selector_width.min(220.0), strip_height],
+                                        [name_width, strip_height],
                                         egui::Label::new(
                                             ui::strong(&full).color(t.text_primary),
                                         )
@@ -3351,25 +3510,31 @@ impl App {
                     let button = egui::Button::new("Combine…")
                         .corner_radius(radius::CONTROL)
                         .min_size(Vec2::new(0.0, 26.0));
-                    egui::containers::menu::MenuButton::from_button(button)
-                        .ui(ui, |ui| {
-                            ui.label(ui::micro("start a result from").color(t.text_muted));
-                            for (i, label) in &seeds {
-                                if ui.button(label).clicked() {
-                                    seed = Some(Some(*i));
+                    if self.mergetool_load_failed {
+                        ui.add_enabled(false, button).on_disabled_hover_text(
+                            "A Git merge input failed to load. Close this window and retry the merge.",
+                        );
+                    } else {
+                        egui::containers::menu::MenuButton::from_button(button)
+                            .ui(ui, |ui| {
+                                ui.label(ui::micro("start a result from").color(t.text_muted));
+                                for (i, label) in &seeds {
+                                    if ui.button(label).clicked() {
+                                        seed = Some(Some(*i));
+                                        ui.close();
+                                    }
+                                }
+                                if ui.button("Start empty").clicked() {
+                                    seed = Some(None);
                                     ui.close();
                                 }
-                            }
-                            if ui.button("Start empty").clicked() {
-                                seed = Some(None);
-                                ui.close();
-                            }
-                        })
-                        .0
-                        .on_hover_text(
-                            "Build a new panel out of these: take the differences you want \
-                             from either side, edit it by hand, then save or copy it.",
-                        );
+                            })
+                            .0
+                            .on_hover_text(
+                                "Build a new panel out of these: take the differences you want \
+                                 from either side, edit it by hand, then save or copy it.",
+                            );
+                    }
                     if result_exists
                         && ui::ghost(ui, "Back to the result")
                             .on_hover_text("Make the result the baseline again")
@@ -3435,6 +3600,7 @@ impl App {
             // the central panel, so dropping the slot here is what stops a
             // layout outliving the comparison it was built for by even a frame.
             self.prepared = None;
+            self.find_matches = None;
             return;
         };
         let style = LayoutStyleKey {
@@ -3487,6 +3653,7 @@ impl App {
             whole,
             hunks,
         });
+        self.find_matches = None;
     }
 
     fn diff_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, glyph: f32) {
@@ -3501,6 +3668,12 @@ impl App {
             self.pending_resize = Some(Instant::now());
         }
 
+        if let Some(text) = self.startup_error.clone() {
+            if ui::banner(ui, &t, ui::Tone::Error, &text) {
+                self.startup_error = None;
+            }
+            ui.add_space(8.0);
+        }
         if let Some(text) = self.notice.clone() {
             if ui::banner(ui, &t, ui::Tone::Warning, &text) {
                 self.notice = None;
@@ -3584,7 +3757,7 @@ impl App {
                                         if previous.clicked() {
                                             move_hunk = -1;
                                         }
-                                        ui.label(
+                                        let count = ui.label(
                                             ui::small(format!(
                                                 "{} of {}",
                                                 hunk_cursor.min(hunk_count - 1) + 1,
@@ -3592,6 +3765,16 @@ impl App {
                                             ))
                                             .color(t.text_muted),
                                         );
+                                        let current = hunk_cursor.min(hunk_count - 1);
+                                        let position = self.cache.get(&self.shown)
+                                            .and_then(|cached| cached.hunks.get(current))
+                                            .map(|(hunk, _)| location(hunk))
+                                            .unwrap_or_default();
+                                        ui.ctx().accesskit_node_builder(count.id, |node| {
+                                            node.set_role(egui::accesskit::Role::Status);
+                                            node.set_live(egui::accesskit::Live::Polite);
+                                            node.set_label(format!("Difference {} of {}: {}", current + 1, hunk_count, position));
+                                        });
                                         let next = ui::ghost_enabled(ui, "Next change", walkable)
                                             .on_disabled_hover_text("Only one difference");
                                         if next.gained_focus() {
@@ -3663,7 +3846,17 @@ impl App {
                     // TextEdit has now applied this frame's input. Searching
                     // earlier jumped to the previous query's first match and
                     // consumed the request before the new matches existed.
-                    let find_lines = prepared.whole.matching_rows(&self.find_query);
+                    if self
+                        .find_matches
+                        .as_ref()
+                        .is_none_or(|(query, _)| query != &self.find_query)
+                    {
+                        self.find_matches = Some((
+                            self.find_query.clone(),
+                            prepared.whole.matching_rows(&self.find_query),
+                        ));
+                    }
+                    let find_lines = &self.find_matches.as_ref().expect("matches computed above").1;
                     if ui::ghost(ui, "Previous").clicked() {
                         move_find = -1;
                     }
@@ -3681,23 +3874,17 @@ impl App {
                         find_row = Some(find_lines[self.find_cursor]);
                     }
                     if find_lines.is_empty() {
-                        ui.label(
-                            ui::small(if self.find_query.is_empty() {
-                                "Type to search"
-                            } else {
-                                "No matches"
-                            })
-                            .color(t.text_muted),
-                        );
+                        ui::status(ui, if self.find_query.is_empty() {
+                            "Type to search"
+                        } else {
+                            "No matches"
+                        }, t.text_muted);
                     } else {
-                        ui.label(
-                            ui::small(format!(
+                        ui::status(ui, &format!(
                                 "{} of {}",
                                 self.find_cursor.min(find_lines.len() - 1) + 1,
                                 find_lines.len()
-                            ))
-                            .color(t.text_muted),
-                        );
+                            ), t.text_muted);
                     }
                     if ui::icon(ui, "×", "Close find", None)
                         .on_hover_text("Close find")
@@ -3862,7 +4049,7 @@ impl App {
                     )))
                     .corner_radius(radius::CHIP)
                     .min_size(Vec2::new(0.0, 22.0));
-                    clicked = ui
+                    let response = ui
                         .add_enabled(live, button)
                         .on_hover_text(format!(
                             "Replace these lines of {} with {}'s.  {}",
@@ -3872,8 +4059,11 @@ impl App {
                         ))
                         .on_disabled_hover_text(
                             "Re-reading the panels — this list is a moment out of date.",
-                        )
-                        .clicked();
+                        );
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_label(format!("Use {}'s version at {} — {}", title(self.shown), location(hunk), self.panel_label(self.shown)));
+                    });
+                    clicked = response.clicked();
                     ui.add(
                         egui::Label::new(ui::small(location(hunk)).color(t.text_muted))
                             .selectable(true),
@@ -4217,7 +4407,7 @@ impl App {
 
     fn no_difference(&self, ui: &mut egui::Ui, t: &Tokens) {
         let (a, b) = self.pair();
-        let lines = self.panels[b].text.lines().count();
+        let lines = self.panels[b].line_count;
         if self.panels[a].is_empty() && self.panels[b].is_empty() {
             ui::empty_state(
                 ui,
@@ -4271,6 +4461,16 @@ impl App {
     }
 
     fn nothing_yet(&self, ui: &mut egui::Ui, t: &Tokens) {
+        if self.mergetool_load_failed {
+            ui::empty_state(
+                ui,
+                t,
+                "Git merge unavailable",
+                "A Git input could not be read. Close this window and retry the merge; the conflict remains unresolved.",
+                &[],
+            );
+            return;
+        }
         let (a, b) = self.pair();
         if !self.panels[a].is_empty() || !self.panels[b].is_empty() {
             if self.in_flight.is_some() {
@@ -4343,7 +4543,7 @@ impl App {
                 let options: Vec<(ThemeChoice, &str)> =
                     ThemeChoice::ALL.iter().map(|c| (*c, c.label())).collect();
                 ui::field(ui, &t, fields, "Theme", |ui| {
-                    ui::choice(ui, &t, &mut theme, &options);
+                    ui::choice(ui, &t, "Appearance theme", &mut theme, &options);
                 });
                 self.settings.theme = theme;
 
@@ -4411,7 +4611,7 @@ impl App {
                         .syntax_theme
                         .clone()
                         .unwrap_or_else(|| automatic.into());
-                    egui::ComboBox::from_id_salt("syntax-theme")
+                    let combo = egui::ComboBox::from_id_salt("syntax-theme")
                         .selected_text(current)
                         .width(ui::control_width(ui))
                         .show_ui(ui, |ui| {
@@ -4434,6 +4634,9 @@ impl App {
                                     .changed();
                             }
                         });
+                    ui.ctx().accesskit_node_builder(combo.response.id, |node| {
+                        node.set_label("Syntax theme");
+                    });
                 });
                 // A syntax theme built for the other appearance is legible only by
                 // accident: it sets the code colours, while --light/--dark sets the
@@ -4478,12 +4681,13 @@ impl App {
                 ui::field(ui, &t, fields, "Show", |ui| {
                     let options: Vec<(Context, &str)> =
                         Context::ALL.iter().map(|c| (*c, c.label())).collect();
-                    dirty |= ui::choice(ui, &t, &mut self.settings.context, &options);
+                    dirty |= ui::choice(ui, &t, "Show context", &mut self.settings.context, &options);
                 });
                 ui::field(ui, &t, fields, "Whitespace", |ui| {
                     dirty |= ui::choice(
                         ui,
                         &t,
+                        "Whitespace",
                         &mut self.opts.whitespace,
                         &[
                             (Whitespace::Exact, "Exact"),
@@ -4510,6 +4714,9 @@ impl App {
                             .desired_width(ui::control_width(ui))
                             .hint_text("regular expression"),
                     );
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_label("Ignore lines matching regular expression");
+                    });
                     // On losing focus, not on every keystroke: a half-typed
                     // pattern is usually not a valid one, and git refuses the
                     // whole diff over it.
@@ -4536,6 +4743,7 @@ impl App {
                     dirty |= ui::choice(
                         ui,
                         &t,
+                        "Highlight",
                         &mut self.opts.granularity,
                         &crate::settings::GRANULARITIES,
                     );
@@ -4711,7 +4919,7 @@ impl App {
             .map(|f| f.family.clone())
             .unwrap_or_else(|| BUNDLED.into());
         let salt = if mono { "font-mono" } else { "font-ui" };
-        egui::ComboBox::from_id_salt(salt)
+        let combo = egui::ComboBox::from_id_salt(salt)
             .selected_text(label)
             .width(ui::control_width(ui))
             .show_ui(ui, |ui| {
@@ -4742,6 +4950,9 @@ impl App {
                     }
                 }
             });
+        ui.ctx().accesskit_node_builder(combo.response.id, |node| {
+            node.set_label(if mono { "Diff font" } else { "Interface font" });
+        });
     }
 
     /// Saving the starting text can be intentional, but must not silently
@@ -5661,6 +5872,11 @@ impl eframe::App for App {
         self.sync_watches(ctx);
         self.draw_drop_hint(ctx, ui);
         self.tick(ctx);
+        let title = self.window_title();
+        if self.last_window_title.as_ref() != Some(&title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
     }
 }
 
@@ -6188,6 +6404,15 @@ mod tests {
             .accesskit_update
             .as_ref()
             .expect("AccessKit tree update");
+        for name in ["Interface font", "Diff font", "Syntax theme", "Ignore lines matching regular expression"] {
+            assert!(update.nodes.iter().any(|(_, node)| node.label() == Some(name)),
+                "settings control {name:?} has no accessible name");
+        }
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::RadioButton
+                && node.label() == Some("Appearance theme: System")
+                && node.toggled() == Some(egui::accesskit::Toggled::True)
+        }));
         // A plain label's text is its node's *value*; a button's is its name.
         let first = |text: &str| {
             update
@@ -6201,7 +6426,7 @@ mod tests {
         // The first "Theme" is the appearance one; its control is the theme
         // choice, whose first button is `ThemeChoice::System`.
         let label = first("Theme");
-        let control = first(ThemeChoice::ALL[0].label());
+        let control = first(&format!("Appearance theme: {}", ThemeChoice::ALL[0].label()));
         assert!(
             label.y0 < control.y1 && control.y0 < label.y1,
             "the label spans {}..{} and its control {}..{}: stacked, not aligned",
@@ -6270,6 +6495,46 @@ mod tests {
         assert!(!resolved.load(Ordering::Relaxed));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_git_input_cannot_seed_or_save_a_result() {
+        let dir = temp_path("mergetool-missing-input");
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = [dir.join("base"), dir.join("local"), dir.join("remote")];
+        let merged = dir.join("MERGED");
+        std::fs::write(&merged, "conflict markers\n").unwrap();
+        for missing in 0..files.len() {
+            for (index, path) in files.iter().enumerate() {
+                if index == missing { let _ = std::fs::remove_file(path); }
+                else { std::fs::write(path, format!("input {index}\n")).unwrap(); }
+            }
+            let (mut app, resolved) = test_mergetool_app(&files, merged.clone());
+            assert!(app.mergetool_load_failed);
+            assert!(app.startup_error.as_deref().is_some_and(|error| error.contains("Could not")));
+            assert!(!app.compared, "a partial Git triple must not auto-render");
+            assert!(app.result_panel().is_none(), "missing input {missing} seeded a result");
+            assert!(!app.save_result(false));
+            assert!(!resolved.load(Ordering::Relaxed));
+            assert_eq!(std::fs::read_to_string(&merged).unwrap(), "conflict markers\n");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failed_positional_open_keeps_the_following_file_in_its_requested_panel() {
+        let dir = temp_path("positional-open");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.txt");
+        let second = dir.join("second.txt");
+        std::fs::write(&second, "second\n").unwrap();
+        let app = App::new(test_app().delta, Settings::default(), Launch {
+            files: vec![missing, second.clone()], ..Launch::default()
+        });
+        assert!(app.panels[0].path.is_none());
+        assert_eq!(app.panels[1].path.as_ref(), Some(&second));
+        assert!(app.startup_error.is_some());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -6438,6 +6703,33 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_plain_mergetool_save_refuses_a_changed_or_newly_created_target() {
+        for existed_at_launch in [true, false] {
+            let dir = temp_path("mergetool-target-changed");
+            std::fs::create_dir_all(&dir).unwrap();
+            let files = [dir.join("base"), dir.join("local"), dir.join("remote")];
+            for (index, path) in files.iter().enumerate() {
+                std::fs::write(path, format!("input {index}\n")).unwrap();
+            }
+            let merged = dir.join("MERGED");
+            if existed_at_launch { std::fs::write(&merged, "original\n").unwrap(); }
+            let (mut app, resolved) = test_mergetool_app(&files, merged.clone());
+            let result = app.result_panel().unwrap();
+            app.panels[result].text = "my resolution\n".into();
+            app.panels[result].dirty = true;
+            std::fs::write(&merged, "external edit\n").unwrap();
+            assert!(!app.save_result(false));
+            assert!(app.error.as_deref().is_some_and(|error| error.contains("changed outside")));
+            assert_eq!(std::fs::read_to_string(&merged).unwrap(), "external edit\n");
+            assert!(!resolved.load(Ordering::Relaxed));
+            // An explicit Save As selection can still replace Git's target.
+            assert!(app.write_result_to(result, merged.clone(), true));
+            assert_eq!(std::fs::read_to_string(&merged).unwrap(), "my resolution\n");
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     #[test]
@@ -6787,6 +7079,55 @@ mod tests {
     }
 
     #[test]
+    fn window_title_identifies_the_pair_and_unsaved_result() {
+        let mut app = test_app();
+        assert_eq!(app.window_title(), "delgui");
+        app.panels[0].text = "left".into();
+        app.panels[1].text = "right".into();
+        let comparison = app.window_title();
+        assert!(comparison.contains("vs") && comparison.ends_with("delgui"));
+        app.start_result(None);
+        let result = app.result_panel().unwrap();
+        app.panels[result].dirty = true;
+        assert!(app.window_title().starts_with("Unsaved Result"));
+        app.panels[result].dirty = false;
+        assert!(app.window_title().starts_with("Unsaved Result"), "an empty result has not been saved");
+        let saved = temp_path("window-title-result");
+        std::fs::write(&saved, "").unwrap();
+        app.panels[result].saved_to = Some(saved.clone());
+        app.panels[result].saved_snapshot = Some(String::new());
+        app.panels[result].saved_stamp = saved_file_stamp(&saved);
+        assert!(app.window_title().starts_with("Result"));
+        std::fs::write(&saved, "external edit").unwrap();
+        assert!(app.window_title().starts_with("Unsaved Result"));
+        std::fs::remove_file(saved).ok();
+    }
+
+    #[test]
+    fn an_oversized_file_drop_is_rejected_as_one_batch() {
+        #[derive(Debug)]
+        struct TestDroppedFile(PathBuf);
+        impl egui::DroppedFile for TestDroppedFile {
+            fn path(&self) -> &Path { &self.0 }
+            fn bytes(&self) -> Result<Vec<u8>, String> { Ok(Vec::new()) }
+        }
+        let mut app = test_app();
+        app.panel_rects = vec![
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0)),
+            egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(100.0, 100.0)),
+        ];
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(150.0, 50.0))],
+            dropped_files: (0..6).map(|n| Arc::new(TestDroppedFile(PathBuf::from(format!("file-{n}")))) as egui::DroppedFileHandle).collect(),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |_ui| app.accept_drops(&ctx)).textures_delta.clear();
+        assert!(app.destructive.is_none(), "a partial batch was queued");
+        assert!(app.notice.as_deref().is_some_and(|text| text.contains("Nothing was loaded")));
+    }
+
+    #[test]
     fn navigation_clamps_a_cursor_left_over_from_a_longer_render() {
         assert_eq!(moved_cursor(99, 2, -1), 0);
         assert_eq!(moved_cursor(99, 2, 1), 0);
@@ -6846,6 +7187,56 @@ mod tests {
         find_test_pass(&mut app, &ctx, Vec::new());
         assert_eq!(app.find_cursor, 0);
         assert_eq!(app.restore_offset, Some(80.0 * row_height));
+    }
+
+    #[test]
+    fn find_reuses_matches_until_the_layout_or_query_changes() {
+        let mut app = test_app();
+        app.show_find = true;
+        app.find_query = "target".into();
+        let key = app.current_key();
+        app.cache.insert(app.shown, Cached {
+            key, lines: ansi::parse(b"target\nother\ntarget\n"),
+            columns: app.columns, hunks: Vec::new(), problem: None,
+        });
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        find_test_pass(&mut app, &ctx, Vec::new());
+        let first = app.find_matches.as_ref().unwrap().1.as_ptr();
+        assert_eq!(app.find_matches.as_ref().unwrap().1.len(), 2);
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.find_matches.as_ref().unwrap().1.as_ptr(), first);
+        app.find_query = "other".into();
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.find_matches.as_ref().unwrap().1.len(), 1);
+        app.cache.remove(&app.shown);
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert!(app.find_matches.is_none());
+    }
+
+    #[test]
+    fn find_feedback_is_a_polite_accessibility_status() {
+        let mut app = test_app();
+        app.show_find = true;
+        app.find_query = "absent".into();
+        app.cache.insert(app.shown, Cached {
+            key: app.current_key(), lines: ansi::parse(b"present\n"),
+            columns: app.columns, hunks: Vec::new(), problem: None,
+        });
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        ctx.enable_accesskit();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+        let mut output = ctx.run_ui(screen_input(screen), |ui| app.diff_area(ui, &ctx, 8.0));
+        let update = output.platform_output.accesskit_update.take().unwrap();
+        output.textures_delta.clear();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.label() == Some("No matches")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+        }));
     }
 
     #[test]
@@ -7088,8 +7479,39 @@ mod tests {
                     for name in ["Settings", "+ Panel", "Help"] {
                         assert_inside_screen(screen, bounds(name), name);
                     }
+                    assert!(bounds("+ Panel").x1 <= bounds("Settings").x0);
+                    assert!(bounds("Settings").x1 <= bounds("Help").x0);
+                    assert!(compare.x1 <= bounds("+ Panel").x0);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn toolbar_tab_order_follows_its_visual_order() {
+        let mut app = test_app();
+        app.panels[0].text = "left".into();
+        app.panels[1].text = "right".into();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, 20.0, 12.5);
+        ctx.enable_accesskit();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+        let expected = ["Compare", "Side by side", "Numbers", "Wrap", "+ Panel", "Settings", "Help"];
+        for name in expected {
+            let mut input = screen_input(screen);
+            input.events.push(egui::Event::Key {
+                key: Key::Tab, physical_key: None, pressed: true, repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let mut output = ctx.run_ui(input, |ui| app.toolbar(ui, &ctx));
+            let update = output.platform_output.accesskit_update.take().expect("AccessKit tree");
+            output.textures_delta.clear();
+            let focused = ctx.memory(|memory| memory.focused()).expect("Tab focused a control");
+            let label = update.nodes.iter().find(|(id, _)| *id == focused.accesskit_id())
+                .and_then(|(_, node)| node.label())
+                .unwrap_or("<unlabelled>");
+            assert!(label.starts_with(name), "expected {name:?}, Tab reached {label:?}");
         }
     }
 
@@ -7780,6 +8202,10 @@ mod tests {
             })
             .map(|(id, _)| *id)
             .expect("merge hunk control");
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.label().is_some_and(|label| label.contains("Difference 1 of 1: line 1"))
+        }));
         let (scroll_id, scroll) = update
             .nodes
             .iter()
