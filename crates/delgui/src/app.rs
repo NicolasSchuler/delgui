@@ -2890,9 +2890,17 @@ impl App {
                                         ui,
                                         &t,
                                         &mut [
-                                            ("Side by side", &mut opts.side_by_side),
-                                            ("Numbers", &mut opts.line_numbers),
-                                            ("Wrap", &mut opts.wrap),
+                                            (
+                                                "Side by side",
+                                                &keys::side_by_side_hint(),
+                                                &mut opts.side_by_side,
+                                            ),
+                                            (
+                                                "Numbers",
+                                                &keys::line_numbers_hint(),
+                                                &mut opts.line_numbers,
+                                            ),
+                                            ("Wrap", &keys::wrap_hint(), &mut opts.wrap),
                                         ],
                                     );
                                 });
@@ -4594,7 +4602,7 @@ impl App {
         );
     }
 
-    fn nothing_yet(&self, ui: &mut egui::Ui, t: &Tokens) {
+    fn nothing_yet(&mut self, ui: &mut egui::Ui, t: &Tokens) {
         if self.mergetool_load_failed {
             ui::empty_state(
                 ui,
@@ -4619,7 +4627,7 @@ impl App {
             }
             return;
         }
-        ui::empty_state(
+        let open_help = ui::getting_started(
             ui,
             t,
             "Nothing to compare yet",
@@ -4631,9 +4639,17 @@ impl App {
             &[
                 (keys::paste_panel_label(), "paste into a new panel"),
                 (keys::compare_label(), "compare"),
-                (keys::help_label(), "keyboard shortcuts"),
             ],
+            // A link, so the screen that names the overlay also opens it: the
+            // `?` in the toolbar is the only other way in without the chord.
+            (keys::help_label(), "keyboard shortcuts"),
+            // The baseline is the app's one idea a newcomer cannot guess, and the
+            // letter chip that sets it looks like a label until it is clicked.
+            "Click a panel's letter to make it the baseline the others are compared against.",
         );
+        if open_help {
+            self.show_help = true;
+        }
     }
 
     // ---- settings --------------------------------------------------------
@@ -4672,12 +4688,14 @@ impl App {
                 });
                 ui.add_space(12.0);
 
-                ui::section(ui, &t, "Appearance");
+                // Section names are lower case, like every other `ui::micro`
+                // tag: it uppercases them for display either way.
+                ui::section(ui, &t, "appearance");
                 let mut theme = self.settings.theme;
                 let options: Vec<(ThemeChoice, &str)> =
                     ThemeChoice::ALL.iter().map(|c| (*c, c.label())).collect();
                 ui::field(ui, &t, fields, "Theme", |ui| {
-                    ui::choice(ui, &t, "Appearance theme", &mut theme, &options);
+                    ui::choice(ui, &t, "Appearance theme", &mut theme, &options, |_| None);
                 });
                 self.settings.theme = theme;
 
@@ -4815,7 +4833,25 @@ impl App {
                 ui::field(ui, &t, fields, "Show", |ui| {
                     let options: Vec<(Context, &str)> =
                         Context::ALL.iter().map(|c| (*c, c.label())).collect();
-                    dirty |= ui::choice(ui, &t, "Show context", &mut self.settings.context, &options);
+                    dirty |= ui::choice(
+                        ui,
+                        &t,
+                        "Show context",
+                        &mut self.settings.context,
+                        &options,
+                        |c| {
+                            Some(match c {
+                                Context::Tight => {
+                                    "Only the changed lines, so each separate change is its own \
+                                     difference."
+                                }
+                                Context::Normal => {
+                                    "Three unchanged lines around each change, git's own default."
+                                }
+                                Context::Whole => "The entire file, with the changes marked.",
+                            })
+                        },
+                    );
                 });
                 ui::field(ui, &t, fields, "Whitespace", |ui| {
                     dirty |= ui::choice(
@@ -4828,10 +4864,29 @@ impl App {
                             (Whitespace::Amount, "Ignore amount"),
                             (Whitespace::All, "Ignore all"),
                         ],
+                        |w| {
+                            Some(match w {
+                                Whitespace::Exact => {
+                                    "Every change to whitespace is a difference. Git's default."
+                                }
+                                Whitespace::Amount => {
+                                    "Passes -b. Changed indentation and trailing spaces are not \
+                                     differences, but space added where there was none still is."
+                                }
+                                Whitespace::All => {
+                                    "Passes -w. Whitespace is never a difference, indentation \
+                                     included."
+                                }
+                            })
+                        },
                     );
                 });
                 dirty |= ui
                     .checkbox(&mut self.opts.ignore_blank_lines, "Ignore blank lines")
+                    .on_hover_text(
+                        "Passes --ignore-blank-lines. A change that only adds or removes blank \
+                         lines is not a difference.",
+                    )
                     .changed();
                 dirty |= ui
                     .checkbox(
@@ -4839,10 +4894,15 @@ impl App {
                         "Ignore Windows line endings",
                     )
                     .on_hover_text(
-                        "A file saved with CRLF differs from the same file saved with LF on                          every single line.",
+                        "A file saved with CRLF differs from the same file saved with LF on \
+                         every single line.",
                     )
                     .changed();
                 ui::field(ui, &t, fields, "Ignore lines matching", |ui| {
+                    const HINT: &str = "Passes --ignore-matching-lines. A change whose lines \
+                                        all match this regular expression, such as a timestamp \
+                                        or a build number, is not a difference. Applied when \
+                                        you leave the field.";
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.settings.ignore_matching)
                             .desired_width(ui::control_width(ui))
@@ -4850,7 +4910,9 @@ impl App {
                     );
                     ui.ctx().accesskit_node_builder(response.id, |node| {
                         node.set_label("Ignore lines matching regular expression");
+                        node.set_description(HINT);
                     });
+                    let response = response.on_hover_text(HINT);
                     // On losing focus, not on every keystroke: a half-typed
                     // pattern is usually not a valid one, and git refuses the
                     // whole diff over it.
@@ -4860,7 +4922,8 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(
                         ui::small(
-                            "While a result is being built these are off: a take copies a                              difference's lines exactly, so nothing may be left out of one.",
+                            "While a result is being built these are off: a take copies a \
+                             difference's lines exactly, so nothing may be left out of one.",
                         )
                         .color(t.text_muted),
                     );
@@ -4874,12 +4937,28 @@ impl App {
                 // why it needs no merge-mode exception -- it cannot make
                 // `merge::verify` false.
                 ui::field(ui, &t, fields, "Highlight", |ui| {
+                    use delgui_core::delta::Granularity;
                     dirty |= ui::choice(
                         ui,
                         &t,
                         "Highlight",
                         &mut self.opts.granularity,
                         &crate::settings::GRANULARITIES,
+                        |g| {
+                            Some(match g {
+                                Granularity::Character => {
+                                    "Only the characters that differ are picked out, so a \
+                                     one-character change is hard to miss."
+                                }
+                                Granularity::Word => {
+                                    "A changed word is marked whole. delta's own default."
+                                }
+                                Granularity::Line => {
+                                    "Nothing is picked out within a line: removed and added \
+                                     lines are coloured whole."
+                                }
+                            })
+                        },
                     );
                 });
                 dirty |= ui
@@ -4968,7 +5047,7 @@ impl App {
                 }
 
                 ui.add_space(16.0);
-                ui::section(ui, &t, "Render pipeline");
+                ui::section(ui, &t, "render pipeline");
                 let argv = self.command_line();
                 Frame::new()
                     .fill(t.surface_sunken)
@@ -7807,6 +7886,33 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The first screen names the shortcuts overlay, so it has to open it: as
+    /// text, that row told a newcomer about a list they could only reach by
+    /// already knowing its chord or spotting the `?`.
+    #[test]
+    fn the_empty_screen_opens_the_shortcuts_overlay_and_explains_the_baseline() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        ctx.enable_accesskit();
+        let tree = app_ui_test_pass(&mut app, &ctx, Vec::new());
+        assert!(tree.nodes.iter().any(|(_, node)| {
+            node.label().or(node.value()).is_some_and(|text| text.starts_with("Click a panel's letter"))
+        }), "the baseline tip is missing");
+        let link = tree.nodes.iter().find(|(_, node)| {
+            node.role() == egui::accesskit::Role::Link && node.label() == Some("keyboard shortcuts")
+        }).expect("the shortcuts row is a link").0;
+        assert!(!app.show_help);
+        app_ui_test_pass(&mut app, &ctx, vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Click,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node: link,
+            data: None,
+        })]);
+        assert!(app.show_help, "clicking the shortcuts row did not open the overlay");
     }
 
     #[test]

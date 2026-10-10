@@ -172,7 +172,12 @@ pub fn slider_visuals(ui: &mut Ui, t: &Tokens) {
 /// These are not settings -- they are the view the user is looking through, and
 /// they get toggled constantly. A row of stock checkboxes said "form"; this says
 /// "mode", and it is one object instead of three loose ones.
-pub fn segmented(ui: &mut Ui, t: &Tokens, items: &mut [(&str, &mut bool)]) -> bool {
+///
+/// Each item is a label, a hint and the flag it flips. A one-word label --
+/// "Numbers" -- does not say what it changes or that a chord does the same, so
+/// the hint is the tooltip, and the accessible description for anyone who never
+/// hovers.
+pub fn segmented(ui: &mut Ui, t: &Tokens, items: &mut [(&str, &str, &mut bool)]) -> bool {
     let mut changed = false;
     Frame::new()
         // Sunken, not `surface`. The toolbar these sit in is drawn on
@@ -191,11 +196,15 @@ pub fn segmented(ui: &mut Ui, t: &Tokens, items: &mut [(&str, &mut bool)]) -> bo
             // does wrap, and there the y matters -- see the comment there.
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.horizontal(|ui| {
-                for (label, on) in items.iter_mut() {
+                for (label, hint, on) in items.iter_mut() {
                     let button = Button::selectable(**on, *label)
                         .corner_radius(CornerRadius::same(5))
                         .min_size(Vec2::new(0.0, 24.0));
                     let response = ui.add(button);
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_description(*hint);
+                    });
+                    let response = response.on_hover_text(*hint);
                     if response.gained_focus() {
                         response.scroll_to_me(Some(Align::Center));
                     }
@@ -210,12 +219,18 @@ pub fn segmented(ui: &mut Ui, t: &Tokens, items: &mut [(&str, &mut bool)]) -> bo
 }
 
 /// A three-way choice where exactly one is on.
+///
+/// `hint` gives an option its tooltip and accessible description. A function of
+/// the value rather than a third tuple field, because some option lists are
+/// shared consts that `docs.rs` also reads -- `settings::GRANULARITIES` -- and
+/// their shape is not this control's to change.
 pub fn choice<T: PartialEq + Copy>(
     ui: &mut Ui,
     t: &Tokens,
     group: &str,
     current: &mut T,
     options: &[(T, &str)],
+    hint: impl Fn(T) -> Option<&'static str>,
 ) -> bool {
     let mut changed = false;
     Frame::new()
@@ -237,11 +252,18 @@ pub fn choice<T: PartialEq + Copy>(
                     let button = Button::selectable(*current == *value, *label)
                         .corner_radius(CornerRadius::same(5))
                         .min_size(Vec2::new(0.0, 24.0));
-                    let response = ui.add(button);
+                    let mut response = ui.add(button);
+                    let hint = hint(*value);
                     ui.ctx().accesskit_node_builder(response.id, |node| {
                         node.set_role(egui::accesskit::Role::RadioButton);
                         node.set_label(format!("{group}: {label}"));
+                        if let Some(hint) = hint {
+                            node.set_description(hint);
+                        }
                     });
+                    if let Some(hint) = hint {
+                        response = response.on_hover_text(hint);
+                    }
                     if response.clicked() && *current != *value {
                         *current = *value;
                         changed = true;
@@ -320,7 +342,25 @@ pub fn banner(ui: &mut Ui, t: &Tokens, tone: Tone, text: &str) -> bool {
 /// Centred guidance for a region with nothing in it yet. A one-line hint in the
 /// top-left corner reads as a status message; this reads as an invitation.
 pub fn empty_state(ui: &mut Ui, t: &Tokens, title: &str, body: &str, rows: &[(&str, &str)]) {
-    let _ = empty_state_scroll(ui, t, title, body, rows);
+    let _ = empty_state_scroll(ui, t, title, body, rows, None, None);
+}
+
+/// The first-run screen: `empty_state` with one more row whose description is a
+/// link, and a muted tip under the list. True on the frame the link is clicked.
+///
+/// The link row is what the row list cannot say by itself: a chord is something
+/// to remember, and the one row that leads to every other chord should not need
+/// remembering before it can be used.
+pub fn getting_started(
+    ui: &mut Ui,
+    t: &Tokens,
+    title: &str,
+    body: &str,
+    rows: &[(&str, &str)],
+    link: (&str, &str),
+    tip: &str,
+) -> bool {
+    empty_state_scroll(ui, t, title, body, rows, Some(link), Some(tip)).inner.2
 }
 
 const GUIDANCE_COMPACT_HEIGHT: f32 = 320.0;
@@ -345,7 +385,9 @@ fn empty_state_scroll(
     title: &str,
     body: &str,
     rows: &[(&str, &str)],
-) -> egui::scroll_area::ScrollAreaOutput<(egui::Rect, egui::Rect)> {
+    link: Option<(&str, &str)>,
+    tip: Option<&str>,
+) -> egui::scroll_area::ScrollAreaOutput<(egui::Rect, egui::Rect, bool)> {
     let viewport_height = ui.available_height();
     let top_space = guidance_top_space(viewport_height);
     let content_width = ui.available_width();
@@ -375,8 +417,18 @@ fn empty_state_scroll(
                 let body = ui
                     .label(RichText::new(body).color(t.text_secondary))
                     .rect;
-                if !rows.is_empty() {
+                let mut clicked = false;
+                if !rows.is_empty() || link.is_some() {
                     ui.add_space(16.0);
+                    let key_cell = |ui: &mut Ui, key: &str| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                chord(key)
+                                    .color(t.text_secondary)
+                                    .background_color(t.surface_raised),
+                            );
+                        });
+                    };
                     // Bounded so `vertical_centered` has something narrower than the
                     // whole card to centre; a full-width grid would sit against the
                     // left edge under a centred heading.
@@ -387,22 +439,34 @@ fn empty_state_scroll(
                             .spacing([14.0, 8.0])
                             .show(ui, |ui| {
                                 for (key, what) in rows {
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(
-                                            chord(*key)
-                                                .color(t.text_secondary)
-                                                .background_color(t.surface_raised),
-                                        );
-                                    });
+                                    key_cell(ui, key);
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         ui.label(RichText::new(*what).color(t.text_muted));
+                                    });
+                                    ui.end_row();
+                                }
+                                if let Some((key, what)) = link {
+                                    key_cell(ui, key);
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        // A selectable link is published to
+                                        // AccessKit as a Label once it is on
+                                        // screen (egui-0.36.1/src/text_selection/
+                                        // label_text_selection.rs:670), so a
+                                        // screen reader would not offer it as
+                                        // something to press.
+                                        ui.style_mut().interaction.selectable_labels = false;
+                                        clicked = ui.link(what).clicked();
                                     });
                                     ui.end_row();
                                 }
                             });
                     });
                 }
-                (title, body)
+                if let Some(tip) = tip {
+                    ui.add_space(16.0);
+                    ui.label(small(tip).color(t.text_muted));
+                }
+                (title, body, clicked)
             })
             .inner;
             let bounds = ui.clip_rect().intersect(ui.min_rect());
@@ -777,6 +841,32 @@ mod tests {
         }
     }
 
+    /// A tooltip only exists for a pointer. The same hint is the accessible
+    /// description, so the view toggles and the drawer's choices explain
+    /// themselves to a keyboard or a screen reader too -- and an option given no
+    /// hint gets no empty description.
+    #[test]
+    fn mode_and_choice_hints_are_published_as_descriptions() {
+        let ctx = test_ctx(13.0);
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let t = Tokens::dark();
+            let mut wrap = true;
+            segmented(ui, &t, &mut [("Wrap", "Wrap long lines", &mut wrap)]);
+            let mut current = 0usize;
+            choice(ui, &t, "Show", &mut current, &[(0, "Hinted"), (1, "Bare")], |v| {
+                (v == 0).then_some("An explanation")
+            });
+        });
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        let node = |label| &update.nodes.iter().find(|(_, node)| node.label() == Some(label))
+            .expect("named control").1;
+        assert_eq!(node("Wrap").description(), Some("Wrap long lines"));
+        assert_eq!(node("Show: Hinted").description(), Some("An explanation"));
+        assert_eq!(node("Show: Bare").description(), None);
+        output.textures_delta.clear();
+    }
+
     #[test]
     fn long_error_keeps_dismiss_and_the_comparison_inside_a_short_view() {
         for ui_pt in [13.0, 20.0] {
@@ -837,7 +927,6 @@ mod tests {
                 ("⌘V", "paste text"),
                 ("drop", "drop a file"),
                 ("⌘N", "add a panel"),
-                ("⌘/", "show shortcuts"),
             ];
             let output = ui
                 .allocate_ui(Vec2::new(420.0, 120.0), |ui| {
@@ -848,6 +937,8 @@ mod tests {
                         "Nothing to compare yet",
                         "Load content into two panels to begin.",
                         &rows,
+                        Some(("⌘/", "show shortcuts")),
+                        Some("Click a panel's letter to make it the baseline."),
                     );
                     assert_eq!(output.id, expected_id);
                     output
@@ -860,7 +951,7 @@ mod tests {
                 output.content_size.y,
                 output.inner_rect.height(),
             );
-            let (title, body) = output.inner;
+            let (title, body, _) = output.inner;
             assert!(
                 output.inner_rect.contains_rect(title),
                 "title {title:?} is outside initial viewport {:?}",
@@ -889,6 +980,13 @@ mod tests {
         assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
         assert!(bounds.x1 - bounds.x0 <= 420.0);
         assert!(bounds.y1 - bounds.y0 <= 120.0);
+        // The shortcuts row is a control, not a caption: drawn as plain text it
+        // named the overlay without being a way to open it.
+        assert!(
+            update.nodes.iter().any(|(_, node)| node.role() == egui::accesskit::Role::Link
+                && node.label() == Some("show shortcuts")),
+            "the link row is not published as a link"
+        );
         output.textures_delta.clear();
     }
 
@@ -1151,7 +1249,7 @@ mod tests {
             // the wrapped frame below has exactly as much of.
             let one = ui
                 .scope(|ui| {
-                    choice(ui, &t, "Choice", &mut current, &[(0usize, "A")]);
+                    choice(ui, &t, "Choice", &mut current, &[(0usize, "A")], |_| None);
                 })
                 .response
                 .rect;
@@ -1161,7 +1259,7 @@ mod tests {
             let wrapped = ui
                 .scope(|ui| {
                     ui.set_max_width(two_wide);
-                    choice(ui, &t, "Choice", &mut current, &[(0usize, "A"), (1, "A"), (2, "A")]);
+                    choice(ui, &t, "Choice", &mut current, &[(0usize, "A"), (1, "A"), (2, "A")], |_| None);
                 })
                 .response
                 .rect;

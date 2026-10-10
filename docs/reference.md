@@ -44,8 +44,9 @@ delgui [OPTIONS] [FILE]...
 | `--paste` |  | Load the clipboard into the first panel at startup. Nothing happens if the clipboard holds no text. |
 | `--combine` |  | Start with a result panel, seeded from the first input panel, ready to take differences into. Non-empty clipboard text loaded with --paste takes that panel before files do. |
 | `--watch` |  | Follow every file given on the command line, re-reading and re-diffing when it changes on disk. |
-| `--hotkey` |  | Register a system-wide hotkey that focuses the window and pastes into a fresh panel. Failure to register is reported and the app continues without it. |
+| `--hotkey` |  | Register a system-wide hotkey that focuses the window and pastes into a fresh panel. It works only while delgui is running. Failure to register is reported and the app continues without it. |
 | `--mergetool` | `BASE LOCAL REMOTE MERGED` | Resolve a merge conflict for Git. Exactly four paths, bound by position. |
+| `--version` |  | Print `delgui` and its version to stdout and exit 0, without looking for delta or Git. |
 | `--help` |  | Print usage to stdout and exit 0. |
 | `-h` |  | Same as `--help`. |
 

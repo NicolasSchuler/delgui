@@ -19,7 +19,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use delgui_core::delta::{self, Delta, DeltaError};
 
-const USAGE: &str = "\
+/// A function rather than a `const`, because the two chords in it are written
+/// the way this platform writes them -- the rule `keys::chord` applies in the
+/// app, where a `⌘` on Linux names a key that keyboard does not have.
+fn usage() -> String {
+    // The chord `hotkey::Hotkey::register` binds.
+    let hotkey = if cfg!(target_os = "macos") { "⌘⇧D" } else { "Super+Shift+D" };
+    format!(
+        "\
 delgui — a paste-first GUI frontend for delta
 
   delgui [OPTIONS] [FILE]...
@@ -27,28 +34,37 @@ delgui — a paste-first GUI frontend for delta
   --paste       load the clipboard into the first panel
   --combine     start a result panel, seeded from the first input panel
   --watch       re-diff when a file given here changes on disk
-  --hotkey      register a system-wide hotkey that pastes into a fresh panel
+  --hotkey      make {hotkey} paste into a fresh panel from any app; it works
+                only while delgui is running and cannot launch it
   --mergetool   resolve a conflict for git: BASE LOCAL REMOTE MERGED
-  --help        this message
+  --version     print the version and exit
+  -h, --help    this message
+
+Drop a file onto a panel to load it there. In the app, {help} or the ? button
+lists every keyboard shortcut.
 
 As git's diff and merge tool:
 
   git config --global diff.tool delgui
   git config --global difftool.delgui.cmd 'delgui \"$LOCAL\" \"$REMOTE\"'
   git config --global merge.tool delgui
-  git config --global mergetool.delgui.cmd \
+  git config --global mergetool.delgui.cmd \\
       'delgui --mergetool \"$BASE\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\"'
   git config --global mergetool.delgui.trustExitCode true
 
 Rendering is done by the real delta binary, so your [delta] gitconfig applies.
-";
+",
+        help = keys::help_label(),
+    )
+}
 
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 8] = [
     "--paste",
     "--combine",
     "--watch",
     "--hotkey",
     "--mergetool",
+    "--version",
     "--help",
     "-h",
 ];
@@ -56,7 +72,13 @@ const FLAGS: [&str; 7] = [
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        print!("{USAGE}");
+        print!("{}", usage());
+        return Ok(());
+    }
+    // Before delta is looked for: a version query has to answer on a machine
+    // that cannot run the app, which is when someone is most likely to ask.
+    if args.iter().any(|a| a == "--version") {
+        println!("delgui {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     // Silently ignoring an unknown flag means `--wach` starts an app that does
@@ -66,7 +88,7 @@ fn main() -> eframe::Result<()> {
         .find(|a| a.starts_with('-') && !FLAGS.contains(&a.as_str()))
     {
         eprintln!("delgui: unknown option {bad}\n");
-        eprint!("{USAGE}");
+        eprint!("{}", usage());
         std::process::exit(2);
     }
     let flag = |name: &str| args.iter().any(|a| a == name);
@@ -110,7 +132,7 @@ fn main() -> eframe::Result<()> {
                 "delgui: --mergetool needs exactly four files — BASE LOCAL REMOTE MERGED, \
                  which is what git passes.\n"
             );
-            eprint!("{USAGE}");
+            eprint!("{}", usage());
             std::process::exit(2);
         };
         (
