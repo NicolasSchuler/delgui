@@ -27,8 +27,9 @@ If either is missing, delgui prints to stderr, shows a dialog, and exits 1.
 | delta refused the patch | Reported in a banner; the previous diff stays on screen. |
 | `git` is not on PATH | Fatal. Every render owns a `git diff --no-index` step, so Git is part of the pipeline, not an optional extra. |
 | `git diff --no-index` refused | Reported in a banner. Exit 1 *with* a patch means the inputs differ and is not an error. |
-| a child outran the timeout | The process group is killed and the failure is reported. |
+| a child outran its timeout | The process group is killed and the failure is reported, suggesting Changes only or smaller inputs. |
 | a child outran the output cap | Reported rather than buffered. |
+| the panels changed while a render ran | Not reported. The render is abandoned, its process group killed, and a render of the panels as they are now takes its place. |
 
 If delta or Git cannot be started at all, or its output cannot be read, that is reported the same way: fatally at startup, in the banner during a render.
 
@@ -356,15 +357,16 @@ Applied to both children of every render.
 | Panels | 6 | delta is two-way; more panels means more pairs against one baseline, and past a handful the columns are too narrow to read. |
 | Panel size | 4 MB | Beyond this delta is the bottleneck: about 0.8 s at 2 MB, and it produces roughly seven times its input in ANSI. Refused rather than hung. |
 | Auto-render ceiling | 1 MB | Above this combined input size, initial comparison and edits wait for Compare. |
-| Typing debounce | 300 ms | |
+| Typing debounce | 300 ms, or 150 ms below 50 KB combined | Long enough for a pause between words; a small pair renders in tens of milliseconds, so it waits less. |
 | Resize debounce | 120 ms | |
 | Watch debounce | 180 ms | A save is rarely one filesystem event, and a file mid-write reads as truncated. |
 | Undo history | 100 takes or 64 MB | Snapshots of a buffer that may be megabytes, so it is bounded twice. |
-| Subprocess timeout | 15 s | The child is killed as a process group. |
+| Superseded render | abandoned after 250 ms | A render whose panels change while it runs is killed when a render of the current panels is due, provided it has run this long, and that render starts in its place. The floor stops a held key restarting delta at key-repeat rate. |
+| Subprocess timeout | 15 s, plus 8 s per MB of input | The child is killed as a process group. Its input is the two panels for the diff step and the patch for delta, which is what grows when much of a pair differs. |
 | Subprocess stdout | 128 MiB | |
 | Subprocess stderr | 1 MiB | |
 
-Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.
+Rendering is single-flight: one render runs at a time, and one whose inputs change while it runs is abandoned as soon as a render of the current inputs is due to start. A result that arrives for inputs that have since changed is dropped without being drawn, unless the pair is over the auto-render ceiling and nothing will replace it until Compare. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.
 
 ---
 

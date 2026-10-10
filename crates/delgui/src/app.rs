@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use delgui_core::ansi::{self, Line};
 use delgui_core::config::{self, DeltaConfig};
-use delgui_core::delta::{Appearance, Delta, DeltaError, Input, Options, Whitespace};
+use delgui_core::delta::{Appearance, Cancel, Delta, DeltaError, Input, Options, Whitespace};
 use delgui_core::language;
 use delgui_core::merge::{self, Hunk};
 use delgui_core::watch::FileWatcher;
@@ -32,15 +32,50 @@ use crate::ui;
 pub(crate) const MAX_PANEL_BYTES: usize = 4_000_000;
 
 /// Above this, editing stops re-rendering by itself and waits to be asked.
-/// delta costs about a second per megabyte, and a diff that recomputes while
-/// you type is worse than one you trigger.
+/// delta takes well under a second per megabyte of a pair that barely differs
+/// and seconds per megabyte of one that mostly does (research.md §20), and a
+/// diff that recomputes while you type is worse than one you trigger.
 pub(crate) const AUTO_RENDER_BYTES: usize = 1_000_000;
 
 /// Delta re-runs on every width change, so resizing has to settle first.
 pub(crate) const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Typing is a stream of changes, and each one would otherwise be a subprocess.
+///
+/// Long enough to wait for a pause between words, not between letters: a
+/// render begun mid-word, on a pair that takes delta a second, is overtaken by
+/// the next keystroke and thrown away, so starting it early buys nothing
+/// (research.md §20).
 pub(crate) const EDIT_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Below this pair size, typing waits only [`SMALL_PAIR_EDIT_DEBOUNCE`].
+///
+/// Two 25 KB panels with two thirds of their lines changed take 70 ms through
+/// `git diff` and delta together, and half that when little differs, so the
+/// wait is most of the latency and a render begun between letters is cheap to
+/// throw away. Pasted snippets, which are most comparisons, live here.
+pub(crate) const SMALL_PAIR_BYTES: usize = 50_000;
+pub(crate) const SMALL_PAIR_EDIT_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How long typing must pause before a pair of this size is re-rendered.
+pub(crate) fn edit_debounce(pair_bytes: usize) -> Duration {
+    if pair_bytes < SMALL_PAIR_BYTES {
+        SMALL_PAIR_EDIT_DEBOUNCE
+    } else {
+        EDIT_DEBOUNCE
+    }
+}
+
+/// A render whose panels have changed is abandoned for the one that is wanted
+/// -- but only once it has run this long.
+///
+/// Its result could only be discarded, so this is not about saving it. It
+/// bounds how often a held key can restart delta: ⌘⏎ re-reads file-backed
+/// panels and ⌘Z rewrites the result, so each would otherwise kill and respawn
+/// a render as often as the key repeats -- the twenty-five processes a second
+/// that single-flight was built to stop. A render quicker than this is never
+/// interrupted, and waiting out the rest of a slower one costs at most this.
+pub(crate) const ABANDON_AFTER: Duration = Duration::from_millis(250);
 
 /// A save is rarely one filesystem event, and a file mid-write reads as
 /// truncated, so watch events are coalesced before re-reading.
@@ -604,14 +639,18 @@ enum Job {
 /// rejects `--hunk-header-style` twice, and a line of file content is
 /// indistinguishable from a header once a gitconfig has emptied the line-number
 /// columns.
+///
+/// `cancel` is how `schedule` abandons a render whose panels have changed under
+/// it: either child is killed, and the parse of a rendering nobody will look at
+/// is skipped.
 fn render_job(
     delta: &Delta,
     left: &Input,
     right: &Input,
     opts: &Options,
     key: RenderKey,
-    columns: usize,
     merging: bool,
+    cancel: &Cancel,
 ) -> Result<Cached, DeltaError> {
     // One path for every render. delta's two-file mode shells out to
     // `git diff --no-index` itself, so running that step here costs a process
@@ -620,8 +659,16 @@ fn render_job(
     // diff it is showing: the context width, the hunk ranges, and anything else
     // decided before delta sees a patch never reaches delta's argv, so it cannot
     // be recovered from the rendering afterwards.
-    let patch = delta.diff(left, right, opts)?;
-    let rendered = ansi::parse(&delta.render_patch(&patch, opts)?);
+    let patch = delta.diff_cancellable(left, right, opts, cancel)?;
+    let output = delta.render_patch_cancellable(&patch, opts, cancel)?;
+    // Up to seven times the input in ANSI, so parsing it is not free either.
+    if cancel.is_cancelled() {
+        return Err(DeltaError::Cancelled);
+    }
+    let rendered = ansi::parse(&output);
+    // The column count delta laid this out against, read from the arguments it
+    // was given rather than passed alongside them.
+    let columns = usize::from(opts.width);
     let hunks = merge::parse(&patch);
     // Every render is marked, so every render knows where its differences are --
     // which is all Previous/Next change needs. The marker rows come back out
@@ -678,6 +725,24 @@ fn render_job(
     })
 }
 
+/// What the banner says when a render fails.
+///
+/// A timeout is the one failure the user can do something about from inside
+/// the app, so it says what. delta's time follows the patch, and context is
+/// most of a patch that differs sparsely: "Changes only" took two 4 MB panels
+/// with 5% of lines changed from 3.2 s at whole-file context to 0.4 s, and a
+/// pair with two thirds changed from 4.2 s to 2.7 s (research.md §20).
+fn describe_render_failure(error: &DeltaError) -> String {
+    match error {
+        DeltaError::TimedOut { .. } => format!(
+            "{error}. delta's time grows with how much it has to draw: choose {} in \
+             Settings to leave out the unchanged lines, or compare smaller inputs.",
+            Context::Tight.label()
+        ),
+        _ => error.to_string(),
+    }
+}
+
 pub struct App {
     delta: Delta,
     panels: Vec<Panel>,
@@ -717,6 +782,9 @@ pub struct App {
     /// attributed -- which turned one failed render into an unbounded respawn
     /// loop, thousands of subprocesses a second.
     in_flight: Option<RenderKey>,
+    /// How to abandon that render, and when it started. Set and cleared with
+    /// `in_flight` by `schedule` and `poll`; a render without one is waited for.
+    in_flight_cancel: Option<(Cancel, Instant)>,
     /// The last render that failed, so we do not immediately try it again.
     failed: Option<RenderKey>,
     error: Option<String>,
@@ -998,6 +1066,7 @@ impl App {
             prepared: None,
             find_matches: None,
             in_flight: None,
+            in_flight_cancel: None,
             failed: None,
             error: None,
             startup_error: error,
@@ -1248,10 +1317,31 @@ impl App {
     /// site with a single `bool` to guard it, so holding ⌘Enter started twenty-five
     /// delta processes a second and whichever finished last won -- the visible
     /// diff could go backwards in time.
+    ///
+    /// Still one at a time when the running render is of panels that have
+    /// changed since: that one is abandoned -- killed, and its result never
+    /// sent -- before the render that is wanted starts. Waiting it out meant an
+    /// edit queued behind seconds of delta whose output `poll` then discarded.
     fn schedule(&mut self, ctx: &egui::Context) {
         self.normalize();
-        if !self.compared || self.in_flight.is_some() {
+        if !self.compared {
             return;
+        }
+        let key = self.current_key();
+        if let Some(running) = &self.in_flight {
+            if *running == key {
+                return; // already rendering exactly this
+            }
+            match &self.in_flight_cancel {
+                Some((_, started)) if started.elapsed() >= ABANDON_AFTER => {}
+                Some((_, started)) => {
+                    // Asked again once it is old enough to abandon, unless it
+                    // lands first -- which also repaints.
+                    ctx.request_repaint_after(ABANDON_AFTER.saturating_sub(started.elapsed()));
+                    return;
+                }
+                None => return, // nothing to abandon it with, so wait for it
+            }
         }
         // A render of the preserved snapshot cannot recover a failed reload.
         // It also must not clear that failure's actionable banner.
@@ -1260,7 +1350,6 @@ impl App {
             self.requested = false;
             return;
         }
-        let key = self.current_key();
         if self.cache.get(&self.shown).is_some_and(|c| c.key == key) {
             self.requested = false;
             return; // already rendered for these inputs, flags and width
@@ -1273,9 +1362,9 @@ impl App {
         for i in [reference, shown] {
             if self.panels[i].text.len() > MAX_PANEL_BYTES {
                 self.error = Some(format!(
-                    "Panel {} holds {:.1} MB. delgui stops at {} MB because delta takes \
-                     about a second per megabyte and produces seven times its input in \
-                     styled output.",
+                    "Panel {} holds {:.1} MB. delgui stops at {} MB because delta can take \
+                     seconds per megabyte when much of it differs, and produces seven times \
+                     its input in styled output.",
                     title(i),
                     self.panels[i].text.len() as f64 / 1e6,
                     MAX_PANEL_BYTES / 1_000_000
@@ -1285,6 +1374,16 @@ impl App {
             }
         }
         self.error = None;
+        // Only here, where a render of the current panels takes its place in the
+        // same breath. Abandoned anywhere else, the slot would sit empty with no
+        // render of what the panels hold coming.
+        if let Some((cancel, started)) = self.in_flight_cancel.take() {
+            cancel.cancel();
+            eprintln!(
+                "delgui: abandoned a render after {} ms; its panels changed while it ran",
+                started.elapsed().as_millis(),
+            );
+        }
 
         let (delta, opts) = (self.delta.clone(), self.effective_options());
         let merging = self.merging();
@@ -1295,15 +1394,19 @@ impl App {
             self.panels[reference].to_input(true),
             self.panels[shown].to_input(true),
         );
-        let (tx, ctx, columns) = (self.tx.clone(), ctx.clone(), self.columns);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
         let job_key = key.clone();
+        let cancel = Cancel::default();
+        let abandoned = cancel.clone();
         eprintln!(
-            "delgui: rendering panel {} against {} ({} bytes, {columns} columns)",
+            "delgui: rendering panel {} against {} ({} bytes, {} columns)",
             title(shown),
             title(reference),
             self.pair_bytes(),
+            opts.width,
         );
         self.in_flight = Some(key);
+        self.in_flight_cancel = Some((cancel, Instant::now()));
         self.requested = false;
         std::thread::spawn(move || {
             let started = Instant::now();
@@ -1313,11 +1416,15 @@ impl App {
                 &right,
                 &opts,
                 job_key.clone(),
-                columns,
                 merging,
+                &abandoned,
             ) {
                 Ok(cached) => Job::Done(shown, cached, started.elapsed()),
-                Err(e) => Job::Failed(job_key, e.to_string(), started.elapsed()),
+                // Nothing to report and nobody to tell: `schedule` replaced this
+                // render in `in_flight` before it raised the flag, so neither a
+                // banner nor `failed` may hear of it.
+                Err(DeltaError::Cancelled) => return,
+                Err(e) => Job::Failed(job_key, describe_render_failure(&e), started.elapsed()),
             };
             let _ = tx.send(job);
             ctx.request_repaint();
@@ -1356,11 +1463,34 @@ impl App {
 
     fn poll(&mut self) {
         while let Ok(job) = self.rx.try_recv() {
+            let (key, elapsed) = match &job {
+                Job::Done(_, cached, elapsed) => (&cached.key, *elapsed),
+                Job::Failed(key, _, elapsed) => (key, *elapsed),
+            };
+            if self.in_flight.as_ref() == Some(key) {
+                self.in_flight = None;
+                self.in_flight_cancel = None;
+            }
+            // Overtaken: the panels changed while it ran, and a render of what
+            // they hold now is already running or will start by itself. Kept,
+            // it would be laid out on this thread -- measured at 0.7 s for 4 MB
+            // -- only to be replaced, and that freeze landed on every keystroke
+            // that outran a render. A failure is dropped for the same reason:
+            // it is about inputs nobody is looking at, and the render that
+            // follows will be attributed in its own right if it fails too.
+            //
+            // Over `AUTO_RENDER_BYTES` nothing follows unasked, so there the
+            // result is still the newest diff there will be until ⌘⏎ -- and
+            // dropping it would make that Compare look like it did nothing.
+            if *key != self.current_key() && self.replacement_follows() {
+                eprintln!(
+                    "delgui: discarded a render that took {} ms; its panels changed while it ran",
+                    elapsed.as_millis(),
+                );
+                continue;
+            }
             match job {
                 Job::Done(panel, cached, elapsed) => {
-                    if self.in_flight.as_ref() == Some(&cached.key) {
-                        self.in_flight = None;
-                    }
                     if panel == self.shown {
                         self.restore_offset = self.pending_offset.take();
                     }
@@ -1379,9 +1509,6 @@ impl App {
                     self.cache.insert(panel, cached);
                 }
                 Job::Failed(key, e, elapsed) => {
-                    if self.in_flight.as_ref() == Some(&key) {
-                        self.in_flight = None;
-                    }
                     self.failed = Some(key);
                     eprintln!(
                         "delgui: render failed after {} ms; the previous diff was kept",
@@ -1409,6 +1536,13 @@ impl App {
 
     fn auto_renders(&self) -> bool {
         self.pair_bytes() <= AUTO_RENDER_BYTES
+    }
+
+    /// Whether a render of the panels as they are now is running or will start
+    /// without anyone asking: another is in flight, one has been asked for, or
+    /// the pair is small enough that `tick` starts one once typing settles.
+    fn replacement_follows(&self) -> bool {
+        self.in_flight.is_some() || self.requested || self.auto_renders()
     }
 
     fn pair_bytes(&self) -> usize {
@@ -5545,17 +5679,18 @@ impl App {
                 None => true,
             }
         };
+        let edit_wait = edit_debounce(self.pair_bytes());
         let resized = settled(&mut self.pending_resize, RESIZE_DEBOUNCE);
-        let typed = settled(&mut self.pending_edit, EDIT_DEBOUNCE);
+        let typed = settled(&mut self.pending_edit, edit_wait);
         if !resized {
             ctx.request_repaint_after(RESIZE_DEBOUNCE);
         }
         if !typed {
-            ctx.request_repaint_after(EDIT_DEBOUNCE);
+            ctx.request_repaint_after(edit_wait);
         }
         // Every other change -- a toggle, a tab, a theme -- takes effect on its
         // own. Only the two streams above wait, and only a big pair waits for
-        // the user to ask, since delta costs about a second per megabyte.
+        // the user to ask, since delta can take seconds per megabyte of it.
         if self.requested || should_auto_render(resized, typed, self.pair_bytes()) {
             self.schedule(ctx);
         }
@@ -7406,8 +7541,8 @@ mod tests {
                 &app.panels[1].to_input(true),
                 &app.effective_options(),
                 app.current_key(),
-                app.columns,
                 false,
+                &Cancel::default(),
             ).unwrap();
             assert_eq!(render::is_empty(&cached.lines), a == b);
             if a != b {
@@ -7936,8 +8071,8 @@ mod tests {
                 &Input::Buffer(after.clone().into_bytes()),
                 &app.effective_options(),
                 app.current_key(),
-                app.columns,
                 false,
+                &Cancel::default(),
             )
             .expect("render");
 
@@ -8131,6 +8266,157 @@ mod tests {
         app.compare_now(&ctx);
         assert_eq!(app.in_flight.as_ref(), Some(&key));
         assert!(app.failed.is_none());
+    }
+
+    fn rendered_for(key: RenderKey) -> Cached {
+        Cached {
+            key,
+            lines: ansi::parse(b"-left\n+right\n"),
+            hunks: Vec::new(),
+            problem: None,
+            columns: 120,
+        }
+    }
+
+    /// A render that lands after the panels moved on is about to be replaced,
+    /// so it must not be laid out first -- that freeze, 0.7 s at 4 MB, landed
+    /// on every keystroke that outran a render. Nor may its failure reach the
+    /// banner or `failed`: it is about inputs nobody is looking at, and
+    /// remembering it must not stop the current panels from rendering.
+    #[test]
+    fn a_result_overtaken_by_an_edit_is_dropped_before_it_is_drawn() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.panels[0].text = "left\n".into();
+        app.panels[1].text = "right\n".into();
+        app.compared = true;
+        let overtaken = app.current_key();
+        app.in_flight = Some(overtaken.clone());
+        app.panels[1].text = "right, edited\n".into();
+        app.touch_edit(1);
+        assert!(app.auto_renders(), "a render of the edit follows by itself");
+
+        let shown = app.shown;
+        app.tx.send(Job::Done(shown, rendered_for(overtaken.clone()), Duration::ZERO)).unwrap();
+        app.tx.send(Job::Failed(overtaken, "delta exited with status 2".into(), Duration::ZERO)).unwrap();
+        app.poll();
+
+        assert!(app.in_flight.is_none(), "the slot stayed taken");
+        assert!(app.shown_diff().is_none(), "an overtaken result reached the cache");
+        assert!(app.error.is_none(), "an overtaken failure reached the banner");
+        assert!(app.failed.is_none(), "an overtaken failure was remembered");
+        app.schedule(&ctx);
+        assert_eq!(app.in_flight, Some(app.current_key()), "the edit was not rendered");
+    }
+
+    /// The other half of attribution: a failure of the panels as they are is
+    /// remembered, so the next frame does not spawn the same render again --
+    /// the loop that once ran at ~7,500 subprocesses a second.
+    #[test]
+    fn a_failure_of_the_current_panels_is_still_attributed() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.panels[0].text = "left\n".into();
+        app.panels[1].text = "right\n".into();
+        app.compared = true;
+        let current = app.current_key();
+        app.in_flight = Some(current.clone());
+        app.tx.send(Job::Failed(current.clone(), "delta exited with status 2".into(), Duration::ZERO)).unwrap();
+        app.poll();
+
+        assert_eq!(app.failed.as_ref(), Some(&current));
+        assert!(app.error.is_some());
+        app.schedule(&ctx);
+        assert!(app.in_flight.is_none(), "a failed render was started again unasked");
+    }
+
+    /// Over the auto-render ceiling nothing replaces an overtaken result until
+    /// Compare, so it is the newest diff there will be: dropping it would make
+    /// the Compare that started it look as if it had done nothing. Once a newer
+    /// render has been asked for, it is overtaken after all.
+    #[test]
+    fn an_overtaken_result_is_kept_when_nothing_will_replace_it() {
+        let mut app = test_app();
+        let line = "a line of text to compare\n";
+        app.panels[0].text = line.repeat(AUTO_RENDER_BYTES / (2 * line.len()) + 1);
+        app.panels[1].text = format!("{}tail\n", app.panels[0].text);
+        app.compared = true;
+        assert!(!app.auto_renders());
+        let asked_for = app.current_key();
+        app.in_flight = Some(asked_for.clone());
+        app.panels[1].text.push_str("typed\n");
+        app.touch_edit(1);
+        let shown = app.shown;
+        app.tx.send(Job::Done(shown, rendered_for(asked_for.clone()), Duration::ZERO)).unwrap();
+        app.poll();
+        assert_eq!(app.shown_diff().map(|c| &c.key), Some(&asked_for));
+        assert!(!app.is_fresh(), "and it is still marked out of date");
+
+        let typed = app.current_key();
+        app.panels[1].text.push_str("more\n");
+        app.touch_edit(1);
+        app.requested = true;
+        app.tx.send(Job::Done(shown, rendered_for(typed), Duration::ZERO)).unwrap();
+        app.poll();
+        assert_eq!(app.shown_diff().map(|c| &c.key), Some(&asked_for), "kept a result Compare will replace");
+    }
+
+    /// The render running when the panels change is of no further use, so
+    /// waiting it out only delays the one that is wanted -- by seconds, on a
+    /// dense pair. Once it has run `ABANDON_AFTER` the next render to be due
+    /// cancels it and takes the slot; before that it is left alone, which is
+    /// what stops a held key restarting delta at key-repeat rate.
+    #[test]
+    fn a_render_overtaken_by_an_edit_is_abandoned_for_the_current_one() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.panels[0].text = "left\n".into();
+        app.panels[1].text = "right\n".into();
+        app.compared = true;
+        let running = Cancel::default();
+        app.in_flight = Some(app.current_key());
+        app.in_flight_cancel = Some((running.clone(), Instant::now()));
+        app.panels[1].text = "right, edited\n".into();
+        app.touch_panel(1);
+        let wanted = app.current_key();
+
+        app.schedule(&ctx);
+        assert!(!running.is_cancelled(), "abandoned before it had run ABANDON_AFTER");
+        assert_ne!(app.in_flight.as_ref(), Some(&wanted));
+
+        app.in_flight_cancel = Some((running.clone(), Instant::now() - ABANDON_AFTER));
+        app.schedule(&ctx);
+        assert!(running.is_cancelled(), "the overtaken render was left running");
+        assert_eq!(app.in_flight.as_ref(), Some(&wanted));
+        let (replacement, _) = app.in_flight_cancel.clone().expect("the new render can be abandoned too");
+        assert!(!replacement.is_cancelled());
+
+        // Already rendering exactly this: nothing is abandoned or restarted.
+        app.schedule(&ctx);
+        assert!(!replacement.is_cancelled());
+        assert_eq!(app.in_flight.as_ref(), Some(&wanted));
+    }
+
+    #[test]
+    fn small_pairs_wait_less_after_typing() {
+        assert_eq!(edit_debounce(0), SMALL_PAIR_EDIT_DEBOUNCE);
+        assert_eq!(edit_debounce(SMALL_PAIR_BYTES - 1), SMALL_PAIR_EDIT_DEBOUNCE);
+        assert_eq!(edit_debounce(SMALL_PAIR_BYTES), EDIT_DEBOUNCE);
+        assert!(SMALL_PAIR_EDIT_DEBOUNCE < EDIT_DEBOUNCE);
+        const { assert!(SMALL_PAIR_BYTES < AUTO_RENDER_BYTES) };
+    }
+
+    /// A timeout is the one failure with a remedy inside the app, so the banner
+    /// names it; every other failure reads exactly as delta or git put it.
+    #[test]
+    fn a_timeout_says_what_to_try_instead() {
+        let timeout = DeltaError::TimedOut { program: "delta", after: Duration::from_secs(71) };
+        let message = describe_render_failure(&timeout);
+        assert!(message.starts_with("delta did not finish within 71 seconds"), "{message}");
+        assert!(message.contains(Context::Tight.label()), "{message}");
+        assert!(message.contains("smaller inputs"), "{message}");
+        let refused = DeltaError::Refused { code: Some(2), message: "unexpected argument".into() };
+        assert_eq!(describe_render_failure(&refused), refused.to_string());
     }
 
     /// A panel with hunks in the cache, as if a merge-mode render had landed.
@@ -8675,8 +8961,8 @@ mod tests {
             &right,
             &opts,
             app.current_key(),
-            app.columns,
             true,
+            &Cancel::default(),
         )
         .expect("merge-mode render");
         assert_eq!(
