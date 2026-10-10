@@ -20,7 +20,7 @@
 //! collections and variable fonts both load -- which is what makes the system
 //! font usable at all on macOS, where nearly everything ships as a collection.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::epaint::text::VariationCoords;
@@ -80,7 +80,7 @@ const SYSTEM_UI_FONT: &str = "/System/Library/Fonts/SFNS.ttf";
 /// worse than one that never does.
 pub fn default_ui_face() -> Option<Face> {
     #[cfg(target_os = "macos")]
-    if Path::new(SYSTEM_UI_FONT).is_file() {
+    if std::path::Path::new(SYSTEM_UI_FONT).is_file() {
         return Some(Face {
             family: "System Font".into(),
             path: SYSTEM_UI_FONT.into(),
