@@ -93,6 +93,9 @@ const SAVE_CHORD: (&str, &str) = ("⌘S", "Ctrl+S");
 const TAKE_CHORD: (&str, &str) = ("⌘⇧Enter", "Ctrl+Shift+Enter");
 const SWAP_CHORD: (&str, &str) = ("⌘⇧R", "Ctrl+Shift+R");
 const PASTE_PANEL_CHORD: (&str, &str) = ("⌘⇧V", "Ctrl+Shift+V");
+const SIDE_BY_SIDE_CHORD: (&str, &str) = ("⌘⌥S", "Ctrl+Alt+S");
+const LINE_NUMBERS_CHORD: (&str, &str) = ("⌘L", "Ctrl+L");
+const WRAP_CHORD: (&str, &str) = ("⌘⇧L", "Ctrl+Shift+L");
 
 pub fn compare_label() -> &'static str {
     chord(COMPARE_CHORD.0, COMPARE_CHORD.1)
@@ -128,6 +131,31 @@ pub fn swap_label() -> &'static str {
 
 pub fn settings_hint() -> &'static str {
     chord("Settings  ⌘,", "Settings  Ctrl+,")
+}
+
+/// The toolbar's view toggles say what they do and the chord that flips them,
+/// in the help button's "what  chord" shape. Built from the same pairs as the
+/// bindings below rather than spelled out again, for the reason `swap_label`
+/// gives; `view_hints_name_the_chord_that_toggles_them` holds them together.
+pub fn side_by_side_hint() -> String {
+    format!(
+        "Old and new in two columns, not one  {}",
+        chord(SIDE_BY_SIDE_CHORD.0, SIDE_BY_SIDE_CHORD.1)
+    )
+}
+
+pub fn line_numbers_hint() -> String {
+    format!(
+        "Line numbers beside each line  {}",
+        chord(LINE_NUMBERS_CHORD.0, LINE_NUMBERS_CHORD.1)
+    )
+}
+
+pub fn wrap_hint() -> String {
+    format!(
+        "Wrap long lines instead of cutting them off  {}",
+        chord(WRAP_CHORD.0, WRAP_CHORD.1)
+    )
 }
 
 pub fn bindings() -> Vec<Binding> {
@@ -269,8 +297,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_SHIFT,
         },
         Binding {
-            mac: "⌘⌥S",
-            other: "Ctrl+Alt+S",
+            mac: SIDE_BY_SIDE_CHORD.0,
+            other: SIDE_BY_SIDE_CHORD.1,
             describe: "side by side",
             group: "view",
             action: Action::ToggleSideBySide,
@@ -278,8 +306,8 @@ pub fn bindings() -> Vec<Binding> {
             mods: CMD_ALT,
         },
         Binding {
-            mac: "⌘L",
-            other: "Ctrl+L",
+            mac: LINE_NUMBERS_CHORD.0,
+            other: LINE_NUMBERS_CHORD.1,
             describe: "line numbers",
             group: "view",
             action: Action::ToggleLineNumbers,
@@ -290,8 +318,8 @@ pub fn bindings() -> Vec<Binding> {
             // On macOS, winit discards Option's character transformation
             // under Command, so QWERTZ's Option+Shift+7 becomes Slash instead
             // of Backslash. Give Wrap a primary chord independent of that path.
-            mac: "⌘⇧L",
-            other: "Ctrl+Shift+L",
+            mac: WRAP_CHORD.0,
+            other: WRAP_CHORD.1,
             describe: "wrap long lines",
             group: "view",
             action: Action::ToggleWrap,
@@ -719,6 +747,24 @@ mod tests {
         assert_eq!(compare.other, "Ctrl+Enter");
         assert!(!compare.mac.contains('⏎'));
         assert_eq!(compare_label(), compare.label());
+    }
+
+    /// A tooltip that names a chord the keymap does not bind teaches a key that
+    /// does nothing. Each hint ends in the chord its toggle's binding answers to.
+    #[test]
+    fn view_hints_name_the_chord_that_toggles_them() {
+        let all = bindings();
+        for (hint, action) in [
+            (side_by_side_hint(), Action::ToggleSideBySide),
+            (line_numbers_hint(), Action::ToggleLineNumbers),
+            (wrap_hint(), Action::ToggleWrap),
+        ] {
+            assert!(
+                all.iter()
+                    .any(|b| b.action == action && hint.ends_with(&format!("  {}", b.label()))),
+                "{hint:?} does not end in a chord bound to {action:?}"
+            );
+        }
     }
 
     #[test]
