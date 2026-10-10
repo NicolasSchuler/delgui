@@ -14,291 +14,212 @@ gitconfig section.
 
 The gap it fills: delta assumes both sides already exist as paths. When they live in a
 clipboard, a browser, or a log viewer, the workarounds are temp files, process substitution,
-or a web diff tool you cannot paste confidential text into. Comparison inputs reach delta over
-pipes, without temporary files. Only an explicit **Save** writes result contents to disk;
-preferences and window geometry are persisted separately.
+or a web diff tool you cannot paste confidential text into. delgui hands panel contents to delta
+over pipes, without temporary files, and writes a file only when you **Save** a result.
 
 ![delgui comparing two Rust files side by side](docs/images/delgui.png)
 
 ## Contents
 
-- [Requirements](#requirements)
-- [Install](#install)
-- [Quickstart](#quickstart)
-- [Panels](#panels)
-- [Building a result](#building-a-result)
-- [Git integration](#git-integration)
-- [Reading the diff](#reading-the-diff)
-- [Keys](#keys)
-- [Configuration](#configuration)
-- [Development](#development)
-- [Contributing](#contributing)
-- [License](#license)
+[Requirements](#requirements) · [Install](#install) · [Quickstart](#quickstart) ·
+[Comparing](#comparing) · [Merge two versions into one](#merge-two-versions-into-one) ·
+[Use with git](#use-with-git) · [Reading the diff](#reading-the-diff) · [Keys](#keys) ·
+[Configuration](#configuration) · [Troubleshooting](#troubleshooting) ·
+[Contributing](#contributing)
 
 ## Requirements
 
 | | |
 | --- | --- |
 | `delta` | 0.18 or newer, on `PATH` — `brew install git-delta` or `cargo install git-delta` |
-| `git` | delgui owns a hardened `git diff --no-index` step, then pipes the patch into delta |
+| `git` | any version, on `PATH` — delgui runs `git diff --no-index` and pipes the patch into delta |
 | platform | macOS and Linux. Windows is not supported: panel contents reach delta as `/dev/fd/N` pipes. |
-
-delta is a hard dependency, not a fallback. If it is missing, delgui says so and exits; it
-does not substitute a renderer of its own. Everything is developed and measured on macOS.
 
 ## Install
 
-The repository is private, so there is no public install channel yet: a Homebrew
-formula and a `curl … | sh` installer both fetch release assets anonymously,
-which a private repo refuses. Both are one config change away the moment it goes
-public — see [RELEASING.md](RELEASING.md).
-
-**From a release** — tagged releases attach prebuilt binaries for macOS (Apple
-Silicon and Intel) and Linux x86-64. With the [`gh` CLI](https://cli.github.com),
-authenticated as someone with access:
-
-```sh
-gh release download --repo NicolasSchuler/delgui --pattern '*aarch64-apple-darwin*'
-tar xf delgui-aarch64-apple-darwin.tar.xz
-install -m755 delgui-aarch64-apple-darwin/delgui ~/.local/bin/delgui
-```
-
-**From source** — needs Rust 1.87 or newer:
+**From source** — needs Rust 1.87 or newer, plus delta (`brew install git-delta`, or see
+[delta's instructions](https://github.com/dandavison/delta#installation)):
 
 ```sh
 git clone git@github.com:NicolasSchuler/delgui.git
 cd delgui
-cargo build --release
-./target/release/delgui
+cargo install --path crates/delgui    # puts delgui in ~/.cargo/bin
 ```
 
-Or straight into `~/.cargo/bin`:
+`cargo build --release` instead leaves the binary at `target/release/delgui`. On Linux the build
+also needs GTK 3, xkbcommon and Wayland headers — on Debian or Ubuntu,
+`sudo apt-get install libgtk-3-dev libxkbcommon-dev libwayland-dev`.
+
+**From the v0.2.0 release** — prebuilt binaries for macOS (Apple Silicon and Intel) and Linux
+x86-64. The repository is private, so downloading needs the [`gh` CLI](https://cli.github.com)
+signed in as someone with access; there is no Homebrew formula or install script yet
+([RELEASING.md](RELEASING.md) says why).
 
 ```sh
-cargo install --git ssh://git@github.com/NicolasSchuler/delgui delgui
+gh release download v0.2.0 --repo NicolasSchuler/delgui --pattern '*aarch64-apple-darwin*'
+tar xf delgui-aarch64-apple-darwin.tar.xz
+install -m755 delgui-aarch64-apple-darwin/delgui ~/.local/bin/delgui
 ```
 
-Either way delta is yours to install — `brew install git-delta`, or see
-[delta's own instructions](https://github.com/dandavison/delta#installation).
-
-Binaries are not signed or notarised, so macOS Gatekeeper will want a
-right-click → **Open** the first time. There is no `.app` bundle: a
-Finder-launched GUI inherits launchd's `PATH`, which has no `/opt/homebrew/bin`
-in it, so it would report delta missing for most Homebrew users. That is a code
-change rather than a packaging one.
+Use `x86_64-apple-darwin` on an Intel Mac and `x86_64-unknown-linux-gnu` on Linux. The binaries
+are not signed or notarised, and delta is not included.
 
 ## Quickstart
 
 ```sh
 delgui                      # two empty panels, ready to paste into
-delgui a.rs b.rs            # prefilled; small pairs compare immediately
+delgui a.rs b.rs            # compare two files
 delgui --paste file.rs      # clipboard into panel A, file into panel B
-delgui --watch a.rs b.rs    # follow both files as they change on disk
+delgui --watch a.rs b.rs    # re-compare whenever either file is saved
 delgui --combine a.rs b.rs  # start a result you can take differences into
-delgui --hotkey             # register a system-wide paste hotkey
+delgui --hotkey             # also register a system-wide paste hotkey
+delgui --help               # every flag, and the git recipe
 ```
 
-Try it on the bundled fixtures:
+On macOS, start delgui from a terminal ([Troubleshooting](#troubleshooting) says why). Files can
+also be dragged onto panels. A pair compares as soon as it is loaded, up to 1 MB of combined input;
+larger pairs wait for **Compare** (<kbd>⌘Enter</kbd>). In a checkout,
+`delgui examples/config_before.rs examples/config_after.rs` is a small pair to try.
 
-```sh
-cargo run --release -- examples/config_before.rs examples/config_after.rs
-```
+## Comparing
 
-Files can also be dragged onto any panel — drop several at once and they fill consecutive
-panels, each outlined while you hover.
-Explicit file pairs compare immediately even when one or both files are empty, up to
-1 MB of combined input. Larger pairs wait for **Compare** or <kbd>⌘Enter</kbd>.
+Two panels to start; <kbd>⌘N</kbd> adds more, up to six. delta compares two things at a time, so
+one panel is the **baseline** — click a panel's letter to choose it — and every other panel is
+diffed against it, one tab per pair. The strip under the panels names the pair on screen, and
+**Swap** (<kbd>⌘⇧R</kbd>) reads the same pair the other way round: what was removed is now added.
 
-## Panels
+A panel is a buffer that may be backed by a file. Type into it and it is marked *edited*, and
+your buffer is what gets compared; its ⋯ menu can reload the file or discard your edits.
+**Follow changes on disk**, in the same menu, re-compares whenever the file is saved, and leaves
+an edited panel alone rather than overwrite your typing.
 
-Two panels to start; <kbd>⌘N</kbd> adds more, up to six. delta is a two-way tool, so one panel
-is the **baseline** — click its letter — and the rest are diffed against it, one tab per pair.
-There is no N-way diff and there is not meant to be. The strip under the panels always names
-the pair on screen, so the direction of the diff is never something you have to infer from
-which side is red — and **Swap** (<kbd>⌘</kbd><kbd>⇧</kbd><kbd>R</kbd>) reads the same pair the
-other way round, which is the difference between "what did this patch add" and "what would
-undoing it remove".
+Each panel shows the syntax delta will use as a small chip: the file's extension, what pasted
+content looks like, or `prose`, which is left unhighlighted. Click the chip to choose another.
 
-A panel is **a buffer that may be backed by a file**. Untouched, it goes to delta as a path, so
-delta infers the syntax itself. Type into it and it says *edited*, and from then on the buffer
-is what gets compared; the file is still there to reload from or discard your edits back to.
-Its ⋯ menu offers **follow changes on disk**, which keeps up with atomic-rename saves — how
-most editors write — and which stands aside while you have unsaved edits rather than
-overwriting them.
+## Merge two versions into one
 
-Each panel shows the syntax delta will use for it as a small chip: the file's extension, what
-the content was sniffed as, or `prose`. Click it to say otherwise. Prose is detected as prose
-and left unhighlighted, which is what you want when diffing paragraphs rather than code — the
-detector is deliberately biased towards answering "don't know", because prose sprayed with
-syntax colour is worse than prose left plain.
+1. Load the versions into panels — `delgui ours.rs theirs.rs`, or paste or drop them.
+2. Click **Combine…** under the panels and pick what the result starts from: a panel, or
+   **Start empty**. `delgui --combine` does this for you, starting from the first panel.
+3. A **result** panel appears along the bottom and becomes the baseline, so the diff now reads
+   *result against candidate*. While building, every separate change is its own difference.
+4. Each difference has a control row. **Use B's version** writes the candidate's lines into the
+   result; <kbd>⌘⇧Enter</kbd> takes the current difference and <kbd>⌘⌥↓</kbd>/<kbd>⌘⌥↑</kbd> move
+   between them. Switch candidate with the tabs, and type into the result for anything no panel
+   supplies. <kbd>⌘Z</kbd> undoes a take when no text field has focus.
+5. **Save** with <kbd>⌘S</kbd> (the first save asks where), **Save as…** with <kbd>⌘⇧S</kbd>, or
+   **Copy** it.
 
-## Building a result
+**Stop building** puts the take controls away and keeps the text. The result's ⋯ menu moves it
+to the left or right edge, to see all of it at once on a wide screen.
 
-Two variants of a file, and you want some of this one and some of that one. **Combine…**, under
-the diff, makes a **result** panel — seeded from any panel or from nothing — and gives it a
-whole edge of the window.
-
-The result is the baseline while you build it, so every diff on screen reads *my result against
-a candidate*, and each difference carries one button that writes the candidate's version into
-it. Switch candidate with the tabs, take from as many as you like, and type into the result for
-anything no panel supplies. Then **Copy**, or **Save** it to a new file.
-Open and drop target input panels; the result remains protected even when you select it
-for an ordinary comparison after **Stop building**.
-
-The result sits along the bottom by default, which costs the diff no width — delta lays out
-against a column count, and side by side is the widest thing in the window. Its ⋯ menu moves it
-to the **left** or **right** instead, the better trade on a wide screen: at 1600 px the diff
-goes from 157 columns to 146, and the whole result is visible at once.
-
-While you are building, the diff is computed with **no context lines**, so each independent
-change is its own difference. It has to be: at git's default of three,
-`examples/config_before.rs` and `config_after.rs` — thirteen lines with four separate changes —
-come back as a *single* hunk, which is one button for the whole file.
-
-Take the current difference with <kbd>⌘</kbd><kbd>⇧</kbd><kbd>Enter</kbd> or its button. Takes are
-undoable (<kbd>⌘Z</kbd> outside a text field), and a take that no longer fits the result is refused
-rather than guessed at.
-
-## Git integration
+## Use with git
 
 ```sh
 git config --global diff.tool delgui
 git config --global difftool.delgui.cmd 'delgui "$LOCAL" "$REMOTE"'
+git config --global difftool.prompt false
 git config --global merge.tool delgui
 git config --global mergetool.delgui.cmd \
     'delgui --mergetool "$BASE" "$LOCAL" "$REMOTE" "$MERGED"'
 git config --global mergetool.delgui.trustExitCode true
 ```
 
-`git difftool` opens the two sides as panels. `git mergetool` opens BASE, LOCAL and REMOTE as
-panels and seeds the result from the ancestor, which is what turns each side into differences
-you can take — seeding from git's own half-merged file would mean diffing against its conflict
-markers. <kbd>⌘S</kbd> writes MERGED and answers git: exit 0 stages the file, exit 1 leaves it
-conflicted. The four paths are bound **by position**, because an empty ancestor is an ordinary
-both-sides-added conflict and must not be filled in by "the first empty panel".
+**As a diff tool**, `git difftool` opens one window per changed file, old version against new,
+and moves on to the next file when you close it. `difftool.prompt false` above stops git asking
+before each file; `git difftool -y` does the same for one run.
+
+**As a merge tool**, `git mergetool` opens one window per conflicted file:
+
+1. The common ancestor (BASE), your side (LOCAL) and theirs (REMOTE) become panels A, B and C.
+2. The result starts as the ancestor, so each side's changes arrive as differences to take —
+   not as git's conflict markers.
+3. Take from B and C as in [the walkthrough above](#merge-two-versions-into-one). Where both
+   sides changed the same lines, take one and edit the result by hand.
+4. <kbd>⌘S</kbd> writes the merge to git's file. Saving a result you have not changed asks first.
+   **Export copy…** writes somewhere else and does not resolve the conflict.
+5. Close the window. With `trustExitCode`, delgui exits 0 if git's file holds your merge, and git
+   stages it; if you closed without saving, or edited again after saving, it exits 1 and git
+   leaves the file conflicted. The [reference](docs/reference.md#as-gits-diff-and-merge-tool)
+   has the details.
 
 ## Reading the diff
 
-- **Navigate differences** with <kbd>⌘⌥↓</kbd> / <kbd>⌘⌥↑</kbd>, or the Previous/Next change
-  buttons, with an *n of m* counter. This works in every comparison, not only while merging.
-- **Find** with <kbd>⌘F</kbd>: a literal, case-sensitive substring scan over the rendered text,
-  walked with <kbd>⌘G</kbd> / <kbd>⌘⇧G</kbd>. Being able to search the diff at all is half of
-  why this parses delta's ANSI rather than embedding a terminal.
-- **Choose how finely a changed line is coloured** in Settings → delta. By default only the
-  characters that actually differ are picked out, because a `<` that became a `<=` is the change
-  most easily missed; *Words* is delta's own default, and *Whole lines* is the way `diff` has
-  always looked.
-- **Filter what counts as a difference** in Settings: how much context to show (changes only,
-  three lines, or the whole file), whether to ignore whitespace, blank lines, Windows line
-  endings, or lines matching a pattern. What is being ignored is always printed beside the
-  difference count — an ignore that silently suppresses a difference is the one way this can do
-  harm. Ignores are forced off while a result is being built, because a take copies a
-  difference's lines exactly.
+- **Differences**: <kbd>⌘⌥↓</kbd> / <kbd>⌘⌥↑</kbd> or the Previous/Next buttons walk them, with an
+  *n of m* counter, in every comparison.
+- **Find**: <kbd>⌘F</kbd> searches the rendered diff for literal, case-sensitive text;
+  <kbd>⌘G</kbd> / <kbd>⌘⇧G</kbd> walk the matches.
+- **Highlight**, in Settings → delta: how much of a changed line is picked out — single
+  characters (the default, so a `<` that became `<=` is not missed), whole words (delta's own
+  default), or nothing within the line.
+- **What counts as a difference**, in Settings → differences: how much context to show (changes
+  only, three lines, or the whole file), and whether to ignore whitespace, blank lines, Windows
+  line endings, or lines matching a pattern. Whatever is ignored is printed beside the difference
+  count, and ignores are off while building a result, where a take copies lines exactly.
 
 ## Keys
 
 | | |
 | --- | --- |
-| <kbd>⌘O</kbd> | open a file in the shown input panel |
-| <kbd>⌘W</kbd> | close the window, with an unsaved-content guard |
-| <kbd>⌘Enter</kbd> | re-render now (re-reads files from disk first) |
-| <kbd>⌘F</kbd> · <kbd>⌘G</kbd> · <kbd>⌘⇧G</kbd> | find in the diff · next match · previous match |
-| <kbd>⌘⌥↓</kbd> · <kbd>⌘⌥↑</kbd> | next difference · previous difference |
-| <kbd>⌘N</kbd> · <kbd>⌘⇧W</kbd> | add a panel · remove the shown panel |
-| <kbd>⌘⇧V</kbd> | paste into a fresh panel |
-| <kbd>⌘R</kbd> · <kbd>⌘⇧R</kbd> | make the shown panel the baseline · swap the two sides |
-| <kbd>⌘1</kbd>…<kbd>⌘6</kbd> | show that panel's diff |
-| <kbd>⌘S</kbd> · <kbd>⌘⇧S</kbd> | save the result · save it as a new file |
-| <kbd>⌘⇧Enter</kbd> | take the current difference into the result |
-| <kbd>⌘Z</kbd> · <kbd>⌘⇧Z</kbd> | undo · redo the last take (only outside a text field) |
-| <kbd>⌘⌥S</kbd> · <kbd>⌘L</kbd> · <kbd>⌘⇧L</kbd> | side by side · line numbers · wrap |
-| <kbd>⌘,</kbd> · <kbd>⌘/</kbd> | settings · show this list |
+| <kbd>⌘Enter</kbd> | Compare: re-read files from disk and render now |
+| <kbd>⌘⇧R</kbd> | swap the two sides |
+| <kbd>⌘⌥↓</kbd> · <kbd>⌘⌥↑</kbd> | next · previous difference |
+| <kbd>⌘F</kbd> · <kbd>⌘G</kbd> · <kbd>⌘⇧G</kbd> | find · next match · previous match |
+| <kbd>⌘⇧Enter</kbd> · <kbd>⌘S</kbd> | take the current difference · save the result |
+| <kbd>⌘,</kbd> | settings |
+| <kbd>⌘/</kbd> | every shortcut |
+| <kbd>⌘Q</kbd> | quit, asking first if anything is unsaved |
 
-Off macOS these are the same chords with <kbd>Ctrl</kbd>. Everything else lives in each panel's
-⋯ menu — open, reload, discard edits, follow the file, clear, remove. Every operation that could
-replace unsaved panel text asks first. The full table, both platforms, is in
-[`docs/reference.md`](docs/reference.md#keyboard).
+Off macOS, use <kbd>Ctrl</kbd> for <kbd>⌘</kbd> and <kbd>Alt</kbd> for <kbd>⌥</kbd>. The full
+list, for both platforms, is in [`docs/reference.md`](docs/reference.md#keyboard).
 
-`--hotkey` registers <kbd>⌘⇧D</kbd> system-wide, which focuses the window and pastes the
-clipboard into a fresh panel. It works only while delgui is running — an application cannot
-arrange to be *launched* by a hotkey; that is a job for launchd, Raycast, or a keyboard tool.
+| mouse | |
+| --- | --- |
+| drop files on a panel | load them; several at once fill consecutive panels |
+| click a panel's letter (A, B, …) | make that panel the baseline |
+| ⋯ on a panel | open, reload, follow on disk, clear, remove |
+
+`--hotkey` registers <kbd>⌘⇧D</kbd> (<kbd>Super</kbd><kbd>⇧</kbd><kbd>D</kbd> on Linux)
+system-wide, while delgui runs: it brings the window forward and pastes into a fresh panel.
 
 ## Configuration
 
-Every option, default and flag mapping is documented in
-**[`docs/reference.md`](docs/reference.md)**, which is generated from the source. In short:
+Settings (<kbd>⌘,</kbd>) cover the theme and fonts, delta's syntax theme and highlighting, the
+difference filters above, and which `[delta "name"]` feature presets are on. The theme follows
+your system and is passed to delta as `--light`/`--dark`, so the diff matches the window.
+Turning off *Use my `[delta]` gitconfig* passes `--no-gitconfig`, the only way to get output
+independent of your gitconfig — delta ignores `GIT_CONFIG_GLOBAL`. Preferences are remembered;
+panel contents never are. Every option, default and flag mapping is in
+**[`docs/reference.md`](docs/reference.md)**, generated from the source.
 
-**Appearance** follows your system light/dark setting by default, and either way the whole
-window agrees with the diff inside it: the theme sets delta's own `--light`/`--dark`, so its red
-and green backgrounds are the ones meant for that mode. You can pick the interface and diff
-fonts from what is installed — delgui measures the one you choose and says so if it is not
-really monospaced, since delta lays its output out in columns.
+## Troubleshooting
 
-**delta** offers *Highlight*, which is how much of a changed line is picked out inside it —
-characters, words, or nothing at all. It shows what your gitconfig already tells delta, which
-`[delta "name"]` presets exist and lets you switch them on, and offers delta's syntax themes, labelled light or dark with one
-click to match the window to them. Turning off *use my `[delta]` gitconfig* passes
-`--no-gitconfig`, which is the only way to get output independent of your gitconfig and working
-directory — `GIT_CONFIG_GLOBAL` does not work, delta ignores it.
+**"`delta` was not found on PATH"** — install it (`brew install git-delta`). If it is installed,
+check how delgui was started: it finds delta (and `git`) only through `PATH`. Launched from
+Finder, the Dock or another macOS launcher, it gets launchd's `PATH`, which has no
+`/opt/homebrew/bin`, so a Homebrew delta looks missing — which is also why there is no `.app`
+bundle yet. Start delgui from a terminal, or from a wrapper that puts Homebrew's `bin` on `PATH`.
 
-**Render pipeline** shows the owned `git diff … | delta …` shape and every flag that affects the
-result. The `/dev/fd/N` operands name private in-memory panel snapshots, so the display is
-explanatory rather than a directly runnable shell command.
+**"found delta …, but delgui needs at least 0.18"** — upgrade delta. Debian and Ubuntu packages
+lag well behind; use `cargo install git-delta` or
+[delta's releases](https://github.com/dandavison/delta/releases) instead.
 
-Preferences and window geometry are remembered; panel contents never are.
+**Pasted text is not highlighted** — delta picks a syntax from the right-hand file's name, and
+pasted text has none, so delgui guesses from the content and answers `prose` when unsure. Click
+the chip under the panel to set the language (passed as `--default-language`), or load the text
+from a file with the right extension.
 
-## Development
+**A large pair does not render** — above 1 MB of combined input, delgui waits for **Compare**
+(<kbd>⌘Enter</kbd>) rather than re-rendering on every keystroke. A panel over 4 MB is refused.
 
-| path | role |
-| --- | --- |
-| `crates/delgui-core` | delta invocation + ANSI→span parsing, no GUI deps |
-| `crates/delgui` | egui frontend: state, theme, fonts, keymap, hotkey |
-| `docs/reference.md` | generated configuration and feature reference |
-| `dist-workspace.toml` | what a tagged release builds and publishes |
-| `docs/research.md` | the measurements the design rests on |
-
-`delgui-core` is deliberately frontend-agnostic so a ratatui frontend stays a real option
-rather than an aspiration.
-
-```sh
-cargo build --release
-cargo test                                           # whole workspace
-cargo clippy --workspace --all-targets
-DELGUI_BLESS=1 cargo test -p delgui docs::   # regenerate docs/reference.md
-```
-
-The suite runs against **your installed delta**, not a fixture, and asserts among other things
-that the parser understands every escape sequence delta emits. A delta upgrade that changes its
-output is *meant* to fail a test rather than mis-render silently. Some watch tests sleep on real
-filesystem events, so the suite is not instant.
-
-[`docs/research.md`](docs/research.md) records the measurements the design rests on — including
-a gotcha that affects the plain shell workflow too: **delta infers syntax from the right-hand
-path only**, so `delta file.rs <(pbpaste)` silently loses highlighting where
-`delta <(pbpaste) file.rs` keeps it.
+**The render timed out** — larger input gets more time, but a big pair shown in full can still
+run out. Set Settings → differences → Show to *Changes only*, or compare smaller pieces.
 
 ## Contributing
 
-Issues and pull requests are welcome. CI builds and tests on macOS and Linux
-against a real delta, and runs weekly so that a delta release which changes its
-output shows up as a failing test rather than as a mis-render. Releases are cut
-by pushing a tag; see [RELEASING.md](RELEASING.md).
-
-Three house rules:
-
-- **Do not run `cargo fmt`.** The code is hand-formatted in a deliberately compact style with no
-  `rustfmt.toml`; a blanket reformat would reflow files unrelated to your change. Match the
-  surrounding layout by hand.
-- **Do not edit `docs/reference.md`.** It is generated — change `crates/delgui/src/docs.rs`
-  and re-bless it. A test fails otherwise.
-
-Comments explain *why*, especially where a line encodes a measured finding about delta or the
-platform. Commit messages follow the same rule: a short imperative subject, then prose
-explaining the reasoning and what a test now pins down.
+Building, testing and the house rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-delta itself is a separate project under its own licence, and is not redistributed here —
-delgui runs whichever copy is on your `PATH`.
+MIT. See [LICENSE](LICENSE). delta is a separate project under its own licence and is not
+redistributed here — delgui runs whichever copy is on your `PATH`.

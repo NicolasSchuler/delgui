@@ -30,7 +30,7 @@ If either is missing, delgui prints to stderr, shows a dialog, and exits 1.
 | a child outran the timeout | The process group is killed and the failure is reported. |
 | a child outran the output cap | Reported rather than buffered. |
 
-The `Io` case — the child could not be spawned or read — is reported the same way.
+If delta or Git cannot be started at all, or its output cannot be read, that is reported the same way: fatally at startup, in the banner during a render.
 
 ## Command line
 
@@ -233,7 +233,6 @@ Set for that render only, never written to the saved settings.
 | --- | --- |
 | macOS | `~/Library/Application Support/delgui/app.ron` |
 | Linux | `~/.local/share/delgui/app.ron` |
-| Windows | `%APPDATA%\delgui\data\app.ron` |
 
 RON, written on exit and on a 30-second timer. Unknown and missing fields are tolerated, so an older file keeps working.
 

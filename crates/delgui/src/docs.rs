@@ -351,8 +351,11 @@ pub fn reference() -> String {
         let (what, then) = describe_error(&e);
         let _ = writeln!(d, "| {what} | {then} |");
     }
+    // `DeltaError::Io` stays out of the table: it is a variant name, not
+    // something a user sees, so the reference says what it means instead.
     d.push_str(
-        "\nThe `Io` case — the child could not be spawned or read — is reported the same way.\n\n",
+        "\nIf delta or Git cannot be started at all, or its output cannot be read, that is \
+         reported the same way: fatally at startup, in the banner during a render.\n\n",
     );
 
     // ---- Command line -----------------------------------------------------
@@ -676,8 +679,9 @@ pub fn reference() -> String {
     d.push_str("## What survives a restart\n\n");
     d.push_str("| platform | file |\n| --- | --- |\n");
     d.push_str("| macOS | `~/Library/Application Support/delgui/app.ron` |\n");
-    d.push_str("| Linux | `~/.local/share/delgui/app.ron` |\n");
-    d.push_str("| Windows | `%APPDATA%\\delgui\\data\\app.ron` |\n\n");
+    // No Windows row: the app does not build there (`/dev/fd/N`, process
+    // groups), and a settings path would advertise a platform it does not support.
+    d.push_str("| Linux | `~/.local/share/delgui/app.ron` |\n\n");
     d.push_str("RON, written on exit and on a 30-second timer. Unknown and missing fields are tolerated, so an older file keeps working.\n\n");
     d.push_str("Saved:\n\n");
     for field in [
