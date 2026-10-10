@@ -5,7 +5,9 @@
 //! delta upgrades changing something underneath us.
 
 use delgui_core::ansi::{self, Color};
-use delgui_core::delta::{Appearance, Delta, DeltaError, Granularity, Input, Options, Whitespace};
+use delgui_core::delta::{
+    Appearance, Cancel, Delta, DeltaError, Granularity, Input, Options, Whitespace,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -735,6 +737,79 @@ fn concurrent_renders_do_not_race_over_dev_fd_numbers() {
             h.join().expect("worker");
         }
     });
+}
+
+/// A render whose panels have changed is abandoned rather than waited out: the
+/// GUI raises the `Cancel` and starts the render it actually wants. Against the
+/// real pipeline, a dense pair that takes delta most of a second has to come
+/// back `Cancelled` within a poll or two of being asked, whichever of its two
+/// steps was running, and leave no descriptor behind -- the pumps feeding
+/// `git diff` included, which are mid-write when that child is killed.
+#[test]
+fn a_cancelled_render_stops_promptly_and_leaks_nothing() {
+    use std::time::{Duration, Instant};
+    let d = delta();
+    let opts = Options {
+        inherit_gitconfig: false,
+        side_by_side: true,
+        ..Options::default()
+    };
+    // Two thirds of half a megabyte of lines changed: most of a second of
+    // delta on an Apple M4, against the 100 ms before it is cancelled.
+    let left: String = (0..12_000)
+        .map(|i| format!("    let value_{i} = render({i}, \"panel\");\n"))
+        .collect();
+    let right: String = left
+        .lines()
+        .enumerate()
+        .map(|(i, l)| match i % 3 {
+            0 => format!("{l}\n"),
+            _ => format!("{}\n", l.replacen("let ", "let mut ", 1)),
+        })
+        .collect();
+    let cancel_after = |wait: Duration| {
+        let cancel = Cancel::default();
+        let raise = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(wait);
+            raise.cancel();
+        });
+        let started = Instant::now();
+        let (l, r) = (
+            Input::Buffer(left.clone().into_bytes()),
+            Input::Buffer(right.clone().into_bytes()),
+        );
+        let result = d
+            .diff_cancellable(&l, &r, &opts, &cancel)
+            .and_then(|patch| d.render_patch_cancellable(&patch, &opts, &cancel));
+        canceller.join().unwrap();
+        assert!(
+            matches!(result, Err(DeltaError::Cancelled)),
+            "a render cancelled after {wait:?} was not reported as cancelled: {:?}",
+            result.map(|out| out.len())
+        );
+        // Noticed within one 10 ms poll; the rest is slack for a loaded
+        // machine, and still well short of letting delta finish.
+        assert!(
+            started.elapsed() < wait + Duration::from_millis(500),
+            "cancelled after {wait:?}, returned after {:?}",
+            started.elapsed()
+        );
+    };
+    // Early, which usually lands in the diff step with its pumps still
+    // writing, and later, which lands in delta.
+    cancel_after(Duration::from_millis(5));
+    cancel_after(Duration::from_millis(100));
+    let before = open_descriptors();
+    for _ in 0..4 {
+        cancel_after(Duration::from_millis(5));
+        cancel_after(Duration::from_millis(100));
+    }
+    let after = open_descriptors();
+    assert!(
+        after <= before + 4,
+        "8 cancelled renders went from {before} open descriptors to {after}"
+    );
 }
 
 /// How many descriptors this process holds. `/dev/fd` lists exactly that on

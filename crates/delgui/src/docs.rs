@@ -21,7 +21,8 @@
 use std::fmt::Write as _;
 
 use delgui_core::delta::{
-    Appearance, DeltaError, Granularity, MINIMUM_VERSION, Options, PROCESS_LIMITS, Whitespace,
+    Appearance, DeltaError, Granularity, MINIMUM_VERSION, Options, PROCESS_LIMITS,
+    TIMEOUT_PER_MEGABYTE, Whitespace,
 };
 
 use crate::app;
@@ -218,12 +219,16 @@ fn describe_error(error: &DeltaError) -> (&'static str, &'static str) {
             "Reported in a banner. Exit 1 *with* a patch means the inputs differ and is not an error.",
         ),
         DeltaError::TimedOut { .. } => (
-            "a child outran the timeout",
-            "The process group is killed and the failure is reported.",
+            "a child outran its timeout",
+            "The process group is killed and the failure is reported, suggesting Changes only or smaller inputs.",
         ),
         DeltaError::OutputTooLarge { .. } => (
             "a child outran the output cap",
             "Reported rather than buffered.",
+        ),
+        DeltaError::Cancelled => (
+            "the panels changed while a render ran",
+            "Not reported. The render is abandoned, its process group killed, and a render of the panels as they are now takes its place.",
         ),
         DeltaError::Io(_) => ("the child could not be spawned or read", "Reported."),
     }
@@ -234,6 +239,8 @@ fn bytes(n: usize) -> String {
         format!("{} MB", n / 1_000_000)
     } else if n.is_multiple_of(1024 * 1024) {
         format!("{} MiB", n / (1024 * 1024))
+    } else if n >= 1000 && n.is_multiple_of(1000) {
+        format!("{} KB", n / 1000)
     } else {
         format!("{n} bytes")
     }
@@ -347,6 +354,7 @@ pub fn reference() -> String {
             stream: "",
             limit: 0,
         },
+        DeltaError::Cancelled,
     ] {
         let (what, then) = describe_error(&e);
         let _ = writeln!(d, "| {what} | {then} |");
@@ -792,8 +800,10 @@ pub fn reference() -> String {
     );
     let _ = writeln!(
         d,
-        "| Typing debounce | {} ms | |",
-        app::EDIT_DEBOUNCE.as_millis()
+        "| Typing debounce | {} ms, or {} ms below {} combined | Long enough for a pause between words; a small pair renders in tens of milliseconds, so it waits less. |",
+        app::EDIT_DEBOUNCE.as_millis(),
+        app::SMALL_PAIR_EDIT_DEBOUNCE.as_millis(),
+        bytes(app::SMALL_PAIR_BYTES)
     );
     let _ = writeln!(
         d,
@@ -813,8 +823,14 @@ pub fn reference() -> String {
     );
     let _ = writeln!(
         d,
-        "| Subprocess timeout | {} s | The child is killed as a process group. |",
-        PROCESS_LIMITS.timeout.as_secs()
+        "| Superseded render | abandoned after {} ms | A render whose panels change while it runs is killed when a render of the current panels is due, provided it has run this long, and that render starts in its place. The floor stops a held key restarting delta at key-repeat rate. |",
+        app::ABANDON_AFTER.as_millis()
+    );
+    let _ = writeln!(
+        d,
+        "| Subprocess timeout | {} s, plus {} s per MB of input | The child is killed as a process group. Its input is the two panels for the diff step and the patch for delta, which is what grows when much of a pair differs. |",
+        PROCESS_LIMITS.timeout.as_secs(),
+        TIMEOUT_PER_MEGABYTE.as_secs()
     );
     let _ = writeln!(
         d,
@@ -827,7 +843,7 @@ pub fn reference() -> String {
         bytes(PROCESS_LIMITS.stderr_bytes)
     );
     d.push('\n');
-    d.push_str("Rendering is single-flight: a render starts only when none is running, and the result of one whose inputs have since changed is dropped. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.\n\n");
+    d.push_str("Rendering is single-flight: one render runs at a time, and one whose inputs change while it runs is abandoned as soon as a render of the current inputs is due to start. A result that arrives for inputs that have since changed is dropped without being drawn, unless the pair is over the auto-render ceiling and nothing will replace it until Compare. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.\n\n");
 
     // ---- Colophon ----------------------------------------------------------
     let _ = write!(

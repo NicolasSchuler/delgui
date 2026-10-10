@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -18,12 +18,50 @@ use std::os::unix::process::CommandExt;
 pub const MINIMUM_VERSION: (u32, u32) = (0, 18);
 
 /// Public so a frontend can state the ceilings it renders under.
+///
+/// `timeout` is the floor. A child handed input is allowed
+/// [`TIMEOUT_PER_MEGABYTE`] more for every megabyte of it; see
+/// [`ProcessLimits::for_input`].
 pub const PROCESS_LIMITS: ProcessLimits = ProcessLimits {
     timeout: Duration::from_secs(15),
     stdout_bytes: 128 * 1024 * 1024,
     stderr_bytes: 1024 * 1024,
 };
+
+/// How much longer a child may run for each megabyte it is handed.
+///
+/// A fixed 15 s failed exactly the inputs the GUI admits. delta's cost follows
+/// how much of the pair differs -- the patch -- far more than the pair's size.
+/// Side by side, delta 0.20.1 on an Apple M4: two 4 MB panels with 5% of lines
+/// changed render in 1.2 s, and with 65% changed (a 7 MB patch) in 5 to 8 s;
+/// one dense pair of that size has been timed at 29.8 s, twice the old ceiling.
+/// Eight seconds a megabyte gives that patch about 70 s, over twice the worst
+/// time seen, while a 50 KB patch gets 15.4 s where it had 15 (research.md §20).
+pub const TIMEOUT_PER_MEGABYTE: Duration = Duration::from_secs(8);
+
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A request to stop a render nobody is waiting for any more.
+///
+/// Shared between whoever may change their mind and the thread running the
+/// render. The running child is polled every [`PROCESS_POLL_INTERVAL`] anyway,
+/// so a cancelled one is killed as a process group within about that long --
+/// the same way a timeout is -- and the thread returns
+/// [`DeltaError::Cancelled`]. Nothing else is shared: the thread that spawned
+/// the child is the only one that kills or reaps it, so the pid cannot have been
+/// reused by the time the signal is sent.
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Debug)]
 pub enum DeltaError {
@@ -62,6 +100,9 @@ pub enum DeltaError {
         stream: &'static str,
         limit: usize,
     },
+    /// The caller withdrew the request through a [`Cancel`]. Not a failure of
+    /// delta or of the inputs, so not something to put in front of a user.
+    Cancelled,
     Io(std::io::Error),
 }
 
@@ -106,6 +147,7 @@ impl std::fmt::Display for DeltaError {
                 stream,
                 limit,
             } => write!(f, "{program} produced more than {limit} bytes on {stream}"),
+            Self::Cancelled => write!(f, "the render was cancelled before it finished"),
             Self::Io(e) => write!(f, "failed to run delta: {e}"),
         }
     }
@@ -192,11 +234,27 @@ impl Delta {
     /// diff in play instead of two that can disagree: `delta A B` is
     /// byte-identical to `git diff --no-index A B | delta` (research.md §7).
     pub fn diff(&self, left: &Input, right: &Input, opts: &Options) -> Result<Vec<u8>, DeltaError> {
+        self.diff_cancellable(left, right, opts, &Cancel::default())
+    }
+
+    /// [`Delta::diff`], stopped early -- child and all -- if `cancel` is
+    /// raised while it runs.
+    pub fn diff_cancellable(
+        &self,
+        left: &Input,
+        right: &Input,
+        opts: &Options,
+        cancel: &Cancel,
+    ) -> Result<Vec<u8>, DeltaError> {
+        if cancel.is_cancelled() {
+            return Err(DeltaError::Cancelled);
+        }
         let mut cmd = Command::new("git");
         cmd.args(opts.git_diff_args());
         opts.apply_env(&mut cmd);
 
-        let out = over_two_inputs(cmd, left, right, "git diff", PROCESS_LIMITS)
+        let limits = PROCESS_LIMITS.for_input(left.size() + right.size());
+        let out = over_two_inputs(cmd, left, right, "git diff", limits, Some(cancel))
             .map_err(|e| map_run_error(e, DeltaError::GitNotFound))?;
         // Exit 1 plus a patch is "the files differ", which is the whole point.
         // Any higher status, or exit 1 without a patch, is a refusal. The
@@ -216,6 +274,20 @@ impl Delta {
 
     /// Render a diff we already hold, rather than one delta computes for itself.
     pub fn render_patch(&self, patch: &[u8], opts: &Options) -> Result<Vec<u8>, DeltaError> {
+        self.render_patch_cancellable(patch, opts, &Cancel::default())
+    }
+
+    /// [`Delta::render_patch`], stopped early -- child and all -- if `cancel`
+    /// is raised while it runs.
+    pub fn render_patch_cancellable(
+        &self,
+        patch: &[u8],
+        opts: &Options,
+        cancel: &Cancel,
+    ) -> Result<Vec<u8>, DeltaError> {
+        if cancel.is_cancelled() {
+            return Err(DeltaError::Cancelled);
+        }
         let mut cmd = Command::new(&self.path);
         cmd.args(opts.to_args());
         opts.apply_env(&mut cmd);
@@ -234,7 +306,10 @@ impl Delta {
         let mut stdin = child.stdin.take().expect("stdin was piped");
         let bytes = patch.to_vec();
         let pump = std::thread::spawn(move || stdin.write_all(&bytes));
-        let out = capture_child(child, vec![pump], Vec::new(), "delta", PROCESS_LIMITS)
+        // Scaled by the patch rather than by the panels: the patch is all delta
+        // is handed, and it is what grows with how much of the pair differs.
+        let limits = PROCESS_LIMITS.for_input(patch.len() as u64);
+        let out = capture_child(child, vec![pump], Vec::new(), "delta", limits, Some(cancel))
             .map_err(|e| map_run_error(e, DeltaError::NotFound))?;
         if !out.status.success() {
             return Err(DeltaError::Refused {
@@ -277,6 +352,7 @@ fn over_two_inputs(
     right: &Input,
     program: &'static str,
     limits: ProcessLimits,
+    cancel: Option<&Cancel>,
 ) -> Result<Captured, RunError> {
     let mut pipes = Pipes::default();
     let left_arg = left.as_argument(&mut pipes)?;
@@ -302,7 +378,7 @@ fn over_two_inputs(
     // descriptors per render, and the GUI renders per keystroke -- a few
     // minutes of typing reached the 256-descriptor ceiling a Finder-launched
     // process gets, and everything failed from there on.
-    capture_child(child, pumps, pipes.readers, program, limits)
+    capture_child(child, pumps, pipes.readers, program, limits, cancel)
 }
 
 #[derive(Clone, Copy)]
@@ -310,6 +386,19 @@ pub struct ProcessLimits {
     pub timeout: Duration,
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
+}
+
+impl ProcessLimits {
+    /// These limits for a child handed `bytes` of input: the timeout grows by
+    /// [`TIMEOUT_PER_MEGABYTE`] for each (decimal) megabyte, pro rata, and
+    /// nothing else changes. The one place the allowance is computed, so that
+    /// what a frontend documents and what a render is given cannot drift apart.
+    pub fn for_input(self, bytes: u64) -> Self {
+        Self {
+            timeout: self.timeout + TIMEOUT_PER_MEGABYTE.mul_f64(bytes as f64 / 1e6),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -331,6 +420,7 @@ enum RunError {
         stream: &'static str,
         limit: usize,
     },
+    Cancelled,
 }
 
 impl From<std::io::Error> for RunError {
@@ -353,6 +443,7 @@ fn map_run_error(error: RunError, not_found: DeltaError) -> DeltaError {
             stream,
             limit,
         },
+        RunError::Cancelled => DeltaError::Cancelled,
     }
 }
 
@@ -363,7 +454,7 @@ fn run_simple_command(
 ) -> Result<Captured, RunError> {
     prepare_command(&mut cmd, Stdio::null());
     let child = cmd.spawn()?;
-    capture_child(child, Vec::new(), Vec::new(), program, limits)
+    capture_child(child, Vec::new(), Vec::new(), program, limits, None)
 }
 
 fn prepare_command(cmd: &mut Command, stdin: Stdio) {
@@ -411,6 +502,7 @@ fn capture_child(
     inherited_readers: Vec<std::io::PipeReader>,
     program: &'static str,
     limits: ProcessLimits,
+    cancel: Option<&Cancel>,
 ) -> Result<Captured, RunError> {
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -424,9 +516,21 @@ fn capture_child(
 
     let started = Instant::now();
     let mut timed_out = false;
+    let mut cancelled = false;
     let mut poll_error = None;
     let status = loop {
         if signal.load(Ordering::Acquire) != 0 {
+            terminate_child(&mut child);
+            break None;
+        }
+        // Killed exactly as a timeout is, so everything below -- dropping the
+        // read ends, joining the pumps -- runs the same way. A pump blocked on a
+        // full pipe is released once no process holds a read end: the group is
+        // dead and ours are dropped next. A render spawned concurrently can
+        // have inherited one, since a `/dev/fd` read end is deliberately not
+        // close-on-exec; that holds the pump only until that child exits.
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            cancelled = true;
             terminate_child(&mut child);
             break None;
         }
@@ -469,6 +573,9 @@ fn capture_child(
         .join()
         .map_err(|_| RunError::Io(std::io::Error::other("stderr reader thread panicked")))?;
 
+    if cancelled {
+        return Err(RunError::Cancelled);
+    }
     if timed_out {
         return Err(RunError::TimedOut {
             program,
@@ -600,6 +707,16 @@ impl Input {
         match self {
             Self::Buffer(bytes) => Some(bytes),
             Self::Path(_) => None,
+        }
+    }
+
+    /// How many bytes this side holds, for sizing the timeout. A path that
+    /// cannot be read counts as empty and leaves the floor: the diff is about to
+    /// fail on it anyway, and say why.
+    fn size(&self) -> u64 {
+        match self {
+            Self::Buffer(bytes) => bytes.len() as u64,
+            Self::Path(p) => std::fs::metadata(p).map_or(0, |m| m.len()),
         }
     }
 
@@ -1250,5 +1367,92 @@ mod tests {
             ),
             "unexpected output-limit result"
         );
+    }
+
+    /// The allowance is pro rata on top of the floor, and touches nothing but
+    /// the timeout. A small input keeps essentially the timeout it always had;
+    /// a 7 MB patch, about what two dense 4 MB panels make, gets 71 s against
+    /// the 29.8 s the slowest of them has been measured at.
+    #[test]
+    fn the_timeout_grows_with_what_the_child_is_handed() {
+        let timeout = |bytes| PROCESS_LIMITS.for_input(bytes).timeout;
+        assert_eq!(timeout(0), PROCESS_LIMITS.timeout);
+        assert_eq!(timeout(1_000_000), Duration::from_secs(23));
+        assert_eq!(timeout(500_000), Duration::from_secs(19));
+        assert_eq!(timeout(7_000_000), Duration::from_secs(71));
+        assert!(timeout(50_000) < Duration::from_millis(15_500));
+        let scaled = PROCESS_LIMITS.for_input(8_000_000);
+        assert_eq!(scaled.stdout_bytes, PROCESS_LIMITS.stdout_bytes);
+        assert_eq!(scaled.stderr_bytes, PROCESS_LIMITS.stderr_bytes);
+    }
+
+    /// A child that never reads its `/dev/fd` inputs leaves both pumps blocked
+    /// on a full pipe -- a megabyte each against ~64 KiB of buffer. Cancelling
+    /// has to kill it and release them, or the render thread never returns and
+    /// its four descriptors are never closed.
+    #[test]
+    fn a_cancelled_child_is_killed_and_releases_its_pumps_and_descriptors() {
+        let run_and_cancel = || {
+            let cancel = Cancel::default();
+            let raise = cancel.clone();
+            let canceller = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                raise.cancel();
+            });
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            let big = || Input::Buffer(vec![b'x'; 1_000_000]);
+            let started = Instant::now();
+            let result = over_two_inputs(
+                command,
+                &big(),
+                &big(),
+                "test child",
+                test_limits(Duration::from_secs(60), 1024),
+                Some(&cancel),
+            );
+            canceller.join().unwrap();
+            assert!(matches!(result, Err(RunError::Cancelled)), "not reported as cancelled");
+            // Generous, because a child another test spawns meanwhile can
+            // inherit a read end and hold a pump until it exits. Blocked for
+            // good would be thirty seconds, or forever.
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "cancelling took {:?}",
+                started.elapsed()
+            );
+        };
+        run_and_cancel();
+        let before = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+        for _ in 0..8 {
+            run_and_cancel();
+        }
+        let after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+        assert!(
+            after <= before + 4,
+            "8 cancelled runs went from {before} open descriptors to {after}"
+        );
+    }
+
+    /// Withdrawn before it started, nothing is spawned at all.
+    #[test]
+    fn a_render_cancelled_before_it_starts_spawns_nothing() {
+        let delta = Delta {
+            path: PathBuf::from("delgui-test-delta-does-not-exist"),
+            version: (0, 20, 1),
+            version_string: "delta test".into(),
+        };
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let input = || Input::Buffer(b"a\n".to_vec());
+        // A missing binary would be `NotFound` had anything been spawned.
+        assert!(matches!(
+            delta.render_patch_cancellable(b"", &Options::default(), &cancel),
+            Err(DeltaError::Cancelled)
+        ));
+        assert!(matches!(
+            delta.diff_cancellable(&input(), &input(), &Options::default(), &cancel),
+            Err(DeltaError::Cancelled)
+        ));
     }
 }

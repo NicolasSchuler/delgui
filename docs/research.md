@@ -412,6 +412,102 @@ Character granularity is the default. A one-character change — a `<` that beca
 in an identifier — is the one a reader is most likely to miss, and word granularity hides it inside
 a marked word that looks like any other marked word.
 
+## 20. Render cost follows the patch, and a stale render is worth nothing
+
+Measured on 2026-10-10 against **delta 0.20.1** on an Apple M4, the way the app runs it: side by
+side at 160 columns, character granularity, `--no-gitconfig`. The inputs are generated lines of
+Rust-like code, about 42 bytes each. *Sparse* changes 5% of lines; *dense* changes two thirds of
+them, scattered; *busy* changes two thirds with three tokens altered in each; *block* re-indents
+the first two thirds as one run. Sizes are per panel, so a pair is twice the figure. Where a cell
+shows a range, two runs disagreed by that much.
+
+| per panel | change | context | `git diff` | delta | patch |
+| --- | --- | --- | --- | --- | --- |
+| 25 KB | sparse | 3 | 0.01 s | 0.03 s | 10 KB |
+| 25 KB | dense | 3 | 0.01 s | 0.06 s | 43 KB |
+| 0.5 MB | sparse | 3 | 0.02 s | 0.18 s | 0.19 MB |
+| 0.5 MB | dense | 3 | 0.03 s | 0.73 s | 0.87 MB |
+| 1 MB | sparse | 3 | 0.02 s | 0.32 s | 0.39 MB |
+| 1 MB | dense | 3 | 0.02–0.03 s | 2.2–2.8 s | 1.7 MB |
+| 2 MB | sparse | 3 | 0.03 s | 1.0 s | 0.77 MB |
+| 2 MB | dense | 3 | 0.05–0.07 s | 3.9–4.2 s | 3.5 MB |
+| 4 MB | sparse | 0 | 0.04 s | 0.42 s | 0.50 MB |
+| 4 MB | sparse | 3 | 0.04 s | 1.2 s | 1.5 MB |
+| 4 MB | sparse | whole file | 0.04 s | 3.2 s | 4.3 MB |
+| 4 MB | dense | 3 | 0.06–0.09 s | 5.6–8.1 s | 6.9 MB |
+| 4 MB | busy | 3 | 0.05–0.08 s | 4.2–6.4 s | 5.4 MB |
+| 4 MB | busy | 0 | 0.05–0.07 s | 2.7–3.9 s | 3.3 MB |
+| 4 MB | block | 3 | 0.07 s | 5.3 s | 5.5 MB |
+
+`git diff` is never the cost. delta's time tracks the **patch**, at roughly 0.7 to 1.6 s per
+megabyte of it across every shape here, and the patch is decided by how much of the pair differs
+and how much context surrounds each change — not by the size of the files. The rule of thumb the
+code used to quote, "about a second per megabyte" of input, is five or six times too pessimistic
+for a sparse pair and too optimistic for a dense one. A separate set of dense pairs, timed on the same kind of
+machine for this change, was worse and superlinear: 1.9 s at 1 MB, 3.8 s at 2 MB, 9.4 s at 4 MB
+and **29.8 s at 8 MB** (pair sizes). These generators did not reproduce that curve, so it stands
+as the worst case seen rather than a law.
+
+**The timeout scales with the input.** A fixed 15 s failed exactly the inputs `MAX_PANEL_BYTES`
+admits. `ProcessLimits::for_input` now gives each child 15 s plus `TIMEOUT_PER_MEGABYTE` — 8 s —
+for every megabyte it is handed: both panels for the diff step, the patch for delta. Two dense
+4 MB panels make a 6.9 MB patch and get 70 s, nine times the slowest run measured here and well
+over twice the 29.8 s case; a 50 KB pair gets 15.4 s where it had 15. Because delta's allowance
+follows the patch, shrinking the patch shrinks the allowance too — but the 15 s floor does not
+shrink, so a smaller patch still clears it, and the timeout banner says so: choosing *Changes
+only* took the sparse 4 MB pair from 3.2 s at whole-file context to 0.42 s, and the busy one from
+4.2 s to 2.7 s.
+
+**A result for panels that have since changed is dropped before it is drawn.** `poll` used to put
+every result in the cache, and the next frame laid it out on the UI thread — measured at 0.19 s
+for 1 MB and 0.7 s for 4 MB — only for it to be replaced by the render the edit had already
+scheduled. During steady typing that was a freeze per keystroke that outran a render. It is now
+discarded unseen whenever a replacement follows: another render is in flight, one has been asked
+for, or the pair is under `AUTO_RENDER_BYTES` and `tick` will start one once typing settles. Over
+that ceiling nothing follows until Compare, so the result is kept: it is the newest diff there
+will be, and dropping it would make the Compare that started it look like it did nothing.
+
+A failure is dropped by the same rule, and that does not reopen the respawn loop of the
+"attributable failure" constraint. `failed` exists so that `schedule`, which only ever starts the
+*current* key, does not start a failed one again on the next frame. A stale failure is by
+definition for a key that is not current, so remembering it could never have stopped anything;
+for that key to be started again, someone has to make it current again, which is an action and
+not a loop. The replacement is attributed in its own right if it fails as well
+(`a_failure_of_the_current_panels_is_still_attributed`).
+
+**A stale render is abandoned, not waited out.** Since its result can only be discarded, the time
+spent waiting for it was pure delay — seconds on a dense pair, with the edit queued behind it.
+`Cancel` is a shared flag that `capture_child` reads on the 10 ms poll it already ran for timeouts,
+and acts on the same way: the process group is killed, the parent's `/dev/fd` read ends are
+dropped, and the pumps feeding them fail with a broken pipe instead of blocking. One caveat holds
+for any two concurrent renders, not just this: a read end is deliberately not close-on-exec, so a
+child spawned elsewhere in that window inherits a copy and holds a pump until it exits — bounded
+by that child, never forever. `a_cancelled_render_stops_promptly_and_leaks_nothing` cancels real
+renders in both steps and counts descriptors afterwards.
+
+`schedule` cancels only at the moment it is about to start the render that replaces the stale
+one, so the single-flight slot is never empty with work outstanding, and the cancelled thread
+sends nothing — no banner, no `failed`. It also cancels only a render that has run
+`ABANDON_AFTER` (250 ms). Holding ⌘⏎ re-reads file-backed panels and holding ⌘Z rewrites the
+result, so each repeat is a new key; without the floor, each would kill and respawn delta at
+key-repeat rate, which is the churn single-flight was built to stop. A render shorter than the
+floor is never interrupted, and waiting out the rest of a longer one costs at most the floor. The
+abandoned process group can outlive its replacement's spawn by one poll, about 10 ms.
+
+**Debounces.** Until now these were bare numbers.
+
+- *Typing*, `EDIT_DEBOUNCE`, 300 ms. Forty to eighty words a minute, at five characters a word,
+  is 150 to 300 ms between keystrokes — arithmetic, not a measurement. Waiting 300 ms starts a
+  render at a pause rather than between letters; on a pair that takes delta a second, a render
+  started between letters is overtaken by the next one and thrown away.
+- *Typing on a small pair*, `SMALL_PAIR_EDIT_DEBOUNCE`, 150 ms below `SMALL_PAIR_BYTES` (50 KB
+  combined). Such a pair renders in 40 to 70 ms end to end, so the wait was most of the latency,
+  and a render started between letters is cheap to throw away. Pasted snippets live here.
+- *Resize*, `RESIZE_DEBOUNCE`, 120 ms, unchanged. A window drag delivers a new width every frame,
+  16 ms at 60 Hz; seven frames of stillness coalesces a drag into one render at its end.
+- *Watch*, `WATCH_DEBOUNCE`, 180 ms, unchanged. An editor's save is a burst of events — write,
+  rename, attribute change — and a file read mid-write is truncated (§8).
+
 ## Open items
 
 - **CJK/wide-glyph fidelity.** Measured in §14: no stock macOS CJK font is double-width, so no
@@ -426,6 +522,9 @@ a marked word that looks like any other marked word.
   this sharper rather than answering it: Git launches the tool at the repo root, so the process
   inherits the right directory by accident, and the panels are Git's temp files rather than the
   repo's.
+- **The timeout allowance is calibrated on one fast machine.** §20's 8 s per megabyte leaves about
+  twice the worst case seen on an Apple M4. A machine three times slower on that same pair would
+  need about 90 s against the 70 it is given; nobody has measured one yet.
 - **Ignores are a reading aid only.** They are forced off while a result is being built (§16), so
   the one workflow where "ignore whitespace" would be most useful — merging two reformatted
   versions — is the one that cannot have it. Lifting that means teaching `merge::verify` what an
