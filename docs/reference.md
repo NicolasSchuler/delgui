@@ -328,7 +328,7 @@ Chords are written the way each platform writes them. Extra Shift or Alt modifie
 | | |
 | --- | --- |
 | drop | load files into the panels you drop them on |
-| click A | make that panel the baseline |
+| click A, B, … | make that panel the baseline the others are compared against |
 | ⋯ | open, reload, follow on disk, clear, remove |
 | `Combine…` | build a result you can take differences into |
 

@@ -497,8 +497,8 @@ pub fn help_rows() -> Vec<HelpRow> {
         group: "mouse",
     });
     rows.push(HelpRow {
-        label: "click A",
-        describe: "make that panel the baseline",
+        label: "click A, B, …",
+        describe: "make that panel the baseline the others are compared against",
         group: "mouse",
     });
     rows.push(HelpRow {

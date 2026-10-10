@@ -110,6 +110,8 @@ content looks like, or `prose`, which is left unhighlighted. Click the chip to c
 5. **Save** with <kbd>⌘S</kbd> (the first save asks where), **Save as…** with <kbd>⌘⇧S</kbd>, or
    **Copy** it.
 
+![delgui building a result: each difference carries a Use B's version button, and the result panel sits along the bottom](docs/images/merge.png)
+
 **Stop building** puts the take controls away and keeps the text. The result's ⋯ menu moves it
 to the left or right edge, to see all of it at once on a wide screen.
 

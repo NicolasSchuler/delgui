@@ -105,11 +105,20 @@ Each of these is load-bearing and pinned by a test or documented in `docs/resear
 - **Watching registers parent directories, not files.** Editors save by rename, which swaps the
   inode; a file-level watch sees exactly one save. Events are coalesced (`WATCH_DEBOUNCE`) and the
   first poll after registering is discarded because FSEvents replays writes from just before.
-- **Rendering is single-flight and debounced.** `App::schedule` starts a render only when none is
-  running, and drops the result of one whose `RenderKey` no longer matches. Six call sites used to
-  spawn freely behind one `bool`, so holding ⌘⏎ started twenty-five delta processes a second and
-  the visible diff could go backwards in time. Typing waits `EDIT_DEBOUNCE`, resizing waits
-  `RESIZE_DEBOUNCE`, and a pair over `AUTO_RENDER_BYTES` waits to be asked.
+- **Rendering is single-flight, debounced, and abandons stale work.** `App::schedule` starts a
+  render only when none is running, and `poll` drops a result or failure whose `RenderKey` no
+  longer matches *before* laying it out — laying out a 1 MB result costs ~0.2 s on the UI thread,
+  and during continuous typing every stale result used to pay that freeze before being discarded.
+  A render whose key has gone stale is cancelled (`Cancel` in `delta.rs` kills the process group
+  the way a timeout does) so the replacement starts at once, but only once it has run for
+  `ABANDON_AFTER`: holding ⌘⏎ or ⌘Z changes the key on every key repeat, and killing and
+  restarting delta each time is the same twenty-five-processes-a-second problem single-flight
+  exists to stop. Six call sites used to spawn freely behind one `bool`, so the visible diff could
+  go backwards in time. Typing waits `edit_debounce()` — `SMALL_PAIR_EDIT_DEBOUNCE` under
+  `SMALL_PAIR_BYTES`, `EDIT_DEBOUNCE` otherwise — resizing waits `RESIZE_DEBOUNCE`, and a pair
+  over `AUTO_RENDER_BYTES` waits to be asked. The delta timeout is `ProcessLimits::for_input`, a
+  base plus `TIMEOUT_PER_MEGABYTE`, because dense diffs are not "a second per megabyte";
+  `research.md` §20 has the measurements.
 - **A failed render must be attributable.** `Job::Failed` carries the `RenderKey` and `App::failed`
   remembers it. Without that, a failure caches nothing, so the key never matches, so the next frame
   re-spawns — measured at ~7,500 subprocesses a second, forever.
