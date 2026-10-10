@@ -367,7 +367,7 @@ Applied to both children of every render.
 | Subprocess stdout | 128 MiB | |
 | Subprocess stderr | 1 MiB | |
 
-Rendering is single-flight: one render runs at a time, and one whose inputs change while it runs is abandoned as soon as a render of the current inputs is due to start. A result that arrives for inputs that have since changed is dropped without being drawn, unless the pair is over the auto-render ceiling and nothing will replace it until Compare. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.
+Rendering is single-flight: one render runs at a time, and one whose inputs change while it runs is abandoned as soon as a render of the current inputs is due to start. A result that arrives for inputs that have since changed is dropped without being drawn, unless the pair is over the auto-render ceiling and nothing will replace it until Compare. Only the rows on screen and about a screen above and below them are laid out for drawing, and while a result is being built only the take controls near the screen are drawn, so a long diff costs a frame and memory about what a short one does; find, Copy diff and screen readers still see every row. Comparison inputs reach delta as `/dev/fd/N` pipes, without temporary files. Only an explicit Save writes result contents to disk; preferences and window geometry are persisted separately as described above.
 
 ---
 

@@ -508,6 +508,89 @@ abandoned process group can outlive its replacement's spawn by one poll, about 1
 - *Watch*, `WATCH_DEBOUNCE`, 180 ms, unchanged. An editor's save is a burst of events — write,
   rename, attribute change — and a file read mid-write is truncated (§8).
 
+## 21. Shaping follows the viewport, not the diff
+
+Measured on 2026-10-10 on an Apple M4 against **delta 0.20.1**, release build, egui 0.36.1, with
+`large_diff_frame_cost` — an `#[ignore]`d test in `app.rs` that renders through `render_job` and
+times `diff_area` on a 1,600 × 1,000 window. The input is the example pair repeated, every line
+tagged with its copy: four independent changes per thirteen lines, side by side at 160 columns.
+At the default context that is one hunk covering the file; building a result diffs at zero
+context, so it is a difference per change. Resident memory is from `ps`, one size per process —
+the allocator keeps what an earlier size freed. The frame time excludes tessellation and
+presenting, which the app pays on top.
+
+| pair, per side | rows | first frame before | after | resident before | after | later frames before | after |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 MB | 41,200 | 874 ms | 9.3 ms | +1,408 MB | +7 MB | 3.4 ms | 0.06 ms |
+| 4 MB | 162,928 | 3,496 ms | 8.4 ms | +1,996 MB | +7 MB | 20 ms | 0.07 ms |
+
+Building a result, where the cost used to follow the number of differences:
+
+| per side | differences | first frame before | after | resident before | after | later frames before | after |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 25 KB | 276 | 45 ms | 6.5 ms | +46 MB | +3 MB | 0.71 ms | 0.12 ms |
+| 100 KB | 1,068 | 162 ms | 6.9 ms | +178 MB | +3 MB | 3.1 ms | 0.17 ms |
+| 400 KB | 4,208 | 596 ms | 7.2 ms | +708 MB | +3 MB | 11.7 ms | 0.40 ms |
+
+**What the time and memory were.** Every row of the diff was shaped into a galley before the
+first frame: about 21 µs and 34 KB a row at 160 columns — a 160-column row's glyphs and the mesh
+that draws them. At 4 MB the resident figure stops tracking it (163,000 rows at 34 KB would be 5.5 GB),
+so read that cell as a floor. Merge mode shaped everything twice, once whole for find and copy and
+once per hunk to draw, and then placed every take control on every frame whether or not it could
+be seen: about 2.8 µs a difference a frame in this harness, which leaves out painting. The audit
+that prompted this measured the real app at about 75 µs a difference, near 15 fps at 750.
+
+**What replaced it.** `render::prepare_layout` only does arithmetic, and a frame shapes the
+192-row chunks within one viewport height of the screen (`OVERSCAN_VIEWPORTS`). A chunk stays
+shaped while it is within four viewport heights (`RETAIN_VIEWPORTS`) or holds a selection end, and
+is dropped after that; the gap between the two numbers stops a chunk on the boundary being shaped
+and dropped on alternate frames. Jumping from the top of the 4 MB pair to the end took 2.4 ms,
+shaped the last 112 rows, dropped the first 192, and left +10 MB resident in all. Scrolling into
+a fresh chunk costs its 192 rows once, about 4 ms. The overscan is a distance, not a count of
+chunks, because a merge-mode chunk is one hunk and can be one row.
+
+Three things had to stop reading galleys, which may no longer exist. Find and *Copy diff* scan the
+parsed rows, shared with the cache as an `Arc<[Line]>`; a galley's text is its rows' text joined by
+newlines, since an `ESC[K` fill is paint, so this is exact (`find_reports_the_same_rows_across_a_chunk_boundary`
+pins it against a scan of the joined text, including a match split across two styled spans). The
+AccessKit value of a chunk is built from the rows in the same way. And the content width: rows can
+run past the column count in the unified view, which is not known until a row is shaped, so the
+horizontal extent grows as wider rows come into view and never shrinks.
+
+**Rows have to be on the pixel grid.** epaint rounds every laid-out row to whole physical pixels
+(`text_layout.rs:971`). At 12 pt the line height is 16.32, which at 2× is drawn 16.5 apart, so
+multiplying rows by 16.32 — as find and the hunk boxes always had — drifts 0.18 px a row: 900 px
+by row 5,000. With chunks now placed by that same multiplication, it would also open gaps and
+overlaps between them. `render::row_height` snaps the height before epaint sees it, which makes
+its rounding a no-op, and `a_row_is_a_whole_number_of_physical_pixels` checks that a shaped chunk
+is exactly as tall as the arithmetic says.
+
+**Culling the take controls.** A control row's height is measured the first time one is drawn
+(`hunk_control_height`, estimated from the theme until then) and every hunk is placed with it, so
+the rows of a hunk whose control is not drawn are still exactly where they would be. Only the
+control rows within the overscan are drawn. `hunk_boxes`, the "n of m" counter and Previous/Next
+change cover every hunk by arithmetic, and a take's scroll restore therefore works for a hunk whose
+control was culled — which is the usual case, since the take that moves the viewport is one made
+above it. A culled control is absent from the AccessKit tree; ⌘⌥↓ is how the keyboard brings one
+near. The location label in a control row is selectable, so a press there records the row as a
+selection end, as a press on a chunk does, and that row is drawn wherever it is until the
+selection ends.
+
+**Copying a selection mounts only the stretch between its ends.** egui puts on the clipboard only
+text from galleys it re-encounters in the copy frame, so a culled middle truncates silently.
+Mounting everything was free when everything was shaped; now it would shape the whole diff, and
+egui's `has_selection()` is true after a single click on any label anywhere, so every ⌘C in a
+panel would have paid for it. When both ends are in the diff, the chunks and control rows between
+them are mounted; when one is outside, everything is, since which side of the diff egui drew that
+end on is not known here; when both are outside, nothing is. That last rule relies on nothing
+selectable being drawn after the diff in a frame, and the stale pill, which is, is not selectable.
+
+**In the app.** The audit's 885 KB pair, 5,975 rows and 747 differences at 157 columns, launched
+with each build: 553 MB resident before, 398 MB after, against 146 MB for the thirteen-line
+example. The 252 MB that remains is not the diff — the harness attributes +7 MB to it — and is most
+likely the two input panels' text editors, which lay out their whole buffers; that was not
+measured here.
+
 ## Open items
 
 - **CJK/wide-glyph fidelity.** Measured in §14: no stock macOS CJK font is double-width, so no

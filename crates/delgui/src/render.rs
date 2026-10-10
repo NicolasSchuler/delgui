@@ -1,5 +1,6 @@
 //! Turning parsed delta output into something egui can draw.
 
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -10,7 +11,7 @@ use delgui_core::ansi::{self, Color, Line, Style};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Color32, Context, CursorIcon, Event, EventFilter, FontId, Galley, Id, Key, Modifiers, OpenUrl,
-    Rect, Response, Sense, Stroke, Ui, UiBuilder, Vec2, Widget, WidgetInfo, WidgetType,
+    Rect, Response, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -23,6 +24,7 @@ use crate::theme::Tokens;
 /// takes these from the user's colour scheme; we have to supply them, so they
 /// come from the app's theme -- which is also why index 4 is the chrome accent:
 /// it is the only one delta reaches for by default.
+#[derive(Clone)]
 pub struct Palette {
     pub ansi16: [Color32; 16],
     pub foreground: Color32,
@@ -102,8 +104,23 @@ pub struct EraseFill {
 /// a widget-info label on a `Role::Label` node is written as the node's *value*
 /// (`response.rs:962-968`), i.e. as a claim about what the label says, so a
 /// chunk's own text is the only honest thing to put there.
+///
+/// And it is the unit of shaping: a chunk is shaped whole or not at all, so
+/// scrolling into one costs its 192 rows once (~4 ms at 160 columns) and
+/// nothing after.
 const PREPARED_CHUNK_ROWS: usize = 192;
-const VIEWPORT_OVERSCAN_CHUNKS: usize = 1;
+/// How far past each edge of the viewport, in viewport heights, a chunk is
+/// still drawn -- and so shaped before it is scrolled to. A distance rather
+/// than a number of chunks, because merge mode's chunks are one hunk each and
+/// a hunk can be a single row.
+const OVERSCAN_VIEWPORTS: f32 = 1.0;
+/// How far past each edge, in viewport heights, a shaped chunk survives before
+/// its galley is dropped. Wider than the overscan, so a chunk on the boundary is
+/// not shaped and dropped again on alternating frames of a small scroll. It is
+/// what bounds memory: at most the rows within nine viewports of the screen,
+/// plus a chunk at either end, are ever shaped at once -- however long the diff
+/// -- along with the chunks a selection's ends are in.
+const RETAIN_VIEWPORTS: f32 = 4.0;
 const RENDERED_DIFF_LABEL: &str = "Rendered diff";
 /// Deliberately not [`RENDERED_DIFF_LABEL`]: the region and the keyboard target
 /// are two nodes, and a test that asserts the diff is named exactly once cannot
@@ -152,6 +169,11 @@ struct ChunkFrame {
 /// `None` is meaningful: that end lives in a widget outside the diff, which is
 /// drawn unconditionally and so is always "reached" without help from us.
 ///
+/// A control row counts as inside. Its location label is selectable, and a row
+/// that is culled once it scrolls away would drop a selection that ends in it,
+/// so a press there records the row's [`control_id`] the way a press on a
+/// chunk records its [`chunk_id`].
+///
 /// Two paths could in principle disagree with egui, and both were read and do
 /// not apply: keyboard selection stays inside the galley that already holds
 /// primary (`:571-574`, `:688`), and the upward/downward drag-extension
@@ -172,9 +194,14 @@ impl SelectionEnds {
 
 /// What one frame decided to register, draw and hand to the selection.
 struct MountPlan {
+    /// Chunks within the overscan of the viewport.
     visible: Range<usize>,
+    /// Sections whose control row is within it.
+    controls: Range<usize>,
     ends: SelectionEnds,
-    copying: bool,
+    /// On a copy frame, the stretch between the selection's ends, inclusive:
+    /// everything egui has to re-encounter to put all of it on the clipboard.
+    copy: Option<(Place, Place)>,
 }
 
 /// What the previous AccessKit pass mounted for one retained layout.
@@ -191,18 +218,40 @@ struct AccessibilityMount {
 }
 
 impl MountPlan {
-    fn mount(&self, id: Id) -> Mount {
-        if self.copying || self.ends.holds(id) {
+    fn copies(&self, place: Place) -> bool {
+        self.copy
+            .is_some_and(|(first, last)| first <= place && place <= last)
+    }
+
+    fn mount(&self, index: usize, id: Id) -> Mount {
+        if self.ends.holds(id)
+            || self.copies(Place {
+                chunk: index,
+                rows: true,
+            })
+        {
             Mount::Anchored
         } else {
             Mount::Culled
         }
     }
 
-    /// Drawn means the galley is painted and the chunk is handed to egui's
-    /// selection. Registration is unconditional and happens either way.
+    /// Drawn means the galley is shaped and painted and the chunk is handed to
+    /// egui's selection. Registration is unconditional and happens either way.
     fn drawn(&self, index: usize, id: Id) -> bool {
-        self.visible.contains(&index) || self.mount(id) == Mount::Anchored
+        self.visible.contains(&index) || self.mount(index, id) == Mount::Anchored
+    }
+
+    /// Whether section `index`'s control row is drawn. A culled one is not
+    /// there at all, so one that holds a selection end, or lies between the
+    /// ends of a selection being copied, is drawn wherever it is.
+    fn control_drawn(&self, index: usize, section: &Section, ui: &Ui) -> bool {
+        self.controls.contains(&index)
+            || self.ends.holds(control_id(ui, index))
+            || self.copies(Place {
+                chunk: section.chunks.start,
+                rows: false,
+            })
     }
 }
 
@@ -213,6 +262,11 @@ impl MountPlan {
 /// previous, longer layout simply matches nothing.
 fn chunk_id(ui: &Ui, index: usize) -> Id {
     ui.id().with(("prepared-diff-chunk", index))
+}
+
+/// The same, for the `Ui` a section's control row is drawn in.
+fn control_id(ui: &Ui, section: usize) -> Id {
+    ui.id().with(("prepared-diff-control", section))
 }
 
 fn selection_key(ui: &Ui) -> Id {
@@ -226,8 +280,8 @@ fn accessibility_key(ui: &Ui) -> Id {
 /// The diff's single keyboard target, and the name of the region the chunks
 /// land in.
 ///
-/// Call this once per frame from *inside* the scroll viewport closure and above
-/// the merge/plain branch. Three things depend on that placement:
+/// Call this once per frame from *inside* the scroll viewport closure, before
+/// the layout is drawn. Three things depend on that placement:
 ///
 /// - The AccessKit node for the enclosing `Ui` must exist before the first chunk
 ///   registers. `Context::accesskit_node_builder` parents a new node by walking
@@ -239,11 +293,12 @@ fn accessibility_key(ui: &Ui) -> Id {
 ///   (`scroll_area.rs:1094-1102`). Outside the closure the delta would go to the
 ///   wrong scroll area, and `ui.clip_rect()` would be the card, not the
 ///   viewport, so the page size would be wrong too.
-/// - Above the branch is what makes merge mode one tab stop as well.
+/// - The control rows merge mode draws name it as their accessibility parent,
+///   which only takes if its node already exists.
 ///
 /// It allocates no space: `Ui::interact` builds a `WidgetRect` and calls
-/// `create_widget` without advancing the cursor (`ui.rs:906-933`), so
-/// `show_viewport`'s `set_min_size` and merge mode's stacking are untouched.
+/// `create_widget` without advancing the cursor (`ui.rs:906-933`), so the
+/// layout's origin and `show_viewport`'s `set_min_size` are untouched.
 pub fn diff_region(ui: &mut Ui) -> Response {
     ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
         node.set_role(egui::accesskit::Role::Group);
@@ -389,210 +444,123 @@ pub fn scroll_edges(ui: &Ui, t: &Tokens, rect: Rect, offset: f32, content: f32) 
     }
 }
 
-struct PreparedChunk {
-    galley: Arc<Galley>,
+/// Where one chunk sits and which rows it draws, known before any of it is
+/// shaped. One rendered line is one laid-out row -- delta does the wrapping,
+/// and an unbounded wrap width stops egui redoing it -- and every row is
+/// exactly `line_height` tall, so where anything in the diff is drawn is
+/// arithmetic.
+struct ChunkSlot {
+    /// Rows of the body, as indices into [`PreparedLayout::rows`].
+    rows: Range<usize>,
     /// Where the chunk is placed, in pixels from the top of the layout.
     top: f32,
-    /// Where the chunk starts, in diff rows. `top` positions it for the
-    /// painter; this positions it for the find bar's line numbers.
-    first_row: usize,
+    height: f32,
+}
+
+impl ChunkSlot {
+    fn bottom(&self) -> f32 {
+        self.top + self.height
+    }
+}
+
+/// What a chunk is once shaped: built the first time it is drawn, and dropped
+/// again once it is far from view (see [`RETAIN_VIEWPORTS`]).
+struct ShapedChunk {
+    galley: Arc<Galley>,
     hyperlinks: Vec<Hyperlink>,
     erase_fills: Vec<EraseFill>,
 }
 
-impl PreparedChunk {
-    fn bottom(&self) -> f32 {
-        self.top + self.galley.size().y
-    }
-
-    fn label(&self, columns: usize, column_width: f32, mount: Mount) -> PreparedLabel<'_> {
-        PreparedLabel {
-            chunk: self,
-            columns,
-            column_width: column_width.max(1.0),
-            mount,
-        }
-    }
-
-    /// Everything a chunk does once it has a `Response`, whether that came from
-    /// laying it out ([`PreparedLabel`]) or from placing it by hand
-    /// ([`PreparedLayout::show_viewport`]).
-    ///
-    /// The order of the five steps below is load-bearing; each says why.
-    fn draw(
-        &self,
-        ui: &Ui,
-        mut response: Response,
-        rect: Rect,
-        columns: usize,
-        column_width: f32,
-        frame: ChunkFrame,
-    ) -> Response {
-        let galley = self.galley.clone();
-        let galley_pos = rect.left_top();
-        let visible = ui.is_rect_visible(rect);
-
-        if frame.publish_accessibility {
-            // `WidgetInfo::labeled` owns its value, so this copies the chunk's
-            // text. That is bounded to viewport-scale work after the first pass
-            // by `show_viewport`; unchanged off-screen nodes remain in
-            // AccessKit's incremental tree and are merely kept as children of
-            // the diff region.
-            response.widget_info(|| {
-                WidgetInfo::labeled(WidgetType::Label, ui.is_enabled(), galley.text())
-            });
-
-            // egui *implements* `ScrollIntoView` for every registered widget
-            // (`context.rs:1305-1323`) but only ever *advertises* `Focus` and
-            // `Click` (`response.rs:907-923`), and that path runs only for
-            // focusable widgets. Without this, the macOS adapter never offers
-            // AXScrollToVisible and an off-screen row cannot be navigated to.
-            ui.ctx().accesskit_node_builder(response.id, |node| {
-                node.add_action(egui::accesskit::Action::ScrollIntoView);
-            });
-        }
-
-        // The chunks are not tab stops any more, so clicking one is what puts
-        // the keyboard on the diff. It has to target `diff_region_id()`, not
-        // this response: `create_widget` calls `surrender_focus` for every
-        // non-focusable widget (`context.rs:1271-1273`), so a chunk could not
-        // hold focus even for a frame. `diff_region` registered that id earlier
-        // in this same pass.
-        if response.clicked() || response.drag_started() {
-            ui.memory_mut(|memory| memory.request_focus(diff_region_id()));
-        }
-
-        if visible {
-            for fill in &self.erase_fills {
-                let Some(row) = galley.rows.get(fill.row) else {
-                    continue;
-                };
-                let row_rect = row.rect().translate(galley_pos.to_vec2());
-                let start =
-                    (galley_pos.x + fill.from_column as f32 * column_width).max(row_rect.right());
-                let end = galley_pos.x + columns as f32 * column_width;
-                if start < end {
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(start, row_rect.top()),
-                            egui::pos2(end, row_rect.bottom()),
-                        ),
-                        0.0,
-                        fill.background,
-                    );
-                }
-            }
-        }
-
-        // This is what paints the galley (`label_text_selection.rs:187`), so it
-        // has to come after the erase fills or the background would be painted
-        // over the text.
-        if visible || frame.mount == Mount::Anchored {
-            egui::text_selection::LabelSelectionState::label_text_selection(
-                ui,
-                &response,
-                galley_pos,
-                galley,
-                ui.visuals().text_color(),
-                Stroke::NONE,
-            );
-        }
-
-        // Must stay last. `on_label` asks for `CursorIcon::Text` whenever the
-        // response is hovered (`label_text_selection.rs:559-561`) and
-        // `Context::set_cursor_icon` is a plain last-write-wins store
-        // (`context.rs:1643-1645`) -- a child `Ui` does not buffer platform
-        // output, so there is nothing to scope and ordering is the whole fix.
-        // Mid-drag the hand still cannot win, because `on_end_pass` forces the
-        // I-beam unconditionally after all widget code (`:218-220`); that is
-        // correct.
-        if visible {
-            let hovered = ui
-                .input(|i| i.pointer.hover_pos())
-                .filter(|p| rect.contains(*p))
-                .map(|p| self.galley.cursor_from_pos(p - galley_pos).index.0)
-                .and_then(|index| {
-                    self.hyperlinks
-                        .iter()
-                        .find(|link| link.char_range.contains(&index))
-                });
-            if let Some(link) = hovered {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                if response.clicked_with_open_in_background() {
-                    ui.open_url(OpenUrl {
-                        url: link.target.clone(),
-                        new_tab: true,
-                    });
-                } else if response.clicked() {
-                    ui.open_url(OpenUrl {
-                        url: link.target.clone(),
-                        new_tab: false,
-                    });
-                }
-                if ui.style().url_in_tooltip {
-                    response = response.on_hover_text(link.target.clone());
-                }
-            }
-        }
-        response
-    }
+/// A run of rows drawn together beneath a control row [`PreparedLayout::gap`]
+/// pixels tall. A plain diff is one section with no gap; merge mode makes one
+/// per hunk, so that its take control sits directly above the rows it acts on.
+struct Section {
+    /// Where the control row starts. The rows start one gap below it.
+    top: f32,
+    /// Rows of the body, as indices into [`PreparedLayout::rows`].
+    rows: Range<usize>,
+    chunks: Range<usize>,
 }
 
-/// A diff block laid out once and cheap to reuse on every frame.
+/// How [`prepare_layout`] divides the rows it is given.
+pub enum Sections<'a> {
+    /// Every row, as one block.
+    Whole,
+    /// Only these spans of rows, each below a control row `control_height`
+    /// pixels tall which [`PreparedLayout::show_viewport`] asks
+    /// the caller to fill. Rows outside every span are not drawn. The spans
+    /// must be in order and must not overlap -- they are a diff's hunks.
+    Hunks {
+        spans: &'a [Range<usize>],
+        control_height: f32,
+    },
+}
+
+/// A place in the diff's drawing order: a section's control row comes before
+/// the first chunk of its rows. Ordered, so the stretch between a selection's
+/// two ends can be taken as a range.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Place {
+    chunk: usize,
+    rows: bool,
+}
+
+/// A diff whose geometry is known up front and whose text is shaped only where
+/// it is looked at.
 ///
-/// Cache this alongside the render/style key and draw it with [`Self::show`] or
+/// Shaping is the expensive part. Done for the whole diff before its first
+/// frame, it cost the UI thread 0.87 s at 41,200 rows and 3.5 s at 163,000
+/// (`docs/research.md` §21), and left ~34 KB of galley resident for every row
+/// of a 160-column side-by-side diff -- 1.4 GB for a pair of 1 MB files. So
+/// [`prepare_layout`] does only arithmetic, and each frame shapes the chunks it
+/// draws -- the viewport and one viewport height either side of it -- and keeps
+/// them for as long as they stay within [`RETAIN_VIEWPORTS`] of it.
+///
+/// It keeps no text of its own. The parsed rows are shared with the render
+/// cache, and everything that reads the diff's text rather than drawing it --
+/// *Copy diff*, find, the AccessKit value of a chunk nobody is looking at --
+/// reads the rows instead. That is exact: a chunk's galley text is its rows'
+/// span text joined by `'\n'`, because an `ESC[K` fill is paint, not
+/// characters.
+///
+/// Cache this alongside the render/style key and draw it with
 /// [`Self::show_viewport`]. The chunks keep egui's cross-label selectable-text
-/// behavior, make OSC 8 spans clickable, and paint `ESC[K` without adding
-/// synthetic spaces to the copied text.
-///
-/// It deliberately keeps no `String` of its own. The characters are already
-/// retained once, inside each chunk's `Galley` (`Galley::text()` is
-/// `&self.job.text`, epaint `text_layout_types.rs:1010-1013`), so a second copy
-/// would double the memory of the largest diffs for nothing. The questions the
-/// app used to answer by scanning that string are answered here instead.
+/// behavior and make OSC 8 spans clickable.
 pub struct PreparedLayout {
-    chunks: Vec<PreparedChunk>,
+    lines: Arc<[Line]>,
+    body: Range<usize>,
+    chunks: Vec<ChunkSlot>,
+    sections: Vec<Section>,
+    /// The height of every control row: zero for a plain diff.
+    gap: f32,
     columns: usize,
+    font: FontId,
+    palette: Palette,
+    line_height: f32,
     height: f32,
-    galley_width: f32,
+    /// One slot per chunk, `Some` while that chunk is shaped. Behind a
+    /// `RefCell` because shaping happens while drawing, and the drawing is done
+    /// from a shared borrow: merge mode's control rows borrow the app the
+    /// layout lives in.
+    shaped: RefCell<Vec<Option<Arc<ShapedChunk>>>>,
+    /// The widest chunk shaped so far. Rows can run past `columns` -- delta
+    /// does not truncate a unified diff -- and how far is not known until the
+    /// row is shaped, so the horizontal extent grows as wider rows come into
+    /// view. It never shrinks when they are dropped again.
+    widest: Cell<f32>,
+    /// How many times a chunk has been shaped, for the tests that pin how few.
+    shapes: Cell<usize>,
     accessibility_revision: u64,
 }
 
 impl PreparedLayout {
-    /// Draw every chunk. Merge mode uses this because control rows interrupt the
-    /// diff and make its vertical positions depend on the surrounding widgets.
-    pub fn show(&self, ui: &mut Ui, column_width: f32) -> Response {
-        // The `Id`-keyed [`SelectionEnds`] tracker cannot be used here: these
-        // chunks take auto-ids, which are not knowable before they are placed.
-        // The cliff is milder -- every chunk is placed regardless, so the
-        // context-global flag only costs an off-screen `TextShape` each, and
-        // merge mode diffs at zero context, so a hunk's layout is a handful of
-        // rows. It is the same shape of problem as the one `show_viewport`
-        // fixes, left live rather than papered over.
-        let mount = if label_selection_active(ui.ctx()) {
-            Mount::Anchored
-        } else {
-            Mount::Culled
-        };
-        ui.scope_builder(
-            UiBuilder::new().accessibility_parent(diff_region_id()),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let mut response: Option<Response> = None;
-                for chunk in &self.chunks {
-                    let chunk_response = ui.add(chunk.label(self.columns, column_width, mount));
-                    response = Some(match response {
-                        Some(current) => current.union(chunk_response),
-                        None => chunk_response,
-                    });
-                }
-                response.unwrap_or_else(|| ui.allocate_response(Vec2::ZERO, Sense::hover()))
-            },
-        )
-        .inner
-    }
-
-    /// Keep every chunk reachable; draw and update the ones the viewport needs.
+    /// Keep every chunk reachable; draw and update the ones the viewport needs,
+    /// calling `control` to fill each control row -- merge mode's take
+    /// controls -- that is near enough the viewport to be seen. The rest are
+    /// not drawn at all: where they are is arithmetic, and drawing every one of
+    /// them every frame is what made merge mode's frame time grow with the
+    /// number of differences. A plain diff has no control rows, and `control`
+    /// is never called for one.
     ///
     /// Culling decides what is *painted*, never what is *reachable*. Every chunk
     /// gets a `Response` on every frame -- an off-screen one with
@@ -603,7 +571,8 @@ impl PreparedLayout {
     /// `Ui::interact` clips only `interact_rect`, leaving `rect` whole
     /// (`ui.rs:926`), and `rect` is what `Action::ScrollIntoView` scrolls to --
     /// so an off-screen chunk carries its true bounds and scrolls itself
-    /// correctly into view.
+    /// correctly into view. A culled control row is the exception: it is absent
+    /// until it is scrolled near, and ⌘⌥↓ is how the keyboard gets it there.
     ///
     /// AccessKit's `TreeUpdate` is incremental: unchanged nodes should be
     /// omitted, but their IDs must remain in their parent's child list. The
@@ -611,12 +580,15 @@ impl PreparedLayout {
     /// passes publish only drawn chunks and chunks drawn on the previous pass;
     /// the latter clears text-run children that would otherwise linger after a
     /// row scrolls away. The region keeps every chunk ID in document order.
-    pub fn show_viewport(&self, ui: &mut Ui, viewport: Rect, column_width: f32) {
+    pub fn show_viewport(
+        &self,
+        ui: &mut Ui,
+        viewport: Rect,
+        column_width: f32,
+        mut control: impl FnMut(&mut Ui, usize),
+    ) {
         let origin = ui.cursor().left_top();
-        let width = self
-            .galley_width
-            .max(self.columns as f32 * column_width.max(1.0));
-        ui.set_min_size(Vec2::new(width, self.height));
+        let column_width = column_width.max(1.0);
 
         let key = selection_key(ui);
         let selecting = label_selection_active(ui.ctx());
@@ -629,17 +601,24 @@ impl PreparedLayout {
         };
         // Replicates the private `got_copy_event`
         // (`label_text_selection.rs:679-686`), gated on a selection existing so
-        // an unrelated Cmd-C does not force a full-mount frame on a 100k-line
-        // diff. `copy_text` accumulates only from galleys that actually ran
-        // `on_label` (`:288`, `:575-577`), so a culled middle would truncate the
-        // clipboard silently: the copy frame has to mount everything.
+        // an unrelated Cmd-C does not force a mount. `copy_text` accumulates
+        // only from galleys that actually ran `on_label` (`:288`, `:575-577`),
+        // so a culled middle would truncate the clipboard silently: the copy
+        // frame has to mount everything between the selection's ends.
         let copying = selecting
             && ui.input(|i| {
                 i.events
                     .iter()
                     .any(|e| matches!(e, Event::Copy | Event::Cut))
             });
-        let plan = self.mount_plan(viewport, ends, copying);
+        let plan = self.mount_plan(ui, viewport, ends, copying);
+
+        // Shaped before anything is placed, so the width below counts them.
+        for index in plan.visible.clone() {
+            self.shaped(ui.ctx(), index);
+        }
+        let width = self.width(column_width);
+        ui.set_min_size(Vec2::new(width, self.height));
 
         let accessibility_key = accessibility_key(ui);
         let frame = ui.ctx().cumulative_frame_nr();
@@ -675,39 +654,79 @@ impl PreparedLayout {
 
         let mut hit: Option<Id> = None;
         let mut drawn_chunks = Vec::new();
-        for index in 0..self.chunks.len() {
-            let chunk = &self.chunks[index];
-            let rect = Rect::from_min_size(
-                origin + Vec2::new(0.0, chunk.top),
-                Vec2::new(width, chunk.galley.size().y),
-            );
-            let id = chunk_id(ui, index);
-            let drawn = plan.drawn(index, id);
-            if drawn {
-                drawn_chunks.push(index);
+        let mut children = Vec::new();
+        for (section_index, section) in self.sections.iter().enumerate() {
+            if self.gap > 0.0 && plan.control_drawn(section_index, section, ui) {
+                let rect = Rect::from_min_size(
+                    origin + Vec2::new(0.0, section.top),
+                    Vec2::new(width, self.gap),
+                );
+                let id = control_id(ui, section_index);
+                // An explicit id, so the controls inside keep theirs however
+                // many rows above were culled; parented to the diff region so
+                // the explicit child list below can place it in document order.
+                let mut row = ui.new_child(
+                    UiBuilder::new()
+                        .id(id)
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min))
+                        .accessibility_parent(diff_region_id()),
+                );
+                control(&mut row, section_index);
+                if ui.rect_contains_pointer(rect) {
+                    hit = Some(id);
+                }
+                if accesskit_active {
+                    children.push(id.accesskit_id());
+                }
             }
-            let sense = if drawn {
-                selection_sense
-            } else {
-                Sense::hover()
-            };
-            let response = ui.interact(rect, id, sense);
-            if drawn && response.contains_pointer() {
-                hit = Some(id);
+            for index in section.chunks.clone() {
+                let slot = &self.chunks[index];
+                let rect = Rect::from_min_size(
+                    origin + Vec2::new(0.0, slot.top),
+                    Vec2::new(width, slot.height),
+                );
+                let id = chunk_id(ui, index);
+                let drawn = plan.drawn(index, id);
+                if drawn {
+                    drawn_chunks.push(index);
+                }
+                let sense = if drawn {
+                    selection_sense
+                } else {
+                    Sense::hover()
+                };
+                let response = ui.interact(rect, id, sense);
+                if drawn && response.contains_pointer() {
+                    hit = Some(id);
+                }
+                // Anything painted needs its galley. In the app that is never
+                // more than `drawn`; a test that draws without a scroll area
+                // can put more of the layout inside the clip rect than that.
+                let shaped =
+                    (drawn || ui.is_rect_visible(rect)).then(|| self.shaped(ui.ctx(), index));
+                let was_drawn = previous_accessibility.drawn.binary_search(&index).is_ok();
+                self.draw_chunk(
+                    ui,
+                    index,
+                    response,
+                    rect,
+                    shaped.as_deref(),
+                    column_width,
+                    ChunkFrame {
+                        mount: plan.mount(index, id),
+                        publish_accessibility: seed_accessibility || drawn || was_drawn,
+                    },
+                );
+                if accesskit_active {
+                    children.push(id.accesskit_id());
+                }
             }
-            let was_drawn = previous_accessibility.drawn.binary_search(&index).is_ok();
-            chunk.draw(
-                ui,
-                response,
-                rect,
-                self.columns,
-                column_width,
-                ChunkFrame {
-                    mount: plan.mount(id),
-                    publish_accessibility: seed_accessibility || drawn || was_drawn,
-                },
-            );
         }
+        // A selection end or a copy can shape a chunk the loop reached after
+        // the width was taken. Growing it here only moves the edge the scroll
+        // area stops at; nothing drawn this frame was placed against it.
+        ui.set_min_size(Vec2::new(self.width(column_width), self.height));
 
         if accesskit_active {
             // Chunk builders created above initially attach to the enclosing Ui.
@@ -715,11 +734,8 @@ impl PreparedLayout {
             // scroll view as the region's only child. Explicit child lists also
             // retain unchanged off-screen nodes that were deliberately absent
             // from this incremental update.
-            let chunks = (0..self.chunks.len())
-                .map(|index| chunk_id(ui, index).accesskit_id())
-                .collect::<Vec<_>>();
             ui.ctx()
-                .accesskit_node_builder(diff_region_id(), |node| node.set_children(chunks));
+                .accesskit_node_builder(diff_region_id(), |node| node.set_children(children));
             ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
                 node.set_children(vec![diff_region_id().accesskit_id()]);
             });
@@ -730,7 +746,7 @@ impl PreparedLayout {
                         revision: self.accessibility_revision,
                         frame,
                         pass,
-                        drawn: drawn_chunks,
+                        drawn: drawn_chunks.clone(),
                     },
                 );
             });
@@ -767,93 +783,426 @@ impl PreparedLayout {
             ends.focus = Some(id);
         }
         ui.data_mut(|data| data.insert_temp(key, ends));
+
+        let margin = viewport.height() * RETAIN_VIEWPORTS;
+        self.evict(
+            self.chunk_range(viewport.top() - margin, viewport.bottom() + margin),
+            &drawn_chunks,
+        );
     }
 
-    /// True when there is nothing to copy or search.
-    ///
-    /// Exact rather than a row count: only a layout whose every chunk laid out
-    /// to the empty string has no text, since a non-final chunk always holds
-    /// [`PREPARED_CHUNK_ROWS`] - 1 row breaks.
+    /// True when there is nothing to copy or search: what [`Self::to_text`]
+    /// would return is empty, which takes at most one row and no characters.
     pub fn is_empty(&self) -> bool {
-        self.chunks
-            .iter()
-            .all(|chunk| chunk.galley.text().is_empty())
+        let rows = self.rows();
+        rows.len() < 2
+            && rows
+                .iter()
+                .all(|line| line.spans.iter().all(|span| span.text.is_empty()))
     }
 
     /// The whole diff as one string. Built on demand -- a *Copy diff* click --
     /// never per frame.
+    ///
+    /// Every row of the body, merge mode included: rows outside every hunk
+    /// are not drawn there, but they are still the diff that was rendered.
     pub fn to_text(&self) -> String {
-        let mut out =
-            String::with_capacity(self.chunks.iter().map(|c| c.galley.text().len() + 1).sum());
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            // Keyed on the index, not on `!out.is_empty()`. The accumulator this
-            // replaces was only accidentally right: a first chunk that laid out
-            // to the empty string would have swallowed the seam break after it.
-            if index > 0 {
-                out.push('\n');
-            }
-            out.push_str(chunk.galley.text());
-        }
-        out
+        join_rows(self.rows())
     }
 
-    /// The rendered line of every match, in document order.
+    /// The rendered line of every match, in document order, once per match.
     ///
-    /// Scanned chunk by chunk rather than over [`Self::to_text`], because the
-    /// point of dropping the retained string is not to rebuild it. That is exact
-    /// for any query without a newline in it: `prepare_chunk` appends `"\n"`
-    /// between rows and at neither end, so the seam between two chunks is one
-    /// row break exactly like every break inside one, and
-    /// `first_row(k+1) == first_row(k) + rows(k)` accounts for it. The find bar
-    /// has exactly one writer, a `TextEdit::singleline`, and egui 0.36.1 cannot
-    /// put a newline into one: paste is `replace(['\r','\n'], " ")`
+    /// Row by row, which is exact for any query without a newline in it -- a
+    /// match cannot span two rows, and a scan restarting at each row break
+    /// finds what a scan of the joined text would. The find bar has exactly
+    /// one writer, a `TextEdit::singleline`, and egui 0.36.1 cannot put a
+    /// newline into one: paste is `replace(['\r','\n'], " ")`
     /// (`text_edit/builder.rs:1121`), a typed bare `"\n"`/`"\r"` is skipped
     /// (`:1129`), and Enter goes to focus handling.
     pub fn matching_rows(&self, query: &str) -> Vec<usize> {
-        let mut rows = Vec::new();
-        for chunk in &self.chunks {
-            rows.extend(
-                line_offsets(chunk.galley.text(), query)
-                    .into_iter()
-                    .map(|row| row + chunk.first_row),
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        let mut scratch = String::new();
+        for (row, line) in self.rows().iter().enumerate() {
+            let text = row_text(line, &mut scratch);
+            matches.extend(text.match_indices(query).map(|_| row));
+        }
+        matches
+    }
+
+    /// Where `row` is drawn, in pixels from the top of the layout -- or `None`
+    /// when it is outside every hunk merge mode draws.
+    pub fn row_top(&self, row: usize) -> Option<f32> {
+        let section = self.sections.partition_point(|s| s.rows.end <= row);
+        let section = self.sections.get(section)?;
+        if !section.rows.contains(&row) {
+            return None;
+        }
+        let chunk = &self.chunks[section.chunks.start + (row - section.rows.start) / PREPARED_CHUNK_ROWS];
+        Some(chunk.top + (row - chunk.rows.start) as f32 * self.line_height)
+    }
+
+    /// How tall the whole diff is drawn, control rows included.
+    #[cfg(test)]
+    pub fn height(&self) -> f32 {
+        self.height
+    }
+
+    /// Where section `n` is drawn -- in merge mode, hunk `n` -- as its top and
+    /// its height, control row included.
+    pub fn section_bounds(&self, n: usize) -> Option<(f32, f32)> {
+        let section = self.sections.get(n)?;
+        Some((
+            section.top,
+            self.gap + section.rows.len() as f32 * self.line_height,
+        ))
+    }
+
+    fn rows(&self) -> &[Line] {
+        &self.lines[self.body.clone()]
+    }
+
+    /// The text a chunk's galley holds, from the rows rather than the galley,
+    /// which may not exist.
+    fn chunk_text(&self, index: usize) -> String {
+        join_rows(&self.rows()[self.chunks[index].rows.clone()])
+    }
+
+    fn width(&self, column_width: f32) -> f32 {
+        self.widest.get().max(self.columns as f32 * column_width)
+    }
+
+    /// The chunk's galley, shaping it first if it is not resident.
+    fn shaped(&self, ctx: &Context, index: usize) -> Arc<ShapedChunk> {
+        let resident = self.shaped.borrow()[index].clone();
+        if let Some(shaped) = resident {
+            return shaped;
+        }
+        let rows = &self.rows()[self.chunks[index].rows.clone()];
+        let shaped = Arc::new(shape_chunk(
+            ctx,
+            rows,
+            self.columns,
+            self.font.clone(),
+            &self.palette,
+            self.line_height,
+        ));
+        debug_assert!(
+            (shaped.galley.size().y - self.chunks[index].height).abs() < 1.0,
+            "a chunk of {} rows shaped to {} px, not {} px: the row height is not \
+             snapped to the pixel grid, and every position below it is off",
+            rows.len(),
+            shaped.galley.size().y,
+            self.chunks[index].height,
+        );
+        self.widest
+            .set(self.widest.get().max(shaped.galley.size().x));
+        self.shapes.set(self.shapes.get() + 1);
+        self.shaped.borrow_mut()[index] = Some(shaped.clone());
+        shaped
+    }
+
+    /// Drop every galley outside `keep` that was not drawn this frame.
+    ///
+    /// Drawn chunks are spared even when far away: a selection end or a copy
+    /// mounted them, and they will be asked for again next frame. A galley
+    /// handed to the painter this frame is unaffected; its shape holds its own
+    /// reference.
+    fn evict(&self, keep: Range<usize>, drawn: &[usize]) {
+        for (index, slot) in self.shaped.borrow_mut().iter_mut().enumerate() {
+            if slot.is_some() && !keep.contains(&index) && drawn.binary_search(&index).is_err() {
+                *slot = None;
+            }
+        }
+    }
+
+    fn mount_plan(
+        &self,
+        ui: &Ui,
+        viewport: Rect,
+        ends: SelectionEnds,
+        copying: bool,
+    ) -> MountPlan {
+        let margin = viewport.height() * OVERSCAN_VIEWPORTS;
+        let (top, bottom) = (viewport.top() - margin, viewport.bottom() + margin);
+        let controls = if self.gap > 0.0 {
+            let first = self
+                .sections
+                .partition_point(|s| s.top + self.gap < top);
+            first..self.sections.partition_point(|s| s.top <= bottom).max(first)
+        } else {
+            0..0
+        };
+        let copy = if copying {
+            let place = |id: Option<Id>| id.and_then(|id| self.place_of(ui, id));
+            match (place(ends.anchor), place(ends.focus)) {
+                (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+                // One end is outside the diff, and which side of it egui drew
+                // that end on is not known here: everything is between.
+                (Some(_), None) | (None, Some(_)) => Some((
+                    Place {
+                        chunk: 0,
+                        rows: false,
+                    },
+                    Place {
+                        chunk: self.chunks.len(),
+                        rows: false,
+                    },
+                )),
+                // Both ends outside it. The diff could only lie between them
+                // with one end drawn before it and one after, and nothing drawn
+                // after it in a frame is selectable -- the stale pill opts out
+                // for exactly this reason. Mounting everything here would shape
+                // the whole diff on every ⌘C after a click on any label.
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
+        MountPlan {
+            visible: self.chunk_range(top, bottom),
+            controls,
+            ends,
+            copy,
+        }
+    }
+
+    /// The chunks that intersect `top..=bottom`, in pixels.
+    fn chunk_range(&self, top: f32, bottom: f32) -> Range<usize> {
+        let first = self.chunks.partition_point(|chunk| chunk.bottom() < top);
+        let end = self.chunks.partition_point(|chunk| chunk.top <= bottom);
+        first..end.max(first)
+    }
+
+    /// Where a selection end is in drawing order, if it is anywhere in this
+    /// layout. Hashes an id per chunk, so it runs only on a copy frame.
+    fn place_of(&self, ui: &Ui, id: Id) -> Option<Place> {
+        self.sections
+            .iter()
+            .enumerate()
+            .find_map(|(index, section)| {
+                (self.gap > 0.0 && control_id(ui, index) == id).then_some(Place {
+                    chunk: section.chunks.start,
+                    rows: false,
+                })
+            })
+            .or_else(|| {
+                (0..self.chunks.len())
+                    .find(|&index| chunk_id(ui, index) == id)
+                    .map(|chunk| Place { chunk, rows: true })
+            })
+    }
+
+    /// Everything a chunk does once it has a `Response`. The order of the
+    /// steps below is load-bearing; each says why.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_chunk(
+        &self,
+        ui: &Ui,
+        index: usize,
+        mut response: Response,
+        rect: Rect,
+        shaped: Option<&ShapedChunk>,
+        column_width: f32,
+        frame: ChunkFrame,
+    ) -> Response {
+        let galley_pos = rect.left_top();
+        let visible = ui.is_rect_visible(rect);
+
+        if frame.publish_accessibility {
+            // `WidgetInfo::labeled` owns its value, so this copies the chunk's
+            // text out of its rows. That is bounded to viewport-scale work after
+            // the first pass by `show_viewport`; unchanged off-screen nodes
+            // remain in AccessKit's incremental tree and are merely kept as
+            // children of the diff region.
+            response.widget_info(|| {
+                WidgetInfo::labeled(WidgetType::Label, ui.is_enabled(), self.chunk_text(index))
+            });
+
+            // egui *implements* `ScrollIntoView` for every registered widget
+            // (`context.rs:1305-1323`) but only ever *advertises* `Focus` and
+            // `Click` (`response.rs:907-923`), and that path runs only for
+            // focusable widgets. Without this, the macOS adapter never offers
+            // AXScrollToVisible and an off-screen row cannot be navigated to.
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.add_action(egui::accesskit::Action::ScrollIntoView);
+            });
+        }
+
+        // The chunks are not tab stops any more, so clicking one is what puts
+        // the keyboard on the diff. It has to target `diff_region_id()`, not
+        // this response: `create_widget` calls `surrender_focus` for every
+        // non-focusable widget (`context.rs:1271-1273`), so a chunk could not
+        // hold focus even for a frame. `diff_region` registered that id earlier
+        // in this same pass.
+        if response.clicked() || response.drag_started() {
+            ui.memory_mut(|memory| memory.request_focus(diff_region_id()));
+        }
+
+        // Not shaped means not drawn: there is nothing to paint or hit-test.
+        let Some(shaped) = shaped else {
+            return response;
+        };
+        let galley = shaped.galley.clone();
+
+        if visible {
+            for fill in &shaped.erase_fills {
+                let Some(row) = galley.rows.get(fill.row) else {
+                    continue;
+                };
+                let row_rect = row.rect().translate(galley_pos.to_vec2());
+                let start =
+                    (galley_pos.x + fill.from_column as f32 * column_width).max(row_rect.right());
+                let end = galley_pos.x + self.columns as f32 * column_width;
+                if start < end {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(start, row_rect.top()),
+                            egui::pos2(end, row_rect.bottom()),
+                        ),
+                        0.0,
+                        fill.background,
+                    );
+                }
+            }
+        }
+
+        // This is what paints the galley (`label_text_selection.rs:187`), so it
+        // has to come after the erase fills or the background would be painted
+        // over the text.
+        if visible || frame.mount == Mount::Anchored {
+            egui::text_selection::LabelSelectionState::label_text_selection(
+                ui,
+                &response,
+                galley_pos,
+                galley.clone(),
+                ui.visuals().text_color(),
+                Stroke::NONE,
             );
         }
-        rows
-    }
 
-    fn mount_plan(&self, viewport: Rect, ends: SelectionEnds, copying: bool) -> MountPlan {
-        MountPlan {
-            visible: self.visible_chunk_range(viewport),
-            ends,
-            copying,
+        // Must stay last. `on_label` asks for `CursorIcon::Text` whenever the
+        // response is hovered (`label_text_selection.rs:559-561`) and
+        // `Context::set_cursor_icon` is a plain last-write-wins store
+        // (`context.rs:1643-1645`) -- a child `Ui` does not buffer platform
+        // output, so there is nothing to scope and ordering is the whole fix.
+        // Mid-drag the hand still cannot win, because `on_end_pass` forces the
+        // I-beam unconditionally after all widget code (`:218-220`); that is
+        // correct.
+        if visible {
+            let hovered = ui
+                .input(|i| i.pointer.hover_pos())
+                .filter(|p| rect.contains(*p))
+                .map(|p| galley.cursor_from_pos(p - galley_pos).index.0)
+                .and_then(|index| {
+                    shaped
+                        .hyperlinks
+                        .iter()
+                        .find(|link| link.char_range.contains(&index))
+                });
+            if let Some(link) = hovered {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                if response.clicked_with_open_in_background() {
+                    ui.open_url(OpenUrl {
+                        url: link.target.clone(),
+                        new_tab: true,
+                    });
+                } else if response.clicked() {
+                    ui.open_url(OpenUrl {
+                        url: link.target.clone(),
+                        new_tab: false,
+                    });
+                }
+                if ui.style().url_in_tooltip {
+                    response = response.on_hover_text(link.target.clone());
+                }
+            }
         }
-    }
-
-    fn visible_chunk_range(&self, viewport: Rect) -> Range<usize> {
-        let first_intersecting = self
-            .chunks
-            .partition_point(|chunk| chunk.bottom() < viewport.top());
-        let first = first_intersecting.saturating_sub(VIEWPORT_OVERSCAN_CHUNKS);
-        let after_last = self
-            .chunks
-            .partition_point(|chunk| chunk.top <= viewport.bottom());
-        let end = after_last
-            .saturating_add(VIEWPORT_OVERSCAN_CHUNKS)
-            .min(self.chunks.len());
-        first..end.max(first)
+        response
     }
 
     #[cfg(test)]
     fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// How many rows are shaped right now.
+    #[cfg(test)]
+    pub fn shaped_rows(&self) -> usize {
+        self.shaped
+            .borrow()
+            .iter()
+            .zip(&self.chunks)
+            .filter(|(shaped, _)| shaped.is_some())
+            .map(|(_, slot)| slot.rows.len())
+            .sum()
+    }
+
+    /// How many times any chunk has been shaped since the layout was prepared.
+    #[cfg(test)]
+    pub fn shapes(&self) -> usize {
+        self.shapes.get()
+    }
+
+    /// The rows of every chunk that is shaped right now, in order.
+    #[cfg(test)]
+    pub fn shaped_chunks(&self) -> Vec<Range<usize>> {
+        self.shaped
+            .borrow()
+            .iter()
+            .zip(&self.chunks)
+            .filter(|(shaped, _)| shaped.is_some())
+            .map(|(_, slot)| slot.rows.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn shaped_chunk(&self, ctx: &Context, index: usize) -> Arc<ShapedChunk> {
+        self.shaped(ctx, index)
+    }
 }
 
-/// The line each match starts on, counting from the start of `text`.
-///
-/// Lives here rather than beside the find bar because the invariant it depends
-/// on -- one `'\n'` per rendered row, at neither end -- belongs beside the
-/// chunking that creates it.
+/// One row's characters: borrowed when the row is a single span, which most
+/// are, and assembled in `scratch` otherwise.
+fn row_text<'a>(line: &'a Line, scratch: &'a mut String) -> &'a str {
+    match line.spans.as_slice() {
+        [] => "",
+        [only] => &only.text,
+        spans => {
+            scratch.clear();
+            for span in spans {
+                scratch.push_str(&span.text);
+            }
+            scratch
+        }
+    }
+}
+
+/// Rows' characters joined by `'\n'`, between rows and at neither end: what a
+/// galley shaped from them holds.
+fn join_rows(rows: &[Line]) -> String {
+    let len = rows
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.text.len()).sum::<usize>() + 1)
+        .sum();
+    let mut out = String::with_capacity(len);
+    for (index, line) in rows.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        for span in &line.spans {
+            out.push_str(&span.text);
+        }
+    }
+    out
+}
+
+/// The line each match starts on, counting from the start of `text`: what
+/// [`PreparedLayout::matching_rows`] must agree with, scanning the joined text
+/// instead of row by row.
+#[cfg(test)]
 fn line_offsets(text: &str, query: &str) -> Vec<usize> {
     if query.is_empty() {
         return Vec::new();
@@ -872,54 +1221,112 @@ fn line_offsets(text: &str, query: &str) -> Vec<usize> {
     matches
 }
 
-/// Build and shape a reusable diff block.
+/// The height of one rendered row: `line_height` on the physical pixel grid.
 ///
-/// This must run on the UI thread because font shaping belongs to egui's
-/// [`Context`]. Rebuild when the rendered rows, column count, font, palette,
-/// line height or pixels-per-point change; otherwise retain the returned value.
+/// epaint rounds every laid-out row to whole physical pixels
+/// (`text_layout.rs:971`), so a row asked to be 17 pt tall at 2× is 17, but
+/// one asked to be 16.32 -- a 12 pt font's -- is 16.5. The layout places
+/// chunks, finds and hunk controls by multiplying rows by the height, and at
+/// 16.32 that drifts 0.18 px a row from what was drawn: 900 px by row 5,000.
+/// Handing epaint a height already on the grid makes its rounding a no-op, so
+/// the two agree exactly.
+pub fn row_height(line_height: f32, pixels_per_point: f32) -> f32 {
+    (line_height * pixels_per_point).round().max(1.0) / pixels_per_point
+}
+
+/// Prepare a diff to be drawn: its geometry, but none of its shaping.
+///
+/// `lines[body]` are the rows. They are used exactly as given: trimming
+/// belongs to `ansi::body`, which has to be the only place that decides where
+/// the body starts, or the row indices the hunks were located against
+/// silently shift. `line_height` must come from [`row_height`]. Rebuild when
+/// the rendered rows, column count, font, palette, line height,
+/// pixels-per-point or control height change; otherwise retain the value --
+/// it is what keeps shaped chunks alive between frames.
 pub fn prepare_layout(
-    ctx: &Context,
-    rows: &[Line],
+    lines: Arc<[Line]>,
+    body: Range<usize>,
+    sections: Sections<'_>,
     columns: usize,
     font: FontId,
     palette: &Palette,
     line_height: f32,
 ) -> PreparedLayout {
-    let mut chunks = Vec::with_capacity(rows.len().div_ceil(PREPARED_CHUNK_ROWS));
-    let mut height = 0.0;
-    let mut first_row = 0usize;
-    let mut galley_width: f32 = 0.0;
+    let row_count = body.len();
+    let (spans, gap) = match sections {
+        Sections::Whole => (std::iter::once(0..row_count).collect(), 0.0),
+        Sections::Hunks {
+            spans,
+            control_height,
+        } => (
+            spans
+                .iter()
+                .map(|span| span.start.min(row_count)..span.end.min(row_count))
+                .collect::<Vec<_>>(),
+            control_height,
+        ),
+    };
+    debug_assert!(
+        spans.windows(2).all(|pair| pair[0].end <= pair[1].start),
+        "sections must be in order and must not overlap",
+    );
 
-    for chunk_rows in rows.chunks(PREPARED_CHUNK_ROWS) {
-        let mut chunk = prepare_chunk(ctx, chunk_rows, columns, font.clone(), palette, line_height);
-        chunk.top = height;
-        // Counted from the rows actually laid out rather than
-        // `index * PREPARED_CHUNK_ROWS`, so it stays true at any chunk size and
-        // for the short final chunk.
-        chunk.first_row = first_row;
-        first_row += chunk_rows.len();
-        height += chunk.galley.size().y;
-        galley_width = galley_width.max(chunk.galley.size().x);
-        chunks.push(chunk);
+    // Positions are multiplied out from counts rather than accumulated, so
+    // they carry one rounding each however far down the diff they are.
+    let at = |rows: usize, gaps: usize| rows as f32 * line_height + gaps as f32 * gap;
+    let mut chunks = Vec::with_capacity(row_count.div_ceil(PREPARED_CHUNK_ROWS) + spans.len());
+    let mut sections = Vec::with_capacity(spans.len());
+    let mut drawn_rows = 0;
+    for (index, span) in spans.into_iter().enumerate() {
+        let first_chunk = chunks.len();
+        let top = at(drawn_rows, index);
+        let mut start = span.start;
+        while start < span.end {
+            let end = (start + PREPARED_CHUNK_ROWS).min(span.end);
+            chunks.push(ChunkSlot {
+                rows: start..end,
+                top: at(drawn_rows, index + 1),
+                height: (end - start) as f32 * line_height,
+            });
+            drawn_rows += end - start;
+            start = end;
+        }
+        sections.push(Section {
+            top,
+            rows: span,
+            chunks: first_chunk..chunks.len(),
+        });
     }
+    let height = at(drawn_rows, sections.len());
 
     PreparedLayout {
+        lines,
+        body,
+        shaped: RefCell::new(vec![None; chunks.len()]),
         chunks,
+        sections,
+        gap,
         columns,
+        font,
+        palette: palette.clone(),
+        line_height,
         height,
-        galley_width,
+        widest: Cell::new(0.0),
+        shapes: Cell::new(0),
         accessibility_revision: NEXT_ACCESSIBILITY_REVISION.fetch_add(1, Ordering::Relaxed),
     }
 }
 
-fn prepare_chunk(
+/// Shape one chunk's rows. Has to run on the UI thread, because font shaping
+/// belongs to egui's [`Context`].
+fn shape_chunk(
     ctx: &Context,
     rows: &[Line],
     columns: usize,
     font: FontId,
     palette: &Palette,
     line_height: f32,
-) -> PreparedChunk {
+) -> ShapedChunk {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     job.keep_trailing_whitespace = true;
@@ -975,55 +1382,10 @@ fn prepare_chunk(
         }
     }
 
-    PreparedChunk {
+    ShapedChunk {
         galley: ctx.fonts_mut(|fonts| fonts.layout_job(job)),
-        top: 0.0,
-        first_row: 0,
         hyperlinks,
         erase_fills,
-    }
-}
-
-/// The selectable widget backed by a cached [`PreparedLayout`].
-pub struct PreparedLabel<'a> {
-    chunk: &'a PreparedChunk,
-    columns: usize,
-    column_width: f32,
-    mount: Mount,
-}
-
-impl Widget for PreparedLabel<'_> {
-    fn ui(self, ui: &mut Ui) -> Response {
-        let chunk = self.chunk;
-        let size = Vec2::new(
-            chunk
-                .galley
-                .size()
-                .x
-                .max(self.columns as f32 * self.column_width),
-            chunk.galley.size().y,
-        );
-        let mut sense = Sense::hover();
-        let selection = if ui.input(|i| i.has_touch_screen()) {
-            Sense::click()
-        } else {
-            Sense::click_and_drag()
-        };
-        sense |= selection;
-        // See `show_viewport`: the diff is one tab stop, not one per chunk.
-        sense -= Sense::FOCUSABLE;
-        let (rect, response) = ui.allocate_exact_size(size, sense);
-        chunk.draw(
-            ui,
-            response,
-            rect,
-            self.columns,
-            self.column_width,
-            ChunkFrame {
-                mount: self.mount,
-                publish_accessibility: true,
-            },
-        )
     }
 }
 
@@ -1032,9 +1394,8 @@ impl Widget for PreparedLabel<'_> {
 /// (`label_text_selection.rs:284-286`, `:590-628`).
 ///
 /// That makes it useless as a culling decision on its own, which is what
-/// [`SelectionEnds`] exists to replace. It is still the right gate for the two
-/// blanket cases: whether a copy event can concern the diff at all, and merge
-/// mode, whose auto-id chunks cannot be tracked individually.
+/// [`SelectionEnds`] exists to replace. It is still the right gate for whether
+/// a copy event can concern the diff at all.
 fn label_selection_active(ctx: &Context) -> bool {
     ctx.plugin::<egui::text_selection::LabelSelectionState>()
         .lock()
@@ -1180,8 +1541,32 @@ mod tests {
             .collect()
     }
 
-    fn layout(ctx: &Context, rows: &[Line]) -> PreparedLayout {
-        prepare_layout(ctx, rows, 16, FontId::monospace(12.0), &palette(), 16.0)
+    fn layout(rows: &[Line]) -> PreparedLayout {
+        layout_with(rows, Sections::Whole, 16)
+    }
+
+    fn layout_with(rows: &[Line], sections: Sections<'_>, columns: usize) -> PreparedLayout {
+        prepare_layout(
+            Arc::from(rows),
+            0..rows.len(),
+            sections,
+            columns,
+            FontId::monospace(12.0),
+            &palette(),
+            16.0,
+        )
+    }
+
+    /// A plain diff's draw: no control rows to fill.
+    fn show(prepared: &PreparedLayout, ui: &mut Ui, viewport: Rect, column_width: f32) {
+        prepared.show_viewport(ui, viewport, column_width, |_, _| {});
+    }
+
+    /// Hunk-shaped spans: `count` of them, `len` rows each, one row apart.
+    fn spaced_spans(count: usize, len: usize) -> Vec<Range<usize>> {
+        (0..count)
+            .map(|n| n * (len + 1)..n * (len + 1) + len)
+            .collect()
     }
 
     /// A window small enough that only the first chunk of a many-chunk layout
@@ -1226,25 +1611,19 @@ mod tests {
                 spans: vec![span("abc", None)],
                 fill_to_eol: Some(Color::Indexed(1)),
             }];
-            let prepared = prepare_layout(
-                ui.ctx(),
-                &rows,
-                8,
-                FontId::monospace(12.0),
-                &palette(),
-                16.0,
-            );
+            let prepared = layout_with(&rows, Sections::Whole, 8);
             assert_eq!(prepared.to_text(), "abc");
             assert_eq!(
-                prepared.chunks[0].erase_fills,
+                prepared.shaped_chunk(ui.ctx(), 0).erase_fills,
                 &[EraseFill {
                     row: 0,
                     from_column: 3,
                     background: Color32::BLACK,
                 }]
             );
-            let response = prepared.show(ui, 7.0);
-            assert!(response.rect.width() >= 56.0);
+            let before = ui.min_rect();
+            show(&prepared, ui, ui.max_rect(), 7.0);
+            assert!(ui.min_rect().union(before).width() >= 56.0);
         });
     }
 
@@ -1260,17 +1639,10 @@ mod tests {
                 ],
                 fill_to_eol: None,
             }];
-            let prepared = prepare_layout(
-                ui.ctx(),
-                &rows,
-                8,
-                FontId::monospace(12.0),
-                &palette(),
-                16.0,
-            );
+            let prepared = layout_with(&rows, Sections::Whole, 8);
             assert_eq!(prepared.to_text(), "αβγ!");
             assert_eq!(
-                prepared.chunks[0].hyperlinks,
+                prepared.shaped_chunk(ui.ctx(), 0).hyperlinks,
                 &[Hyperlink {
                     char_range: 1..3,
                     target: "https://example.test/a".into(),
@@ -1281,53 +1653,113 @@ mod tests {
 
     #[test]
     fn prepared_layout_preserves_text_across_chunk_boundaries() {
-        egui::__run_test_ui(|ui| {
-            let rows = numbered_rows(PREPARED_CHUNK_ROWS + 1);
-            let prepared = layout(ui.ctx(), &rows);
-            let expected = (0..rows.len())
-                .map(|row| format!("row {row}"))
-                .collect::<Vec<_>>()
-                .join("\n");
+        let rows = numbered_rows(PREPARED_CHUNK_ROWS + 1);
+        let prepared = layout(&rows);
+        let expected = (0..rows.len())
+            .map(|row| format!("row {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-            assert_eq!(prepared.chunk_count(), 2);
-            assert_eq!(prepared.to_text(), expected);
-        });
+        assert_eq!(prepared.chunk_count(), 2);
+        assert_eq!(prepared.to_text(), expected);
     }
 
     #[test]
     fn viewport_work_is_bounded_to_nearby_chunks() {
         egui::__run_test_ui(|ui| {
             let rows = numbered_rows(PREPARED_CHUNK_ROWS * 8);
-            let prepared = layout(ui.ctx(), &rows);
+            let prepared = layout(&rows);
             let top = prepared.chunks[3].top + 8.0;
             let viewport = Rect::from_min_size(pos2(0.0, top), Vec2::new(800.0, 40.0));
+            let plan = prepared.mount_plan(ui, viewport, SelectionEnds::default(), false);
 
             assert_eq!(prepared.chunk_count(), 8);
-            assert_eq!(prepared.visible_chunk_range(viewport), 2..5);
+            // One viewport height above reaches 32 px into chunk 2; one below
+            // stays inside chunk 3.
+            assert_eq!(plan.visible, 2..4);
+            assert_eq!(plan.controls, 0..0, "a plain diff has no control rows");
+        });
+    }
+
+    /// Merge mode's chunks are a hunk each, so the overscan has to be a
+    /// distance: one chunk either side of a short viewport would be a row or
+    /// two, and the controls would pop in at the very edge.
+    #[test]
+    fn merge_mode_overscan_is_a_distance_not_a_chunk_count() {
+        egui::__run_test_ui(|ui| {
+            let spans = spaced_spans(200, 2);
+            let rows = numbered_rows(spans.last().unwrap().end);
+            let prepared = layout_with(
+                &rows,
+                Sections::Hunks {
+                    spans: &spans,
+                    control_height: 32.0,
+                },
+                16,
+            );
+            // Each section is 32 + 2 x 16 = 64 px, so a 128 px viewport just
+            // inside section 100 overscans by 128 px -- two sections -- either
+            // way, plus whatever the edges touch.
+            let (top, _) = prepared.section_bounds(100).unwrap();
+            assert_eq!(top, 6400.0);
+            let viewport = Rect::from_min_size(pos2(0.0, top + 8.0), Vec2::new(800.0, 128.0));
+            let plan = prepared.mount_plan(ui, viewport, SelectionEnds::default(), false);
+
+            assert_eq!(plan.controls, 98..105);
+            assert_eq!(plan.visible, 98..104);
         });
     }
 
     #[test]
+    fn rows_and_hunks_are_placed_by_arithmetic() {
+        let spans = spaced_spans(3, PREPARED_CHUNK_ROWS + 5);
+        let rows = numbered_rows(spans.last().unwrap().end + 4);
+        let plain = layout(&rows);
+        assert_eq!(plain.row_top(0), Some(0.0));
+        assert_eq!(plain.row_top(300), Some(300.0 * 16.0));
+        assert_eq!(plain.row_top(rows.len()), None);
+        assert_eq!(plain.height, rows.len() as f32 * 16.0);
+
+        let merge = layout_with(
+            &rows,
+            Sections::Hunks {
+                spans: &spans,
+                control_height: 30.0,
+            },
+            16,
+        );
+        let section = 30.0 + (PREPARED_CHUNK_ROWS + 5) as f32 * 16.0;
+        assert_eq!(merge.section_bounds(1), Some((section, section)));
+        // The first row of the second hunk sits one control row below its top,
+        // and its last row is in that hunk's second chunk.
+        assert_eq!(merge.row_top(spans[1].start), Some(section + 30.0));
+        assert_eq!(
+            merge.row_top(spans[1].end - 1),
+            Some(section + 30.0 + (PREPARED_CHUNK_ROWS + 4) as f32 * 16.0)
+        );
+        // Between hunks is not drawn in merge mode, and the find bar must not
+        // scroll to it.
+        assert_eq!(merge.row_top(spans[0].end), None);
+        assert_eq!(merge.height, 3.0 * section);
+        assert_eq!(merge.chunk_count(), 6, "no chunk spans two hunks");
+    }
+
+    #[test]
     fn an_empty_layout_reports_itself_empty() {
-        egui::__run_test_ui(|ui| {
-            let nothing = layout(ui.ctx(), &[]);
-            assert!(nothing.is_empty());
-            assert_eq!(nothing.to_text(), "");
+        let nothing = layout(&[]);
+        assert!(nothing.is_empty());
+        assert_eq!(nothing.to_text(), "");
 
-            let blank = layout(
-                ui.ctx(),
-                &[Line {
-                    spans: Vec::new(),
-                    fill_to_eol: None,
-                }],
-            );
-            assert_eq!(blank.is_empty(), blank.to_text().is_empty());
-            assert!(blank.is_empty());
+        let blank = layout(&[Line {
+            spans: Vec::new(),
+            fill_to_eol: None,
+        }]);
+        assert_eq!(blank.is_empty(), blank.to_text().is_empty());
+        assert!(blank.is_empty());
 
-            let many = layout(ui.ctx(), &numbered_rows(PREPARED_CHUNK_ROWS * 2 + 3));
-            assert_eq!(many.is_empty(), many.to_text().is_empty());
-            assert!(!many.is_empty());
-        });
+        let many = layout(&numbered_rows(PREPARED_CHUNK_ROWS * 2 + 3));
+        assert_eq!(many.is_empty(), many.to_text().is_empty());
+        assert!(!many.is_empty());
     }
 
     #[test]
@@ -1336,19 +1768,53 @@ mod tests {
             // Deliberately not a multiple, so the last chunk is short and the
             // arithmetic cannot be `index * PREPARED_CHUNK_ROWS` by luck.
             let rows = numbered_rows(PREPARED_CHUNK_ROWS * 2 + 7);
-            let prepared = layout(ui.ctx(), &rows);
+            let prepared = layout(&rows);
             let text = prepared.to_text();
             let lines = text.lines().collect::<Vec<_>>();
 
             assert_eq!(prepared.chunk_count(), 3);
             let mut counted = 0;
-            for chunk in &prepared.chunks {
-                let first = chunk.galley.text().lines().next().unwrap();
-                assert_eq!(lines[chunk.first_row], first);
-                counted += chunk.galley.text().lines().count();
+            for (index, chunk) in prepared.chunks.iter().enumerate() {
+                // What AccessKit is told and what is painted are one text.
+                let shaped = prepared.shaped_chunk(ui.ctx(), index);
+                assert_eq!(shaped.galley.text(), prepared.chunk_text(index));
+                let first = shaped.galley.text().lines().next().unwrap();
+                assert_eq!(lines[chunk.rows.start], first);
+                counted += shaped.galley.text().lines().count();
+                assert_eq!(shaped.galley.size().y, chunk.height);
             }
             assert_eq!(counted, rows.len());
         });
+    }
+
+    #[test]
+    fn a_row_is_a_whole_number_of_physical_pixels() {
+        assert_eq!(row_height(17.0, 2.0), 17.0);
+        assert_eq!(row_height(32.64, 2.0), 32.5);
+        assert_eq!(row_height(16.32, 2.0), 16.5);
+        assert_eq!(row_height(16.32, 1.0), 16.0);
+        // And epaint agrees, which is the point: a chunk of rows at that height
+        // is exactly as tall as the arithmetic placing the next one says.
+        let ctx = Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let rows = numbered_rows(PREPARED_CHUNK_ROWS);
+        let height = row_height(16.32, 2.0);
+        let prepared = prepare_layout(
+            Arc::from(rows.as_slice()),
+            0..rows.len(),
+            Sections::Whole,
+            16,
+            FontId::monospace(12.0),
+            &palette(),
+            height,
+        );
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            assert_eq!(
+                prepared.shaped_chunk(ui.ctx(), 0).galley.size().y,
+                PREPARED_CHUNK_ROWS as f32 * height
+            );
+        });
+        output.textures_delta.clear();
     }
 
     #[test]
@@ -1362,55 +1828,59 @@ mod tests {
 
     #[test]
     fn find_reports_the_same_rows_across_a_chunk_boundary() {
-        egui::__run_test_ui(|ui| {
-            let n = PREPARED_CHUNK_ROWS;
-            let wanted = [0, n - 1, n, n + 3];
-            let rows = (0..n + 5)
-                .map(|row| Line {
-                    spans: vec![span(
-                        if wanted.contains(&row) {
-                            "needle"
-                        } else {
-                            "plain"
-                        },
-                        None,
-                    )],
-                    fill_to_eol: None,
-                })
-                .collect::<Vec<_>>();
-            let prepared = layout(ui.ctx(), &rows);
+        let n = PREPARED_CHUNK_ROWS;
+        let wanted = [0, n - 1, n, n + 3];
+        let mut rows = (0..n + 5)
+            .map(|row| Line {
+                spans: vec![span(
+                    if wanted.contains(&row) {
+                        "needle"
+                    } else {
+                        "plain"
+                    },
+                    None,
+                )],
+                fill_to_eol: None,
+            })
+            .collect::<Vec<_>>();
+        // A match split across two styled spans, and two matches in one row:
+        // found row by row, both have to come out as they do from the text.
+        rows[5].spans = vec![span("nee", None), span("dle needle", None)];
+        let prepared = layout(&rows);
 
-            assert_eq!(prepared.chunk_count(), 2);
-            assert_eq!(prepared.matching_rows("needle"), wanted.to_vec());
-            // A dropped or doubled seam break would move every index past the
-            // seam by one, and this is what would catch it.
-            assert_eq!(
-                prepared.matching_rows("needle"),
-                line_offsets(&prepared.to_text(), "needle")
-            );
-        });
+        assert_eq!(prepared.chunk_count(), 2);
+        assert_eq!(
+            prepared.matching_rows("needle"),
+            vec![0, 5, 5, n - 1, n, n + 3]
+        );
+        // A dropped or doubled seam break would move every index past the
+        // seam by one, and this is what would catch it.
+        assert_eq!(
+            prepared.matching_rows("needle"),
+            line_offsets(&prepared.to_text(), "needle")
+        );
     }
 
     #[test]
     fn a_selection_outside_the_diff_does_not_stop_culling() {
         egui::__run_test_ui(|ui| {
-            let prepared = layout(ui.ctx(), &numbered_rows(PREPARED_CHUNK_ROWS * 8));
+            let prepared = layout(&numbered_rows(PREPARED_CHUNK_ROWS * 8));
             let ids = (0..8).map(|i| chunk_id(ui, i)).collect::<Vec<_>>();
             let top = prepared.chunks[3].top + 8.0;
             let viewport = Rect::from_min_size(pos2(0.0, top), Vec2::new(800.0, 40.0));
-            let plan = prepared.mount_plan(viewport, SelectionEnds::default(), false);
+            let plan = prepared.mount_plan(ui, viewport, SelectionEnds::default(), false);
 
             let drawn = (0..8)
                 .filter(|&i| plan.drawn(i, ids[i]))
                 .collect::<Vec<_>>();
-            assert_eq!(drawn, vec![2, 3, 4]);
+            assert_eq!(drawn, vec![2, 3]);
         });
     }
 
     #[test]
     fn an_offscreen_selection_end_stays_mounted() {
         egui::__run_test_ui(|ui| {
-            let prepared = layout(ui.ctx(), &numbered_rows(PREPARED_CHUNK_ROWS * 8));
+            let prepared = layout(&numbered_rows(PREPARED_CHUNK_ROWS * 8));
             let ids = (0..8).map(|i| chunk_id(ui, i)).collect::<Vec<_>>();
             let top = prepared.chunks[3].top + 8.0;
             let viewport = Rect::from_min_size(pos2(0.0, top), Vec2::new(800.0, 40.0));
@@ -1419,12 +1889,12 @@ mod tests {
                 anchor: Some(ids[0]),
                 focus: Some(ids[7]),
             };
-            let plan = prepared.mount_plan(viewport, straddling, false);
+            let plan = prepared.mount_plan(ui, viewport, straddling, false);
             assert_eq!(
                 (0..8)
                     .filter(|&i| plan.drawn(i, ids[i]))
                     .collect::<Vec<_>>(),
-                vec![0, 2, 3, 4, 7],
+                vec![0, 2, 3, 7],
                 "both ends, and nothing between them"
             );
 
@@ -1436,12 +1906,12 @@ mod tests {
             };
             let top = prepared.chunks[5].top + 8.0;
             let viewport = Rect::from_min_size(pos2(0.0, top), Vec2::new(800.0, 40.0));
-            let plan = prepared.mount_plan(viewport, above, false);
+            let plan = prepared.mount_plan(ui, viewport, above, false);
             assert_eq!(
                 (0..8)
                     .filter(|&i| plan.drawn(i, ids[i]))
                     .collect::<Vec<_>>(),
-                vec![0, 1, 4, 5, 6]
+                vec![0, 1, 4, 5]
             );
         });
     }
@@ -1449,16 +1919,84 @@ mod tests {
     #[test]
     fn copying_mounts_the_whole_selection() {
         egui::__run_test_ui(|ui| {
-            let prepared = layout(ui.ctx(), &numbered_rows(PREPARED_CHUNK_ROWS * 8));
+            let prepared = layout(&numbered_rows(PREPARED_CHUNK_ROWS * 8));
             let ids = (0..8).map(|i| chunk_id(ui, i)).collect::<Vec<_>>();
             let top = prepared.chunks[3].top + 8.0;
             let viewport = Rect::from_min_size(pos2(0.0, top), Vec2::new(800.0, 40.0));
-            let plan = prepared.mount_plan(viewport, SelectionEnds::default(), true);
+            let drawn = |ends: SelectionEnds| {
+                let plan = prepared.mount_plan(ui, viewport, ends, true);
+                (0..8)
+                    .filter(|&i| plan.drawn(i, ids[i]))
+                    .collect::<Vec<_>>()
+            };
 
-            assert!(
-                (0..8).all(|i| plan.drawn(i, ids[i])),
+            assert_eq!(
+                drawn(SelectionEnds {
+                    anchor: Some(ids[6]),
+                    focus: Some(ids[1]),
+                }),
+                vec![1, 2, 3, 4, 5, 6],
                 "a culled middle would truncate the clipboard silently"
             );
+            assert_eq!(
+                drawn(SelectionEnds {
+                    anchor: None,
+                    focus: Some(ids[5]),
+                }),
+                (0..8).collect::<Vec<_>>(),
+                "an end outside the diff could be on either side of it"
+            );
+            assert_eq!(
+                drawn(SelectionEnds::default()),
+                vec![2, 3],
+                "a selection wholly outside the diff does not shape all of it"
+            );
+        });
+    }
+
+    /// The same for merge mode's control rows: a culled one is not drawn at
+    /// all, so one holding an end, or lying between the ends of a selection
+    /// being copied, has to be drawn wherever it is.
+    #[test]
+    fn a_control_row_holding_a_selection_end_stays_drawn() {
+        egui::__run_test_ui(|ui| {
+            let spans = spaced_spans(50, 2);
+            let rows = numbered_rows(spans.last().unwrap().end);
+            let prepared = layout_with(
+                &rows,
+                Sections::Hunks {
+                    spans: &spans,
+                    control_height: 32.0,
+                },
+                16,
+            );
+            let viewport = Rect::from_min_size(pos2(0.0, 8.0), Vec2::new(800.0, 64.0));
+            let drawn = |ends: SelectionEnds, copying: bool| {
+                let plan = prepared.mount_plan(ui, viewport, ends, copying);
+                let controls = (0..50)
+                    .filter(|&s| plan.control_drawn(s, &prepared.sections[s], ui))
+                    .collect::<Vec<_>>();
+                let chunks = (0..50)
+                    .filter(|&i| plan.drawn(i, chunk_id(ui, i)))
+                    .collect::<Vec<_>>();
+                (controls, chunks)
+            };
+
+            let (controls, _) = drawn(SelectionEnds::default(), false);
+            assert_eq!(controls, vec![0, 1, 2], "the viewport and its overscan");
+            let far = SelectionEnds {
+                anchor: Some(control_id(ui, 40)),
+                focus: Some(control_id(ui, 40)),
+            };
+            assert_eq!(drawn(far, false).0, vec![0, 1, 2, 40]);
+
+            let spanning = SelectionEnds {
+                anchor: Some(control_id(ui, 20)),
+                focus: Some(chunk_id(ui, 23)),
+            };
+            let (controls, chunks) = drawn(spanning, true);
+            assert_eq!(controls, vec![0, 1, 2, 20, 21, 22, 23]);
+            assert_eq!(chunks, vec![0, 1, 20, 21, 22, 23]);
         });
     }
 
@@ -1470,10 +2008,10 @@ mod tests {
         let mut sentinel = None;
         let pass = |input: RawInput, sentinel: &mut Option<Id>| {
             let mut output = ctx.run_ui(input, |ui| {
-                let prepared = layout(ui.ctx(), &rows);
+                let prepared = layout(&rows);
                 diff_region(ui);
                 let viewport = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 400.0));
-                prepared.show_viewport(ui, viewport, 7.0);
+                show(&prepared, ui, viewport, 7.0);
                 *sentinel = Some(ui.button("after").id);
             });
             output.textures_delta.clear();
@@ -1500,19 +2038,26 @@ mod tests {
     fn the_diff_is_one_tab_stop_in_merge_mode_too() {
         let ctx = Context::default();
         ctx.enable_accesskit();
-        let hunks = (0..4)
-            .map(|hunk| numbered_rows(6 + hunk))
-            .collect::<Vec<_>>();
+        let spans = (0..4).map(|n| n * 10..n * 10 + 6 + n).collect::<Vec<_>>();
+        let rows = numbered_rows(40);
         let mut sentinel = None;
         let pass = |input: RawInput, sentinel: &mut Option<Id>| {
             let mut output = ctx.run_ui(input, |ui| {
+                let prepared = layout_with(
+                    &rows,
+                    Sections::Hunks {
+                        spans: &spans,
+                        control_height: 24.0,
+                    },
+                    16,
+                );
                 diff_region(ui);
-                for rows in &hunks {
-                    // Stands in for the hunk control row merge mode draws in
-                    // place of delta's header.
+                let viewport = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 400.0));
+                // Stands in for the hunk control row merge mode draws in place
+                // of delta's header.
+                prepared.show_viewport(ui, viewport, 7.0, |ui, _| {
                     ui.label("take");
-                    layout(ui.ctx(), rows).show(ui, 7.0);
-                }
+                });
                 *sentinel = Some(ui.button("after").id);
             });
             output.textures_delta.clear();
@@ -1525,14 +2070,14 @@ mod tests {
             .iter()
             .find(|(_, node)| node.label() == Some(DIFF_SCROLL_LABEL))
             .expect("the merge diff scroll view");
-        let owned = scroll
-            .1
-            .children()
-            .iter()
-            .filter_map(|id| initial.nodes.iter().find(|(node_id, _)| node_id == id))
-            .flat_map(|(_, node)| node.children())
-            .copied()
-            .collect::<Vec<_>>();
+        let node = |id: &accesskit::NodeId| {
+            initial
+                .nodes
+                .iter()
+                .find(|(node_id, _)| node_id == id)
+                .map(|(_, node)| node)
+        };
+        let owned = scroll.1.children().to_vec();
         let row_chunks = initial
             .nodes
             .iter()
@@ -1542,10 +2087,27 @@ mod tests {
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        assert_eq!(row_chunks.len(), hunks.len());
+        assert_eq!(row_chunks.len(), spans.len());
         assert!(
             row_chunks.iter().all(|id| owned.contains(id)),
             "merge-mode chunk labels are outside the diff scroll view",
+        );
+        // In document order: each control row, then the rows it acts on.
+        let takes = owned
+            .iter()
+            .map(|id| {
+                node(id).is_some_and(|row| {
+                    row.children()
+                        .iter()
+                        .filter_map(node)
+                        .any(|child| child.label() == Some("take") || child.value() == Some("take"))
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            takes,
+            [true, false].repeat(spans.len()),
+            "control rows are missing from the scroll view or out of order",
         );
 
         let _ = pass(with_events(vec![key_press(Key::Tab)]), &mut sentinel);
@@ -1565,12 +2127,13 @@ mod tests {
         // the id was re-registered rather than merely not yet reaped.
         for _ in 0..2 {
             let mut output = ctx.run_ui(small_screen(), |ui| {
-                let prepared = layout(ui.ctx(), &rows);
+                let prepared = layout(&rows);
                 diff_region(ui);
                 // Parked at the bottom, so chunk 0 -- and every chunk but the
                 // last -- is culled.
                 let top = prepared.chunks[7].top;
-                prepared.show_viewport(
+                show(
+                    &prepared,
                     ui,
                     Rect::from_min_size(pos2(0.0, top), Vec2::new(800.0, 40.0)),
                     7.0,
@@ -1601,10 +2164,10 @@ mod tests {
                 small_screen()
             };
             let mut output = ctx.run_ui(input, |ui| {
-                let prepared = layout(ui.ctx(), &rows);
+                let prepared = layout(&rows);
                 let out = egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
                     diff_region(ui);
-                    prepared.show_viewport(ui, viewport, 7.0);
+                    show(&prepared, ui, viewport, 7.0);
                 });
                 offset = out.state.offset.y;
             });
@@ -1625,9 +2188,10 @@ mod tests {
         ];
         for input in passes {
             let mut output = ctx.run_ui(input, |ui| {
-                let prepared = layout(ui.ctx(), &rows);
+                let prepared = layout(&rows);
                 diff_region(ui);
-                prepared.show_viewport(
+                show(
+                    &prepared,
                     ui,
                     Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 400.0)),
                     7.0,
@@ -1652,9 +2216,10 @@ mod tests {
         let mut chunk = None;
         let pass = |input: RawInput, key: &mut Option<Id>, chunk: &mut Option<Id>| {
             let mut output = ctx.run_ui(input, |ui| {
-                let prepared = layout(ui.ctx(), &rows);
+                let prepared = layout(&rows);
                 diff_region(ui);
-                prepared.show_viewport(
+                show(
+                    &prepared,
                     ui,
                     Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 400.0)),
                     7.0,
@@ -1720,9 +2285,8 @@ mod tests {
         }];
         let mut at = pos2(0.0, 0.0);
         let mut output = ctx.run_ui(small_screen(), |ui| {
-            let prepared = layout(ui.ctx(), &rows);
-            let response = prepared.show(ui, 7.0);
-            at = response.rect.left_top() + Vec2::new(6.0, 6.0);
+            at = ui.cursor().left_top() + Vec2::new(6.0, 6.0);
+            show(&layout(&rows), ui, ui.max_rect(), 7.0);
         });
         output.textures_delta.clear();
 
@@ -1735,22 +2299,12 @@ mod tests {
         let mut icon = CursorIcon::Default;
         for _ in 0..2 {
             let mut output = ctx.run_ui(with_events(vec![Event::PointerMoved(at)]), |ui| {
-                let prepared = layout(ui.ctx(), &rows);
-                prepared.show(ui, 7.0);
+                show(&layout(&rows), ui, ui.max_rect(), 7.0);
             });
             icon = output.platform_output.cursor_icon;
             output.textures_delta.clear();
         }
         assert_eq!(icon, CursorIcon::PointingHand);
-    }
-
-    fn initialized_layout(ctx: &Context, rows: &[Line]) -> PreparedLayout {
-        let mut prepared = None;
-        let mut output = ctx.run_ui(Default::default(), |ui| {
-            prepared = Some(layout(ui.ctx(), rows));
-        });
-        output.textures_delta.clear();
-        prepared.expect("the layout was prepared")
     }
 
     /// One pass of the production shape: the region, then every chunk, with a
@@ -1771,7 +2325,8 @@ mod tests {
     ) -> accesskit::TreeUpdate {
         let mut output = ctx.run_ui(input, |ui| {
             diff_region(ui);
-            prepared.show_viewport(
+            show(
+                prepared,
                 ui,
                 Rect::from_min_size(pos2(0.0, viewport_top), Vec2::new(800.0, 400.0)),
                 7.0,
@@ -1789,7 +2344,7 @@ mod tests {
         let ctx = Context::default();
         ctx.enable_accesskit();
         let rows = numbered_rows(PREPARED_CHUNK_ROWS * 8);
-        let prepared = initialized_layout(&ctx, &rows);
+        let prepared = layout(&rows);
         let update = accesskit_pass(&ctx, &prepared, small_screen());
 
         let labels = update
@@ -1838,10 +2393,11 @@ mod tests {
         let ctx = Context::default();
         ctx.enable_accesskit();
         let rows = numbered_rows(PREPARED_CHUNK_ROWS * 8);
-        let prepared = initialized_layout(&ctx, &rows);
+        let prepared = layout(&rows);
         let mut output = ctx.run_ui(small_screen(), |ui| {
             diff_region(ui);
-            prepared.show_viewport(
+            show(
+                &prepared,
                 ui,
                 Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 400.0)),
                 7.0,
@@ -1874,7 +2430,7 @@ mod tests {
         let ctx = Context::default();
         ctx.enable_accesskit();
         let rows = numbered_rows(PREPARED_CHUNK_ROWS * 8);
-        let prepared = initialized_layout(&ctx, &rows);
+        let prepared = layout(&rows);
         let update = accesskit_pass(&ctx, &prepared, small_screen());
 
         let runs = update
@@ -1896,7 +2452,7 @@ mod tests {
         let ctx = Context::default();
         ctx.enable_accesskit();
         let rows = numbered_rows(PREPARED_CHUNK_ROWS * 8);
-        let prepared = initialized_layout(&ctx, &rows);
+        let prepared = layout(&rows);
         let update = accesskit_pass(&ctx, &prepared, small_screen());
 
         let chunks = update
@@ -1925,11 +2481,11 @@ mod tests {
         // either of them mutably could not be read between the two passes.
         let pass = |input: RawInput, last: &mut Option<Id>, offset: &mut f32| {
             let mut output = ctx.run_ui(input, |ui| {
-                let prepared = layout(ui.ctx(), &rows);
+                let prepared = layout(&rows);
                 let out = egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
                     diff_region(ui);
                     *last = Some(chunk_id(ui, 7));
-                    prepared.show_viewport(ui, viewport, 7.0);
+                    show(&prepared, ui, viewport, 7.0);
                 });
                 *offset = out.state.offset.y;
             });
@@ -1970,7 +2526,7 @@ mod tests {
             spans: vec![span(secret, None)],
             fill_to_eol: None,
         }];
-        let prepared = initialized_layout(&ctx, &rows);
+        let prepared = layout(&rows);
         let update = accesskit_pass(&ctx, &prepared, small_screen());
 
         let named = |what: &str| {
@@ -2017,7 +2573,7 @@ mod tests {
         let ctx = Context::default();
         ctx.enable_accesskit();
         let rows = numbered_rows(PREPARED_CHUNK_ROWS * 128);
-        let prepared = initialized_layout(&ctx, &rows);
+        let prepared = layout(&rows);
 
         let initial = accesskit_pass(&ctx, &prepared, small_screen());
         let initial_bytes = initial
@@ -2046,10 +2602,11 @@ mod tests {
             .map(str::len)
             .sum::<usize>();
 
-        // One visible chunk, one overscan chunk, and at most the same set from
-        // the previous pass. This bound is independent of the 128-chunk input.
+        // A 400 px viewport and its overscan span 1,200 px, which touches at
+        // most two 3,072 px chunks; the previous pass's set can add two more.
+        // This bound is independent of the 128-chunk input.
         assert!(
-            submitted_chunks.len() <= 2 * (1 + 2 * VIEWPORT_OVERSCAN_CHUNKS),
+            submitted_chunks.len() <= 4,
             "submitted {} of {} chunks again",
             submitted_chunks.len(),
             prepared.chunk_count(),

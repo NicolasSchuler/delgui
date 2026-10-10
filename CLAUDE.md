@@ -45,7 +45,7 @@ crates/delgui-core   no GUI dependencies — kept frontend-agnostic so a ratatui
   watch.rs
 crates/delgui        egui/eframe frontend
   app.rs                 all state + the eframe::App::ui loop
-  render.rs              parsed lines -> egui LayoutJobs (one, or one per hunk)
+  render.rs              parsed lines -> a layout placed by arithmetic, shaped where it is seen
   theme.rs               colour/spacing/type tokens -> egui Visuals and Style
   fonts.rs               font discovery, installation, and monospace probing
   ui.rs                  the styled controls app.rs is assembled from
@@ -60,8 +60,9 @@ docs/research.md         measured findings; every non-obvious decision below tra
 
 The render path is: `Panel` → `Input::Buffer`/`Input::Path` → `Delta::diff` (a `git diff
 --no-index` subprocess) → `Delta::render_patch` (a delta subprocess) → `ansi::parse` → `Vec<Line>`
-→ `render::to_layout_job` → egui. Rendering happens on a spawned thread; results come back over an
-`mpsc` channel as a `Job` and land in `App::cache`, keyed by panel index.
+→ `render::prepare_layout` → egui, which shapes only the rows near the viewport. Rendering happens
+on a spawned thread; results come back over an `mpsc` channel as a `Job` and land in `App::cache`,
+keyed by panel index.
 
 ### Constraints that look arbitrary but are not
 
@@ -168,16 +169,29 @@ Each of these is load-bearing and pinned by a test or documented in `docs/resear
   by `a_kept_marked_row_is_the_header_without_its_mark`: delta sizes the decoration rule to the
   header text, so it comes out as wide as the label made it. `prepare_rows` re-trims the body
   afterwards, because dropping a marker can expose a blank context line the marker was hiding.
-- **A plain diff is drawn as one block; only merge mode cuts it up.** `prepare_shown_diff` builds
-  the per-hunk layouts only while merging, since laying every hunk out a second time would double
-  the layout cost of the longest diffs. Where a hunk was drawn is arithmetic there instead: one
-  rendered line is one laid-out row — delta does the wrapping and `TextWrapMode::Extend` stops egui
-  redoing it — which is the same assumption find already makes.
+- **Nothing in the diff is shaped until it is near the screen.** `render::prepare_layout` is
+  arithmetic only. One rendered line is one laid-out row — delta does the wrapping and an
+  unbounded wrap width stops egui redoing it — and every row is `render::row_height` tall: the line
+  height snapped to the physical pixel grid, because epaint rounds each row there and a height off
+  the grid drifts from what is drawn (0.18 px a row at 12 pt and 2×). So where every chunk, hunk
+  and find match sits is known without shaping a glyph, and each frame shapes only the 192-row
+  chunks within one viewport height of the screen and drops galleys more than four away. Shaping
+  the whole diff up front cost the UI thread 0.87 s at 41,200 rows and 3.5 s at 163,000, and held
+  1.4 GB for a pair of 1 MB files; the first frame is now ~8 ms and +7 MB at either size
+  (`research.md` §21). Find, *Copy diff* and the AccessKit value of an undrawn chunk read the
+  parsed rows — `Cached::lines` is an `Arc<[Line]>` the layout shares — never a galley, which may
+  not exist. Merge mode is the same layout cut into one section per hunk, each below a control row
+  whose height is measured (`hunk_control_height`), and only the control rows near the viewport
+  are drawn: at 4,208 hunks a frame went from 11.7 ms to 0.3 ms. `hunk_boxes`, the "n of m"
+  counter and Previous/Next still cover every hunk, by arithmetic; a culled control is simply
+  absent from the AccessKit tree until ⌘⌥↓ brings it near. A selection end in a chunk *or* a
+  control row keeps that one drawn wherever it is, and ⌘C mounts everything between the two ends —
+  which relies on nothing selectable being drawn after the diff; the stale pill opts out for that.
 - **Difference navigation works in every comparison, and from the keyboard.** ⌘⌥↓/⌘⌥↑ walk the
   differences and ⌘G/⌘⇧G walk the search matches; both are pending moves (`pending_hunk_move`,
-  `pending_find_move`) claimed by `diff_area` on the next frame, because the frame that draws the
-  diff is the one that knows how many there are and where. F7, which is what the IDEs bind, is not
-  available: `no_binding_is_a_bare_keypress` forbids it, and the panels are text fields.
+  `pending_find_move`) claimed by `diff_area` on the next frame, because that is where the
+  prepared layout — how many there are, and where — is current. F7, which is what the IDEs bind,
+  is not available: `no_binding_is_a_bare_keypress` forbids it, and the panels are text fields.
 - **Ignoring differences is reading, and merge mode is not reading.** `Options` carries the diff
   step's own ignores — `whitespace` (`-b`/`-w`), `ignore_blank_lines`, `ignore_cr_at_eol`,
   `ignore_matching` — and `effective_options` forces every one of them off while merging, alongside
@@ -304,7 +318,8 @@ one contiguous change).
 One thing that list used to hold and no longer should:
 
 - **Search in the diff is built.** ⌘F opens a find bar over the *rendered* text — a literal,
-  case-sensitive substring scan (`find_line_offsets`) that counts matches, walks them with
-  Previous/Next, and scrolls to the matching line by multiplying its index by the line height. It
+  case-sensitive substring scan of the parsed rows (`PreparedLayout::matching_rows`) that counts
+  matches, walks them with Previous/Next, and scrolls to the matching line with
+  `PreparedLayout::row_top` — arithmetic, so the row need never have been shaped. It
   does not highlight the match, and it has no regex or case toggle. Being able to do this at all is
   half of why the architecture parses ANSI rather than embedding a terminal.

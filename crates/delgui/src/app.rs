@@ -550,7 +550,9 @@ struct RenderKey {
 
 struct Cached {
     key: RenderKey,
-    lines: Vec<Line>,
+    /// Shared with the prepared layout, which reads the text out of these
+    /// rather than keeping a copy of its own.
+    lines: Arc<[Line]>,
     /// Each difference and the rows delta drew for it, for a render made in
     /// merge mode where the two lined up. Empty otherwise, and empty is what
     /// makes the take controls absent rather than wrong.
@@ -571,13 +573,15 @@ struct LayoutStyleKey {
     background: Color32,
     line_height: f32,
     pixels_per_point: f32,
+    /// How tall each take control is, while merge mode cuts the diff at its
+    /// hunks; `None` for a diff drawn as one block.
+    control_height: Option<f32>,
 }
 
 struct PreparedDiff {
     render_key: RenderKey,
     style: LayoutStyleKey,
-    whole: render::PreparedLayout,
-    hunks: Vec<render::PreparedLayout>,
+    layout: render::PreparedLayout,
 }
 
 /// What a panel's ⋯ menu asked for, applied once its borrows are over. A menu
@@ -675,6 +679,7 @@ fn render_job(
     // here; `keep` decides whether the one delta drew stays as the header.
     let keep = !merging && opts.hunk_headers;
     let (lines, located) = merge::prepare_rows(ansi::body(&rendered), hunks.len(), keep);
+    let lines = Arc::<[Line]>::from(lines);
     if !merging {
         return Ok(Cached {
             key,
@@ -826,14 +831,20 @@ pub struct App {
     undo: VecDeque<ResultUndo>,
     redo: Vec<ResultUndo>,
     undo_bytes: usize,
-    /// Where each hunk was drawn, as (top, height) relative to the start of the
-    /// diff's content, so a take can put the viewport back where it was.
     /// Set when git launched the app to resolve a conflict, which changes two
     /// things: where a save goes, and what the process exit means.
     mergetool: Option<MergeTool>,
     mergetool_load_failed: bool,
     initial_merge_target: Option<MergeTargetAtLaunch>,
+    /// Where each hunk is drawn, as (top, height) relative to the start of the
+    /// diff's content, so a take can put the viewport back where it was and
+    /// Previous/Next change know where to go. Arithmetic on the prepared
+    /// layout, so it covers every hunk, drawn or not.
     hunk_boxes: Vec<(f32, f32)>,
+    /// How tall a take control row came out when last drawn. Merge mode places
+    /// every hunk by arithmetic, culled controls included, so it has to know
+    /// before drawing any; until one has been drawn it is estimated.
+    hunk_control_height: Option<f32>,
     hunk_cursor: usize,
     /// A jump asked for by the keyboard, waiting for the frame that knows how
     /// many differences there are and where they were drawn.
@@ -1091,6 +1102,7 @@ impl App {
             redo: Vec::new(),
             undo_bytes: 0,
             hunk_boxes: Vec::new(),
+            hunk_control_height: None,
             hunk_cursor: 0,
             pending_hunk_move: 0,
             pending_find_move: 0,
@@ -3726,25 +3738,32 @@ impl App {
         }
     }
 
+    /// Make sure `prepared` describes the comparison on screen, and refresh
+    /// where every hunk is drawn.
+    ///
+    /// Cheap at any size: preparing is arithmetic over row counts, and shaping
+    /// is left to the frames that draw the rows (see `render::PreparedLayout`).
+    /// Which is also why a change of control height can afford to re-prepare.
     fn prepare_shown_diff(
         &mut self,
         ctx: &egui::Context,
         font: &egui::FontId,
         palette: &Palette,
         line_height: f32,
+        control_height: f32,
     ) {
-        // Only merge mode draws the diff hunk by hunk. A plain render is one
-        // block, and laying every hunk out a second time to reach it would
-        // double the layout cost of the longest diffs.
-        let merging = self.merging();
         let Some(cached) = self.cache.get(&self.shown) else {
             // `diff_area` calls this first and is called unconditionally from
             // the central panel, so dropping the slot here is what stops a
             // layout outliving the comparison it was built for by even a frame.
             self.prepared = None;
             self.find_matches = None;
+            self.hunk_boxes.clear();
             return;
         };
+        // Only merge mode cuts the diff at its hunks, to put a take control
+        // above each. Everything else is one block with nothing between rows.
+        let cut = self.merging() && !cached.hunks.is_empty();
         let style = LayoutStyleKey {
             font: font.clone(),
             ansi16: palette.ansi16,
@@ -3752,6 +3771,7 @@ impl App {
             background: palette.background,
             line_height,
             pixels_per_point: ctx.pixels_per_point(),
+            control_height: cut.then_some(control_height),
         };
         // `RenderKey` carries `shown`, so a matching key already implies a
         // matching panel; the slot needs no index of its own.
@@ -3762,38 +3782,48 @@ impl App {
         {
             return;
         }
-        let rows = ansi::body(&cached.lines);
-        let whole = render::prepare_layout(
-            ctx,
-            rows,
+        let spans = cached
+            .hunks
+            .iter()
+            .map(|(_, span)| span.clone())
+            .collect::<Vec<_>>();
+        let layout = render::prepare_layout(
+            cached.lines.clone(),
+            ansi::body_range(&cached.lines),
+            if cut {
+                render::Sections::Hunks {
+                    spans: &spans,
+                    control_height,
+                }
+            } else {
+                render::Sections::Whole
+            },
             cached.columns,
             font.clone(),
             palette,
             line_height,
         );
-        let hunks = if merging {
-            cached
-                .hunks
-                .iter()
-                .map(|(_, span)| {
-                    render::prepare_layout(
-                        ctx,
-                        &rows[span.clone()],
-                        cached.columns,
-                        font.clone(),
-                        palette,
-                        line_height,
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // In merge mode a hunk's box starts at its control row. Otherwise it is
+        // just the rows -- whether delta drew a header above them or not, the
+        // header is one of them.
+        self.hunk_boxes = spans
+            .iter()
+            .enumerate()
+            .map(|(n, span)| {
+                if cut {
+                    layout.section_bounds(n)
+                } else {
+                    layout
+                        .row_top(span.start)
+                        .map(|top| (top, span.len() as f32 * line_height))
+                }
+                .unwrap_or_default()
+            })
+            .collect();
         self.prepared = Some(PreparedDiff {
             render_key: cached.key.clone(),
             style,
-            whole,
-            hunks,
+            layout,
         });
         self.find_matches = None;
     }
@@ -3831,29 +3861,32 @@ impl App {
 
         let font = self.mono_font();
         let palette = Palette::from_tokens(&t);
-        let line_height = self.settings.mono_pt * 1.36;
-        self.prepare_shown_diff(ctx, &font, &palette, line_height);
+        // On the pixel grid, because every position in the diff is a multiple
+        // of it -- see `render::row_height`.
+        let line_height = render::row_height(self.settings.mono_pt * 1.36, ctx.pixels_per_point());
+        let control_height = self
+            .hunk_control_height
+            .unwrap_or_else(|| estimated_hunk_control_height(ui));
+        self.prepare_shown_diff(ctx, &font, &palette, line_height, control_height);
         let restore = self.restore_offset.take();
-        let merging = self.merging();
         let fresh = self.is_fresh();
         // Claimed before anything borrows `self`, and defaulted to the keyboard's
         // pending move so a chord and a button click go through one path.
         let mut move_hunk = std::mem::take(&mut self.pending_hunk_move);
         let mut move_find = std::mem::take(&mut self.pending_find_move);
         let mut find_row = None;
-        let mut find_offset = None;
         let mut take = None;
-        let mut boxes = Vec::new();
+        let mut drawn_control_height = None;
         // Whether the diff owns the keyboard, learned inside the scroll area --
         // which is the only place that knows -- and painted after it.
         let mut focused = false;
         let mut offset = self.diff_offset;
 
         if let Some(prepared) = self.prepared.as_ref()
-            && !prepared.whole.is_empty()
+            && !prepared.layout.is_empty()
         {
-            // From the cache, not from `prepared`: the per-hunk layouts exist
-            // only while merging, and the count is what every render knows.
+            // Every difference, drawn or not: the counter and the walk are over
+            // the whole diff, and merge mode culls only what is off screen.
             let hunk_count = self.cache.get(&self.shown).map_or(0, |c| c.hunks.len());
             let mut close_find = false;
             let mut copy = false;
@@ -3962,7 +3995,7 @@ impl App {
                     },
                 );
             if copy && let Some(prepared) = self.prepared.as_ref() {
-                ctx.copy_text(prepared.whole.to_text());
+                ctx.copy_text(prepared.layout.to_text());
                 self.flash = Some(("Diff copied".into(), Instant::now()));
             }
             if self.show_find {
@@ -3995,7 +4028,7 @@ impl App {
                     {
                         self.find_matches = Some((
                             self.find_query.clone(),
-                            prepared.whole.matching_rows(&self.find_query),
+                            prepared.layout.matching_rows(&self.find_query),
                         ));
                     }
                     let find_lines = &self.find_matches.as_ref().expect("matches computed above").1;
@@ -4072,63 +4105,25 @@ impl App {
                             // thing that may be tinted is the selection over
                             // them, whose default washes out on a diff ground.
                             ui.visuals_mut().selection.bg_fill = t.diff_selection;
-                            // Above the merge/plain branch, and inside the
-                            // viewport closure: that is what makes merge mode
-                            // one tab stop too, puts the region's accessibility
-                            // node in place before the first chunk claims a
-                            // parent, and sends a page-key scroll to *this*
-                            // scroll area.
+                            // Before the layout, and inside the viewport
+                            // closure: that is what makes merge mode one tab
+                            // stop too, puts the region's accessibility node in
+                            // place before the first chunk or control row
+                            // claims a parent, and sends a page-key scroll to
+                            // *this* scroll area.
                             focused = render::diff_region(ui).has_focus();
-                            if !merging || c.hunks.is_empty() {
-                                prepared.whole.show_viewport(ui, viewport, glyph);
-                                find_offset = find_row.map(|row| row as f32 * line_height);
-                                // One rendered line is one laid-out row --
-                                // delta does the wrapping, and `Extend` stops
-                                // egui redoing it -- so where a hunk was drawn
-                                // is arithmetic, and the block does not have to
-                                // be cut up to find out.
-                                boxes.extend(c.hunks.iter().map(|(_, span)| {
-                                    (
-                                        span.start as f32 * line_height,
-                                        span.len() as f32 * line_height,
-                                    )
-                                }));
-                                return;
-                            }
-                            ui.scope_builder(
-                                egui::UiBuilder::new()
-                                    .accessibility_parent(render::diff_region_id()),
-                                |ui| {
-                                    // Zero spacing so the hunks still read as one block
-                                    // with control rows cut into it, rather than as a
-                                    // stack of separate cards. Selection stitches across
-                                    // adjacent labels, so the diff stays copyable whole.
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    let origin = ui.cursor().top();
-                                    for (n, (hunk, span)) in c.hunks.iter().enumerate() {
-                                        let (control, clicked) =
-                                            self.hunk_control(ui, &t, hunk, !stale);
-                                        if clicked {
-                                            take = Some(n);
-                                        }
-                                        let body = prepared.hunks[n].show(ui, glyph);
-                                        if let Some(row) = find_row.filter(|row| span.contains(row)) {
-                                            // Merge controls add height between rendered
-                                            // rows. Use this frame's body position so
-                                            // finds also land correctly after resizing
-                                            // or changing fonts.
-                                            find_offset = Some(
-                                                body.rect.top() - origin
-                                                    + (row - span.start) as f32 * line_height,
-                                            );
-                                        }
-                                        boxes.push((
-                                            control.top() - origin,
-                                            body.rect.bottom() - control.top(),
-                                        ));
-                                    }
-                                },
-                            );
+                            // A plain diff has no control rows, so this is
+                            // never called for one.
+                            prepared.layout.show_viewport(ui, viewport, glyph, |ui, n| {
+                                let Some((hunk, _)) = c.hunks.get(n) else {
+                                    return;
+                                };
+                                let (control, clicked) = self.hunk_control(ui, &t, hunk, !stale);
+                                if clicked {
+                                    take = Some(n);
+                                }
+                                drawn_control_height = Some(control.height());
+                            });
                         });
                         offset = out.state.offset.y;
                         render::scroll_edges(
@@ -4156,10 +4151,29 @@ impl App {
                 }
             });
 
-        self.hunk_boxes = boxes;
         self.diff_offset = offset;
-        if find_offset.is_some() {
-            self.restore_offset = find_offset;
+        // Arithmetic, like every other position in the diff: a find lands on a
+        // row whether or not it has ever been shaped. A match outside every
+        // hunk merge mode draws has nowhere to scroll to.
+        if let Some(top) = find_row.and_then(|row| self.prepared.as_ref()?.layout.row_top(row)) {
+            self.restore_offset = Some(top);
+        }
+        // Measured, not predicted: the control row is a button and a label in
+        // whatever font and spacing the theme has, and every hunk below is
+        // placed by multiplying it. Off by even a pixel, each one would drift
+        // further from where its control was drawn, so a mismatch re-prepares
+        // the layout -- arithmetic, plus shaping what is on screen once more.
+        // Recorded once and then only on a real change, so a measurement that
+        // wobbled in the last bit could not re-prepare on every frame.
+        if let Some(height) = drawn_control_height
+            && self
+                .hunk_control_height
+                .is_none_or(|known| (known - height).abs() > 0.5)
+        {
+            self.hunk_control_height = Some(height);
+            if (height - control_height).abs() > 0.5 {
+                ctx.request_repaint();
+            }
         }
         if let Some(n) = take {
             self.take_hunk(n, ctx);
@@ -4170,7 +4184,9 @@ impl App {
     /// the one control that takes it.
     ///
     /// Left-aligned and immediately above the rows it acts on, so which lines a
-    /// click affects is a matter of looking rather than of remembering.
+    /// click affects is a matter of looking rather than of remembering. Drawn
+    /// only while it is near the viewport; the layout keeps its place either
+    /// way, at the height the last one drawn measured.
     fn hunk_control(
         &self,
         ui: &mut egui::Ui,
@@ -4543,7 +4559,14 @@ impl App {
             .corner_radius(radius::CHIP)
             .inner_margin(Margin::symmetric(10, 5))
             .show(&mut overlay, |ui| {
-                ui.add(egui::Label::new(ui::small(text).color(t.text_secondary)).truncate());
+                // Not selectable: it is drawn after the diff, and the diff's
+                // copy mount relies on nothing selectable coming after it --
+                // see `render::PreparedLayout::mount_plan`.
+                ui.add(
+                    egui::Label::new(ui::small(text).color(t.text_secondary))
+                        .truncate()
+                        .selectable(false),
+                );
             });
     }
 
@@ -6094,6 +6117,20 @@ impl eframe::App for App {
     }
 }
 
+/// What a take control row should measure before one has been drawn: its
+/// button -- at least 22 px, grown to the theme's interact height or to its
+/// text and padding -- plus the 4 px margin above and below it. A first guess
+/// only; `diff_area` uses the measured height once a row has been drawn.
+fn estimated_hunk_control_height(ui: &egui::Ui) -> f32 {
+    let spacing = ui.spacing();
+    let button = spacing
+        .interact_size
+        .y
+        .max(22.0)
+        .max(ui.text_style_height(&TextStyle::Small) + 2.0 * spacing.button_padding.y);
+    button + 8.0
+}
+
 /// Where a difference sits, in terms of the buffer being built rather than in
 /// `@@` coordinates -- with git's own note of the enclosing function, which it
 /// names better than any heuristic here would.
@@ -7367,7 +7404,7 @@ mod tests {
             .collect::<String>();
         app.cache.insert(app.shown, Cached {
             key: app.current_key(),
-            lines: ansi::parse(text.as_bytes()),
+            lines: ansi::parse(text.as_bytes()).into(),
             columns: app.columns,
             hunks: Vec::new(),
             problem: None,
@@ -7410,7 +7447,7 @@ mod tests {
         app.find_query = "target".into();
         let key = app.current_key();
         app.cache.insert(app.shown, Cached {
-            key, lines: ansi::parse(b"target\nother\ntarget\n"),
+            key, lines: ansi::parse(b"target\nother\ntarget\n").into(),
             columns: app.columns, hunks: Vec::new(), problem: None,
         });
         let ctx = egui::Context::default();
@@ -7435,7 +7472,7 @@ mod tests {
         app.show_find = true;
         app.find_query = "absent".into();
         app.cache.insert(app.shown, Cached {
-            key: app.current_key(), lines: ansi::parse(b"present\n"),
+            key: app.current_key(), lines: ansi::parse(b"present\n").into(),
             columns: app.columns, hunks: Vec::new(), problem: None,
         });
         let ctx = egui::Context::default();
@@ -7470,7 +7507,7 @@ mod tests {
                     }
                 })
                 .collect::<String>();
-            app.cache.get_mut(&1).unwrap().lines = ansi::parse(text.as_bytes());
+            app.cache.get_mut(&1).unwrap().lines = ansi::parse(text.as_bytes()).into();
             app.show_find = true;
             let ctx = egui::Context::default();
             ctx.set_fonts(crate::fonts::definitions(None, None, None));
@@ -7491,6 +7528,200 @@ mod tests {
             }
             assert!((app.diff_offset - expected).abs() < 1.0);
         }
+    }
+
+    /// `rows` numbered rows, rendered and cached for the shown pair.
+    fn cache_long_diff(app: &mut App, rows: usize, hunks: Vec<(Hunk, Range<usize>)>) {
+        let text = (0..rows).map(|i| format!("row {i}\n")).collect::<String>();
+        app.cache.insert(app.shown, Cached {
+            key: app.current_key(),
+            lines: ansi::parse(text.as_bytes()).into(),
+            columns: app.columns,
+            hunks,
+            problem: None,
+        });
+    }
+
+    fn diff_test_context(app: &App) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        ctx
+    }
+
+    fn shaped_chunks(app: &App) -> Vec<Range<usize>> {
+        app.prepared.as_ref().expect("a prepared diff").layout.shaped_chunks()
+    }
+
+    /// The first frame of a long diff shapes the rows on screen and a viewport
+    /// either side -- where it used to shape all of them, 0.9 s and 1.4 GB for
+    /// 41,200 rows -- and jumping to the end shapes the end and lets the start
+    /// go, so memory follows the viewport rather than the diff.
+    #[test]
+    fn a_long_diff_is_shaped_only_where_it_is_looked_at() {
+        let mut app = test_app();
+        cache_long_diff(&mut app, 20_000, Vec::new());
+        let ctx = diff_test_context(&app);
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(shaped_chunks(&app), vec![0..192], "one chunk covers a 480 px window");
+        assert_eq!(app.prepared.as_ref().unwrap().layout.shapes(), 1);
+
+        app.restore_offset = Some(app.prepared.as_ref().unwrap().layout.height());
+        for _ in 0..3 {
+            find_test_pass(&mut app, &ctx, Vec::new());
+        }
+        let shaped = shaped_chunks(&app);
+        assert_eq!(shaped.last().map(|rows| rows.end), Some(20_000), "the end is shaped");
+        assert!(!shaped.contains(&(0..192)), "the start was let go: {shaped:?}");
+        assert!(
+            shaped.iter().map(Range::len).sum::<usize>() <= 2 * 192,
+            "{shaped:?} is more than the viewport needs"
+        );
+    }
+
+    /// Both jumps are arithmetic on rows that have never been shaped, and the
+    /// row they land on is shaped by the frame that draws it.
+    #[test]
+    fn find_and_next_change_land_on_rows_that_were_never_shaped() {
+        let mut app = test_app();
+        cache_long_diff(
+            &mut app,
+            20_000,
+            vec![
+                (hunk(10..12, 10..12), 10..14),
+                (hunk(14_990..14_992, 14_990..14_992), 15_000..15_004),
+            ],
+        );
+        let ctx = diff_test_context(&app);
+        let line_height = render::row_height(app.settings.mono_pt * 1.36, 1.0);
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.hunk_boxes, vec![(10.0 * line_height, 4.0 * line_height), (15_000.0 * line_height, 4.0 * line_height)]);
+
+        app.pending_hunk_move = 1;
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.hunk_cursor, 1);
+        assert_eq!(app.restore_offset, Some(15_000.0 * line_height));
+        for _ in 0..3 {
+            find_test_pass(&mut app, &ctx, Vec::new());
+        }
+        assert_eq!(app.diff_offset, 15_000.0 * line_height);
+        assert!(shaped_chunks(&app).contains(&(14_976..15_168)));
+
+        app.show_find = true;
+        app.find_query = "row 12345".into();
+        app.find_jump = true;
+        find_test_pass(&mut app, &ctx, Vec::new());
+        assert_eq!(app.restore_offset, Some(12_345.0 * line_height));
+        for _ in 0..3 {
+            find_test_pass(&mut app, &ctx, Vec::new());
+        }
+        assert_eq!(app.diff_offset, 12_345.0 * line_height);
+        assert!(shaped_chunks(&app).contains(&(12_288..12_480)));
+    }
+
+    /// A result being built from `count` one-line differences, rendered as two
+    /// rows each with nothing between them.
+    fn merging_many(count: usize) -> App {
+        let base = (0..count).map(|i| format!("old {i}\n")).collect::<String>();
+        let cand = (0..count).map(|i| format!("new {i}\n")).collect::<String>();
+        let hunks = (0..count)
+            .map(|i| (hunk(i..i + 1, i..i + 1), 2 * i..2 * i + 2))
+            .collect();
+        let mut app = merging_app(&base, &cand, hunks);
+        let text = (0..count)
+            .map(|i| format!("-old {i}\n+new {i}\n"))
+            .collect::<String>();
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(text.as_bytes()).into();
+        app
+    }
+
+    fn take_controls(update: &egui::accesskit::TreeUpdate) -> Vec<String> {
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label())
+            .filter(|label| label.starts_with("Use B's version"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Only the take controls near the viewport are drawn, however many
+    /// differences there are -- drawing every one every frame is what made
+    /// merge mode's frame time grow with them -- while the counter, the walk
+    /// and the hunk geometry still cover every difference.
+    #[test]
+    fn merge_mode_draws_only_the_controls_near_the_viewport() {
+        let count = 300;
+        let mut app = merging_many(count);
+        let ctx = diff_test_context(&app);
+        ctx.enable_accesskit();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+        let pass = |app: &mut App| {
+            let mut output = ctx.run_ui(screen_input(screen), |ui| app.diff_area(ui, &ctx, 8.0));
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update.take().expect("AccessKit tree update")
+        };
+        // The first pass measures a control row; the second is laid out with it.
+        pass(&mut app);
+        let update = pass(&mut app);
+        let drawn = take_controls(&update);
+        assert!(
+            !drawn.is_empty() && drawn.len() < 30,
+            "{} of {count} take controls were drawn",
+            drawn.len()
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.label().is_some_and(|label| label.starts_with("Difference 1 of 300:"))
+        }));
+
+        // Every difference is placed, and the control row each is placed with
+        // is the one that was measured.
+        let line_height = render::row_height(app.settings.mono_pt * 1.36, 1.0);
+        let gap = app.hunk_control_height.expect("a control row was measured");
+        assert_eq!(app.hunk_boxes.len(), count);
+        for (n, &(top, height)) in app.hunk_boxes.iter().enumerate() {
+            assert!((height - (gap + 2.0 * line_height)).abs() < 0.01);
+            assert!((top - n as f32 * height).abs() < 0.5, "hunk {n} is at {top}");
+        }
+
+        // Walking to a difference far below brings its control into being.
+        let target = 200;
+        let location = location(&app.cache[&1].hunks[target].0);
+        assert!(!drawn.iter().any(|label| label.contains(&format!("at {location} —"))));
+        app.hunk_cursor = target - 1;
+        app.pending_hunk_move = 1;
+        let mut update = pass(&mut app);
+        for _ in 0..3 {
+            update = pass(&mut app);
+        }
+        assert_eq!(app.hunk_cursor, target);
+        assert!((app.diff_offset - app.hunk_boxes[target].0).abs() < 0.5);
+        assert!(
+            take_controls(&update)
+                .iter()
+                .any(|label| label.contains(&format!("at {location} —"))),
+            "the control for difference {target} is not drawn where Next change went"
+        );
+    }
+
+    /// The geometry a take restores the viewport with is arithmetic, so it
+    /// exists for a difference whose control is culled -- the usual case, since
+    /// a take that moves the viewport is one made above it.
+    #[test]
+    fn a_take_above_the_viewport_keeps_the_rows_on_screen_in_place() {
+        let mut app = merging_many(300);
+        let ctx = diff_test_context(&app);
+        find_test_pass(&mut app, &ctx, Vec::new());
+        app.restore_offset = Some(app.hunk_boxes[150].0);
+        for _ in 0..3 {
+            find_test_pass(&mut app, &ctx, Vec::new());
+        }
+        let offset = app.diff_offset;
+        assert!(offset > 0.0);
+        let (top, height) = app.hunk_boxes[100];
+        app.take_hunk(100, &ctx);
+        assert_eq!(app.pending_offset, Some((offset - height).max(top)));
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -7734,7 +7965,7 @@ mod tests {
         for focused in ["Help", "Compare"] {
             for taking in [false, true] {
                 let mut app = merging_app("a\n", "b\n", vec![(hunk(0..1, 0..1), 0..2)]);
-                app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n");
+                app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n").into();
                 let ctx = egui::Context::default();
                 ctx.set_fonts(crate::fonts::definitions(None, None, None));
                 crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
@@ -7807,7 +8038,7 @@ mod tests {
     #[test]
     fn full_shortcut_chords_undo_and_redo_takes_from_the_diff() {
         let mut app = merging_app("a\n", "b\n", vec![(hunk(0..1, 0..1), 0..2)]);
-        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n");
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n").into();
         let ctx = egui::Context::default();
         ctx.set_fonts(crate::fonts::definitions(None, None, None));
         crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
@@ -7921,7 +8152,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let saved = dir.join("result.txt");
         let mut app = merging_app("result\n", "candidate\n", vec![(hunk(0..1, 0..1), 0..2)]);
-        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-result\n+candidate\n");
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-result\n+candidate\n").into();
         app.panels[0].text = "source\n".into();
         let result = app.result_panel().unwrap();
         assert!(app.save_result_to(result, saved.clone(), true));
@@ -8314,7 +8545,7 @@ mod tests {
             app.shown,
             Cached {
                 key: app.current_key(),
-                lines: Vec::new(),
+                lines: Vec::new().into(),
                 columns: app.columns,
                 hunks: Vec::new(),
                 problem: None,
@@ -8377,7 +8608,7 @@ mod tests {
     fn rendered_for(key: RenderKey) -> Cached {
         Cached {
             key,
-            lines: ansi::parse(b"-left\n+right\n"),
+            lines: ansi::parse(b"-left\n+right\n").into(),
             hunks: Vec::new(),
             problem: None,
             columns: 120,
@@ -8542,7 +8773,7 @@ mod tests {
             1,
             Cached {
                 key,
-                lines: Vec::new(),
+                lines: Vec::new().into(),
                 columns: app.columns,
                 hunks,
                 problem: None,
@@ -8562,7 +8793,7 @@ mod tests {
     #[test]
     fn merge_hunk_controls_belong_to_the_diff_scroll_view() {
         let mut app = merging_app("a\n", "b\n", vec![(hunk(0..1, 0..1), 0..2)]);
-        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n");
+        app.cache.get_mut(&1).unwrap().lines = ansi::parse(b"-a\n+b\n").into();
 
         let ctx = egui::Context::default();
         ctx.set_fonts(crate::fonts::definitions(None, None, None));
@@ -9633,7 +9864,7 @@ mod tests {
             app.shown,
             Cached {
                 key: app.current_key(),
-                lines: Vec::new(),
+                lines: Vec::new().into(),
                 columns: app.columns,
                 hunks: Vec::new(),
                 problem: None,
@@ -9753,5 +9984,119 @@ mod tests {
     #[test]
     fn panels_are_labelled_by_position() {
         assert_eq!((title(0), title(1), title(5)), ('A', 'B', 'F'));
+    }
+
+    /// The example pair repeated to `bytes`, every line tagged with its copy so
+    /// no two copies are identical: four independent changes per thirteen lines,
+    /// which is the dense, many-hunk shape a large real diff has.
+    fn repeated_example_pair(bytes: usize) -> (String, String) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect("example file");
+        let (before, after) = (read("config_before.rs"), read("config_after.rs"));
+        let (mut left, mut right) = (String::new(), String::new());
+        let mut copy = 0;
+        while left.len() < bytes {
+            for line in before.lines() {
+                left.push_str(&format!("{line} // {copy}\n"));
+            }
+            for line in after.lines() {
+                right.push_str(&format!("{line} // {copy}\n"));
+            }
+            copy += 1;
+        }
+        (left, right)
+    }
+
+    /// Resident memory of this process, from `ps`, in megabytes.
+    fn resident_mb() -> f64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+    }
+
+    /// A measurement, not a regression test: what the first frame of a large
+    /// diff costs the UI thread, what it leaves resident, and what every later
+    /// frame costs. The numbers in `docs/research.md` come from
+    /// `DELGUI_MEASURE_KB=4000 cargo test --release -p delgui large_diff_frame_cost -- --ignored --nocapture`,
+    /// with `DELGUI_MEASURE_MERGE=1` for a result being built.
+    ///
+    /// One size per process: the allocator keeps what an earlier size freed
+    /// resident, so a second size measured in the same process reads low.
+    #[test]
+    #[ignore = "a measurement; run by hand in release"]
+    fn large_diff_frame_cost() {
+        let kilobytes = std::env::var("DELGUI_MEASURE_KB")
+            .ok()
+            .and_then(|kb| kb.parse::<usize>().ok())
+            .unwrap_or(1000);
+        let merging = std::env::var_os("DELGUI_MEASURE_MERGE").is_some();
+        let delta = Delta::discover().expect("this measurement requires `delta` on PATH");
+        let mut app = App::new(delta, Settings::default(), Launch::default());
+        app.opts.inherit_gitconfig = false;
+        let (left, right) = repeated_example_pair(kilobytes * 1000);
+        app.panels[0].text = left;
+        app.panels[1].text = right;
+        app.panels[0].edited = true;
+        app.panels[1].edited = true;
+        app.compared = true;
+        app.columns = 160;
+        if merging {
+            app.start_result(Some(0));
+        }
+        let opts = app.effective_options();
+        let (l, r) = (
+            app.panels[app.reference].to_input(true),
+            app.panels[app.shown].to_input(true),
+        );
+        let cached =
+            render_job(&app.delta, &l, &r, &opts, app.current_key(), merging, &Cancel::default())
+                .expect("render");
+        let (rows, hunks) = (cached.lines.len(), cached.hunks.len());
+        assert_eq!(cached.problem, None);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::definitions(None, None, None));
+        crate::theme::install(&ctx, crate::settings::DEFAULT_UI_PT, app.settings.mono_pt);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let frame = |app: &mut App| {
+            let started = Instant::now();
+            let mut output = ctx.run_ui(screen_input(screen), |ui| app.diff_area(ui, &ctx, 8.0));
+            output.textures_delta.clear();
+            started.elapsed()
+        };
+        // Fonts and the atlas are warmed on an empty diff, so the first
+        // measured frame is only the diff's own cost.
+        frame(&mut app);
+        app.cache.insert(app.shown, cached);
+        let before = resident_mb();
+        let first = frame(&mut app);
+        let after_first = resident_mb();
+        let shaped_first = app.prepared.as_ref().map_or(0, |p| p.layout.shaped_rows());
+        let mut steady = std::time::Duration::ZERO;
+        for _ in 0..10 {
+            steady += frame(&mut app);
+        }
+        let end = app.prepared.as_ref().map_or(0.0, |p| p.layout.height());
+        app.restore_offset = Some(end);
+        let mut scrolled = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            scrolled = scrolled.max(frame(&mut app));
+        }
+        let at_end = resident_mb();
+        let shaped_end = app.prepared.as_ref().map_or(0, |p| p.layout.shaped_rows());
+        eprintln!(
+            "{kilobytes} KB a side{}, {rows} rows, {hunks} differences: first frame {:.1} ms \
+             (+{:.0} MB resident, {shaped_first} rows shaped), later frames {:.2} ms, jump to \
+             the end {:.1} ms (scrolled to {:.0} of {end:.0} px, {shaped_end} rows shaped, \
+             +{:.0} MB resident in all)",
+            if merging { ", building a result" } else { "" },
+            first.as_secs_f64() * 1e3,
+            after_first - before,
+            steady.as_secs_f64() * 1e3 / 10.0,
+            scrolled.as_secs_f64() * 1e3,
+            app.diff_offset,
+            at_end - before,
+        );
     }
 }
