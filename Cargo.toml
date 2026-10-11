@@ -9,10 +9,8 @@ license = "MIT"
 repository = "https://github.com/NicolasSchuler/delgui"
 homepage = "https://github.com/NicolasSchuler/delgui"
 authors = ["Nicolas Schuler"]
-# Not edition 2024's own 1.85: `std::io::pipe` is stable since 1.87, and it is
-# what lets panel buffers reach delta without a temp file. Clippy's msrv lint
-# found the real floor once `rust-version` was stated at all.
-rust-version = "1.87"
+# egui and eframe 0.36 require Rust 1.95, which sets the workspace's build floor.
+rust-version = "1.95"
 
 [workspace.dependencies]
 delgui-core = { path = "crates/delgui-core" }

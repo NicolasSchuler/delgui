@@ -318,7 +318,12 @@ impl FileWatcher {
                 if *count == 0 {
                     self.dirs.remove(dir);
                     self.failed_dirs.remove(dir);
-                    if let Err(error) = self.inner.unwatch(dir) {
+                    // inotify removes a deleted directory's watch before we
+                    // release it. The desired state is already reached then;
+                    // other failures still need to reach the caller.
+                    if let Err(error) = self.inner.unwatch(dir)
+                        && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
+                    {
                         push_error(&self.pending, error);
                     }
                 }
@@ -606,6 +611,29 @@ mod tests {
             changed.is_empty(),
             "still reporting after unwatch: {changed:?}"
         );
+    }
+
+    #[test]
+    fn releasing_a_watch_already_removed_by_the_backend_is_not_a_failure() {
+        use notify::Watcher;
+
+        let _serial = LIVE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dpw-backend-unwatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        let mut watcher = FileWatcher::new(|| {}).unwrap();
+        watcher.watch(&file).unwrap();
+
+        // inotify removes deleted directories itself. Reproduce its state
+        // before logical cleanup without relying on event delivery timing.
+        watcher.inner.unwatch(&dir.canonicalize().unwrap()).unwrap();
+        watcher.unwatch(&file);
+        let errors = watcher.poll_errors();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!watcher.is_watching(&file));
+        assert!(watcher.dirs.is_empty());
+        assert!(errors.is_empty(), "reported an already removed watch: {errors:?}");
     }
 
     #[test]

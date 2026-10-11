@@ -19,7 +19,7 @@ option rather than an aspiration.
 
 ## Build and test
 
-You need Rust 1.87 or newer, `git`, and delta 0.18 or newer on `PATH`. On Linux, also install
+You need Rust 1.95 or newer, `git`, and delta 0.18 or newer on `PATH`. On Linux, also install
 the GUI build dependencies: `sudo apt-get install libgtk-3-dev libxkbcommon-dev libwayland-dev`.
 
 ```sh

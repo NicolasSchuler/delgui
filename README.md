@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/NicolasSchuler/delgui/actions/workflows/ci.yml/badge.svg)](https://github.com/NicolasSchuler/delgui/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.87+](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](Cargo.toml)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](Cargo.toml)
 [![requires delta ≥ 0.18](https://img.shields.io/badge/requires-delta%20%E2%89%A5%200.18-green.svg)](https://github.com/dandavison/delta)
 
 Two or more editable panels. Paste into both, press <kbd>⌘</kbd><kbd>Enter</kbd>, and get delta's
@@ -37,7 +37,7 @@ over pipes, without temporary files, and writes a file only when you **Save** a 
 
 ## Install
 
-**From source** — needs Rust 1.87 or newer, plus delta (`brew install git-delta`, or see
+**From source** — needs Rust 1.95 or newer, plus delta (`brew install git-delta`, or see
 [delta's instructions](https://github.com/dandavison/delta#installation)):
 
 ```sh

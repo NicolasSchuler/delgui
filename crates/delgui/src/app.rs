@@ -5394,10 +5394,8 @@ impl App {
         }
         let unsaved = self.unsaved_panels();
         let merge_unresolved = self.merge_unresolved();
-        if close_requested {
-            if let Some(tool) = &self.mergetool {
-                tool.resolved.store(!merge_unresolved, Ordering::Relaxed);
-            }
+        if close_requested && let Some(tool) = &self.mergetool {
+            tool.resolved.store(!merge_unresolved, Ordering::Relaxed);
         }
         if close_requested
             && (!unsaved.is_empty() || merge_unresolved)

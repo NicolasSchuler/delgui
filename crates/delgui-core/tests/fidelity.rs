@@ -677,13 +677,16 @@ fn identical_inputs_render_nothing_and_succeed() {
 }
 
 /// Buffers reach delta as `/dev/fd/N`, and the read ends used to be leaked so
-/// they would survive into the child. They do not need to: the child has its own
-/// copy of the descriptor table once `spawn` returns. The leak cost two
+/// they would survive into the child. They only need to stay open until the
+/// child exits, then be dropped. The leak cost two
 /// descriptors per render and the GUI renders per keystroke, so a session ran
 /// out of descriptors -- measurably, after about 123 of them -- and then stayed
 /// broken. This is the guard.
 #[test]
 fn rendering_repeatedly_does_not_leak_descriptors() {
+    if run_descriptor_check_in_subprocess("rendering_repeatedly_does_not_leak_descriptors") {
+        return;
+    }
     let d = delta();
     let opts = Options {
         inherit_gitconfig: false,
@@ -747,6 +750,9 @@ fn concurrent_renders_do_not_race_over_dev_fd_numbers() {
 /// `git diff` included, which are mid-write when that child is killed.
 #[test]
 fn a_cancelled_render_stops_promptly_and_leaks_nothing() {
+    if run_descriptor_check_in_subprocess("a_cancelled_render_stops_promptly_and_leaks_nothing") {
+        return;
+    }
     use std::time::{Duration, Instant};
     let d = delta();
     let opts = Options {
@@ -812,10 +818,30 @@ fn a_cancelled_render_stops_promptly_and_leaks_nothing() {
     );
 }
 
+/// Descriptor counts belong to the whole process. Other fidelity tests open
+/// pipes concurrently, so run each resource check alone without serialising
+/// the suite or weakening its leak assertion. Returns true in the parent.
+fn run_descriptor_check_in_subprocess(test: &str) -> bool {
+    const CHILD: &str = "DELGUI_DESCRIPTOR_CHECK_CHILD";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
+        return false;
+    }
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--test-threads=1"])
+        .env(CHILD, test)
+        .status()
+        .expect("spawn isolated descriptor check");
+    assert!(status.success(), "isolated descriptor check {test} failed");
+    true
+}
+
 /// How many descriptors this process holds. `/dev/fd` lists exactly that on
 /// macOS and Linux both, and reading it is cheaper than parsing `lsof`.
 fn open_descriptors() -> usize {
-    std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    std::fs::read_dir("/dev/fd")
+        .expect("enumerate open descriptors")
+        .inspect(|entry| { entry.as_ref().expect("read descriptor entry"); })
+        .count()
 }
 
 /// A file that disappears from under a panel makes Git exit 1 with nothing on

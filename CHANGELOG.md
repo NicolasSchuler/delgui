@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Following files on Linux no longer reports a watcher failure when a deleted
+  directory's watch has already been removed by the filesystem backend.
+- The source build requirement now states Rust 1.95, as required by the GUI
+  dependencies. CI checks that compiler explicitly instead of using stable.
+
 ## [0.2.0] - 2026-10-10
 
 The first tagged release, with prebuilt binaries for macOS and Linux.

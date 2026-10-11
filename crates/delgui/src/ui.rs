@@ -665,10 +665,8 @@ fn widest_label(ui: &Ui, labels: &'static [&'static str]) -> f32 {
     };
     let id = column_id(labels);
     let previous = ui.ctx().data(|d| d.get_temp::<ColumnMemo>(id));
-    if let Some(memo) = &previous {
-        if memo.key == key {
-            return memo.width;
-        }
+    if let Some(memo) = &previous && memo.key == key {
+        return memo.width;
     }
     let width = ui.ctx().fonts_mut(|f| {
         labels
